@@ -122,17 +122,26 @@ async function tgCall(method, body, env) {
 }
 
 function sendMessage(chatId, text, env, extra = {}) {
+  // Strip markdown symbols to avoid silent parse failures
+  const safe = stripMd(text);
   return tgCall('sendMessage', {
-    chat_id: chatId, text, parse_mode: 'Markdown',
+    chat_id: chatId, text: safe,
     disable_web_page_preview: true, ...extra,
   }, env);
 }
 
 function editMessage(chatId, messageId, text, env, extra = {}) {
+  const safe = stripMd(text);
   return tgCall('editMessageText', {
-    chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown',
+    chat_id: chatId, message_id: messageId, text: safe,
     disable_web_page_preview: true, ...extra,
   }, env);
+}
+
+// Remove markdown formatting to prevent Telegram parse errors
+function stripMd(text) {
+  if (!text) return '';
+  return String(text).replace(/[*_`\[\]]/g, '');
 }
 
 function answerCallback(id, text, env) {
