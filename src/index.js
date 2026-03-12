@@ -1,18 +1,15 @@
 /**
  * FTT Signal Telegram Bot — Cloudflare Worker
- * Fixed: pair URL encoding, signal API endpoint, robust error debug
+ * v1.2 — Fixed fetchSignal URL (no encoding on slash)
  *
- * Secrets required (Cloudflare Dashboard → Worker → Settings → Variables):
+ * Secrets (Cloudflare Dashboard → Worker → Settings → Variables):
  *   BOT_TOKEN    — Telegram bot token from @BotFather
  *   SETUP_SECRET — Any password to protect /setup endpoint
  *
  * KV Binding: BOT_KV
  */
 
-// ✅ তোমার actual signal worker URL
 const SIGNAL_API = 'https://my-worker-601.umuhammadiswa.workers.dev';
-
-// ─── PAIR PAGES ───────────────────────────────────────────────────────────────
 
 const PAIR_PAGES = [
   ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD'],
@@ -30,17 +27,15 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Telegram webhook POST
     if (request.method === 'POST' && url.pathname === '/webhook') {
       const update = await request.json().catch(() => null);
       if (update) ctx.waitUntil(handleUpdate(update, env));
       return new Response('OK');
     }
 
-    // Debug: test signal fetch directly in browser
-    // /debug?pair=EUR/USD
+    // Test signal API directly in browser: /debug?pair=EURUSD
     if (url.pathname === '/debug') {
-      const pair = url.searchParams.get('pair') || 'EUR/USD';
+      const pair = url.searchParams.get('pair') || 'EURUSD';
       try {
         const data = await fetchSignal(pair);
         return new Response(JSON.stringify(data, null, 2), {
@@ -53,12 +48,10 @@ export default {
       }
     }
 
-    // One-time webhook setup
-    // Visit: https://your-bot.workers.dev/setup?secret=YOUR_SETUP_SECRET
+    // One-time webhook setup: /setup?secret=YOUR_SETUP_SECRET
     if (url.pathname === '/setup') {
       if (url.searchParams.get('secret') !== env.SETUP_SECRET)
         return new Response('Unauthorized', { status: 401 });
-
       const webhookUrl = `https://${url.hostname}/webhook`;
       const res = await fetch(`${tgApi(env)}/setWebhook`, {
         method: 'POST',
@@ -75,16 +68,15 @@ export default {
       });
     }
 
-    return new Response('FTT Signal Bot — OK. Use /setup?secret=... to register webhook.');
+    return new Response('FTT Signal Bot — OK');
   },
 
-  // Cron: runs every 1 minute
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runAutoScan(env));
   },
 };
 
-// ─── TELEGRAM API HELPERS ─────────────────────────────────────────────────────
+// ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
 
 function tgApi(env) {
   return `https://api.telegram.org/bot${env.BOT_TOKEN}`;
@@ -99,17 +91,16 @@ async function tgCall(method, body, env) {
     });
     if (!res.ok) {
       const err = await res.text();
-      console.error(`tgCall ${method} failed ${res.status}:`, err);
+      console.error(`tgCall ${method} ${res.status}:`, err);
     }
   } catch (e) {
-    console.error(`tgCall ${method} exception:`, e.message);
+    console.error(`tgCall ${method}:`, e.message);
   }
 }
 
 function sendMessage(chatId, text, env, extra = {}) {
   return tgCall('sendMessage', {
-    chat_id: chatId,
-    text,
+    chat_id: chatId, text,
     parse_mode: 'Markdown',
     disable_web_page_preview: true,
     ...extra,
@@ -118,9 +109,7 @@ function sendMessage(chatId, text, env, extra = {}) {
 
 function editMessage(chatId, messageId, text, env, extra = {}) {
   return tgCall('editMessageText', {
-    chat_id: chatId,
-    message_id: messageId,
-    text,
+    chat_id: chatId, message_id: messageId, text,
     parse_mode: 'Markdown',
     disable_web_page_preview: true,
     ...extra,
@@ -134,24 +123,19 @@ function answerCallback(id, text, env) {
 // ─── KV: USER DATA ────────────────────────────────────────────────────────────
 
 function defaultUser() {
-  return { pair: 'EUR/USD', interval: 5, autoEnabled: false, lastSignalAt: 0, noTradeStreak: 0 };
+  return { pair: 'EURUSD', interval: 5, autoEnabled: false, lastSignalAt: 0, noTradeStreak: 0 };
 }
 
 async function getUser(chatId, env) {
   try {
     const d = await env.BOT_KV.get(`user:${chatId}`, 'json');
     return d ? { ...defaultUser(), ...d } : defaultUser();
-  } catch {
-    return defaultUser();
-  }
+  } catch { return defaultUser(); }
 }
 
 async function saveUser(chatId, data, env) {
-  try {
-    await env.BOT_KV.put(`user:${chatId}`, JSON.stringify(data));
-  } catch (e) {
-    console.error('saveUser failed:', e.message);
-  }
+  try { await env.BOT_KV.put(`user:${chatId}`, JSON.stringify(data)); }
+  catch (e) { console.error('saveUser:', e.message); }
 }
 
 async function getAutoUsers(env) {
@@ -170,8 +154,9 @@ async function addAutoUser(chatId, env) {
 
 async function removeAutoUser(chatId, env) {
   const list = await getAutoUsers(env);
-  const filtered = list.filter(id => id !== String(chatId));
-  await env.BOT_KV.put('auto_users', JSON.stringify(filtered));
+  await env.BOT_KV.put('auto_users', JSON.stringify(
+    list.filter(id => id !== String(chatId))
+  ));
 }
 
 // ─── KEYBOARDS ────────────────────────────────────────────────────────────────
@@ -196,18 +181,15 @@ function pairsKeyboard(page) {
   page = Math.max(0, Math.min(page, PAIR_PAGES.length - 1));
   const pairs = PAIR_PAGES[page];
   const keyboard = [];
-
   for (let i = 0; i < pairs.length; i += 2) {
     const row = [{ text: pairs[i], callback_data: `pair:${pairs[i]}` }];
     if (pairs[i + 1]) row.push({ text: pairs[i + 1], callback_data: `pair:${pairs[i + 1]}` });
     keyboard.push(row);
   }
-
   const nav = [];
-  if (page > 0)                      nav.push({ text: '◀ Prev', callback_data: `pairpage:${page - 1}` });
-  if (page < PAIR_PAGES.length - 1)  nav.push({ text: 'Next ▶', callback_data: `pairpage:${page + 1}` });
+  if (page > 0)                     nav.push({ text: '◀ Prev', callback_data: `pairpage:${page - 1}` });
+  if (page < PAIR_PAGES.length - 1) nav.push({ text: 'Next ▶', callback_data: `pairpage:${page + 1}` });
   if (nav.length) keyboard.push(nav);
-
   keyboard.push([{ text: '🔙 Back', callback_data: 'cmd:main' }]);
   return { inline_keyboard: keyboard };
 }
@@ -237,38 +219,48 @@ function signalKeyboard(autoEnabled) {
   };
 }
 
-// ─── SIGNAL FETCH (FIXED URL ENCODING) ───────────────────────────────────────
+// ─── SIGNAL FETCH ─────────────────────────────────────────────────────────────
+// KEY FIX: pair is passed as-is (e.g. EURUSD or EUR/USD).
+// No encodeURIComponent — the signal worker's sanitizePair() handles both formats.
 
 async function fetchSignal(pair) {
-  // ✅ Fix: encodeURIComponent converts '/' to '%2F' which some workers reject.
-  // Instead, pass the pair with slash intact — URLSearchParams handles it safely.
-  const params = new URLSearchParams();
-  params.set('pair', pair);
-  const url = `${SIGNAL_API}/api/signal?${params.toString()}`;
-
-  console.log('Fetching signal URL:', url);
+  const url = `${SIGNAL_API}/api/signal?pair=${pair}`;
+  console.log('fetchSignal:', url);
 
   const res = await fetch(url, {
-    headers: { 'Accept': 'application/json' },
+    headers: { Accept: 'application/json' },
     signal: AbortSignal.timeout(20000),
   });
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    throw new Error(`HTTP ${res.status} — ${body.slice(0, 200)}`);
+    throw new Error(`HTTP ${res.status} — ${body.slice(0, 400)}`);
   }
 
-  const data = await res.json();
-  return data;
+  return res.json();
 }
 
 // ─── SIGNAL FORMATTER ─────────────────────────────────────────────────────────
 
+function esc(text) {
+  if (!text) return '';
+  return String(text).replace(/[_*`[\]]/g, '\\$&');
+}
+
+function displayPair(pair) {
+  // Show with slash: EURUSD → EUR/USD
+  if (!pair.includes('/') && pair.length === 6) {
+    return pair.slice(0, 3) + '/' + pair.slice(3);
+  }
+  return pair;
+}
+
 function formatSignal(data, pair, interval) {
-  // Market closed (Forex weekend)
+  const label = displayPair(pair);
+
   if (data.marketStatus === 'CLOSED') {
     return (
-      `📊 *${pair}* | ${interval}min\n` +
+      `📊 *${label}* | ${interval}min\n` +
       `━━━━━━━━━━━━━━\n` +
       `🔴 *Forex Market CLOSED*\n` +
       `🕐 Opens in: ${data.opensIn || 'Soon'}\n\n` +
@@ -278,53 +270,42 @@ function formatSignal(data, pair, interval) {
 
   const sig = data.signal;
   if (!sig) {
-    return `📊 *${pair}* | ${interval}min\n━━━━━━━━━━━━━━\n❌ No signal data received`;
+    return `📊 *${label}* | ${interval}min\n━━━━━━━━━━━━━━\n❌ No signal data`;
   }
 
-  const dir      = sig.finalSignal  || 'NO_TRADE';
-  const conf     = sig.confidence   || '0%';
-  const grade    = sig.grade ? `*${sig.grade.grade}* ${sig.grade.label}` : '?';
+  const dir      = sig.finalSignal   || 'NO_TRADE';
+  const conf     = sig.confidence    || '0%';
+  const grade    = sig.grade ? `*${sig.grade.grade}* ${sig.grade.label}` : '';
   const htf      = sig.higherTFTrend || 'NEUTRAL';
-  const reason   = sig.entryReason  || '';
+  const reason   = sig.entryReason   || '';
   const filters  = sig.filtersApplied || [];
-  const align    = sig.alignment    || '';
+  const align    = sig.alignment     || '';
 
   const dirEmoji = dir === 'BUY' ? '🟢' : dir === 'SELL' ? '🔴' : '⚪';
   const htfEmoji = htf === 'BUY' ? '📈' : htf === 'SELL' ? '📉' : '➡️';
 
-  // Expiry + countdown from bestTimeframe
   const best      = sig.bestTimeframe;
   const expiry    = best?.expiry?.humanReadable || null;
   const countdown = best?.expiry?.countdown?.label || null;
 
-  let msg = `📊 *${pair}* | ${interval}min\n━━━━━━━━━━━━━━\n`;
+  let msg = `📊 *${label}* | ${interval}min\n━━━━━━━━━━━━━━\n`;
 
   if (dir === 'BUY' || dir === 'SELL') {
     msg += `${dirEmoji} *${dir}*  ${conf}  ${grade}\n`;
     if (expiry)    msg += `⏰ Expiry: *${expiry}*\n`;
     if (countdown) msg += `🕐 Candle closes: *${countdown}*\n`;
     msg += `${htfEmoji} HTF 15min: *${htf}*\n`;
-    if (reason)    msg += `\n📝 _${escapeMarkdown(reason)}_`;
+    if (reason)    msg += `\n📝 _${esc(reason)}_`;
   } else {
-    // NO_TRADE
     msg += `⚪ *NO TRADE*\n`;
     if (filters.length > 0) {
-      msg += `🔕 _${escapeMarkdown(filters.join(' · '))}_`;
+      msg += `🔕 _${esc(filters.join(' · '))}_`;
     } else {
-      const reason2 = align === 'MIXED' ? 'Timeframes mixed — no clear direction'
-                                         : 'Setup conditions not met';
-      msg += `🔕 _${reason2}_`;
+      msg += `🔕 _${align === 'MIXED' ? 'Timeframes mixed' : 'Setup not clear'}_`;
     }
   }
 
   return msg;
-}
-
-// Escape Markdown special chars to prevent Telegram parse errors
-function escapeMarkdown(text) {
-  if (!text) return '';
-  // Only escape chars that break Telegram Markdown v1
-  return text.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
 }
 
 // ─── UPDATE HANDLER ───────────────────────────────────────────────────────────
@@ -334,7 +315,7 @@ async function handleUpdate(update, env) {
     if (update.message)             await handleMessage(update.message, env);
     else if (update.callback_query) await handleCallback(update.callback_query, env);
   } catch (e) {
-    console.error('handleUpdate error:', e.message);
+    console.error('handleUpdate:', e.message);
   }
 }
 
@@ -345,24 +326,23 @@ async function handleMessage(msg, env) {
 
   if (text.startsWith('/start')) {
     return sendMessage(chatId,
-      `👋 *FTT Signal Bot*\n\nReal\\-time binary signals from your FTT Signal Engine\\.\n\n` +
-      `💱 Pair: *EUR/USD*  ⏱ Interval: *5min*  🔕 Auto OFF\n\nUse the buttons below 👇`,
+      `👋 *FTT Signal Bot*\n\nReal-time binary signals from your FTT Signal Engine.\n\n` +
+      `💱 Pair: *EUR/USD*  ⏱ *5min*  🔕 Auto OFF\n\nUse the buttons below 👇`,
       env, { reply_markup: mainKeyboard(user.autoEnabled) });
   }
 
   if (text.startsWith('/signal'))   return doSignal(chatId, env);
   if (text.startsWith('/auto'))     return doToggleAuto(chatId, env);
   if (text.startsWith('/status'))   return doStatus(chatId, env);
-  if (text.startsWith('/help'))     return doHelp(chatId, user, env);
 
   if (text.startsWith('/pair ')) {
     const raw = text.slice(6).trim().toUpperCase().replace(/\s/g, '');
-    const normalized = (raw.length === 6 && !raw.includes('/'))
-      ? raw.slice(0, 3) + '/' + raw.slice(3)
-      : raw;
-    user.pair = normalized;
+    // Store without slash for URL safety; display adds slash
+    const stored = raw.replace('/', '');
+    user.pair = stored;
     await saveUser(chatId, user, env);
-    return sendMessage(chatId, `✅ Pair set to *${normalized}*`, env, { reply_markup: mainKeyboard(user.autoEnabled) });
+    return sendMessage(chatId, `✅ Pair set to *${displayPair(stored)}*`, env,
+      { reply_markup: mainKeyboard(user.autoEnabled) });
   }
 
   if (text.startsWith('/interval ')) {
@@ -370,12 +350,26 @@ async function handleMessage(msg, env) {
     if (VALID_INTERVALS.includes(m)) {
       user.interval = m;
       await saveUser(chatId, user, env);
-      return sendMessage(chatId, `✅ Interval set to *${m} min*`, env, { reply_markup: mainKeyboard(user.autoEnabled) });
+      return sendMessage(chatId, `✅ Interval set to *${m} min*`, env,
+        { reply_markup: mainKeyboard(user.autoEnabled) });
     }
     return sendMessage(chatId, `❌ Valid intervals: 1, 5, 15`, env);
   }
 
-  return sendMessage(chatId, `Use the buttons below 👇`, env, { reply_markup: mainKeyboard(user.autoEnabled) });
+  if (text.startsWith('/help')) {
+    return sendMessage(chatId,
+      `*Commands*\n\n` +
+      `/signal — Get signal now\n` +
+      `/auto — Toggle auto scan\n` +
+      `/status — View settings\n` +
+      `/pair EURUSD — Set pair\n` +
+      `/interval 5 — Set interval (1, 5, 15)\n\n` +
+      `Or use the inline buttons 👇`,
+      env, { reply_markup: mainKeyboard(user.autoEnabled) });
+  }
+
+  return sendMessage(chatId, `Use the buttons below 👇`, env,
+    { reply_markup: mainKeyboard(user.autoEnabled) });
 }
 
 async function handleCallback(cb, env) {
@@ -384,12 +378,11 @@ async function handleCallback(cb, env) {
   const data   = cb.data;
 
   await answerCallback(cb.id, '', env);
-
   const user = await getUser(chatId, env);
 
   if (data === 'cmd:main') {
     return editMessage(chatId, msgId,
-      `🏠 *FTT Signal Bot*\n\n💱 Pair: *${user.pair}*  ⏱ ${user.interval}min  ${user.autoEnabled ? '🔄 Auto ON' : '🔕 Auto OFF'}`,
+      `🏠 *FTT Signal Bot*\n\n💱 *${displayPair(user.pair)}*  ⏱ ${user.interval}min  ${user.autoEnabled ? '🔄 Auto ON' : '🔕 Auto OFF'}`,
       env, { reply_markup: mainKeyboard(user.autoEnabled) });
   }
 
@@ -412,11 +405,13 @@ async function handleCallback(cb, env) {
   }
 
   if (data.startsWith('pair:')) {
-    const pair = data.slice(5);
-    user.pair = pair;
+    const raw  = data.slice(5);
+    // Store without slash
+    const stored = raw.replace('/', '');
+    user.pair = stored;
     await saveUser(chatId, user, env);
     return editMessage(chatId, msgId,
-      `✅ Pair set to *${pair}*\n\n⏱ Interval: *${user.interval}min*  ${user.autoEnabled ? '🔄 Auto ON' : '🔕 Auto OFF'}`,
+      `✅ Pair set to *${displayPair(stored)}*\n\n⏱ Interval: *${user.interval}min*  ${user.autoEnabled ? '🔄 Auto ON' : '🔕 Auto OFF'}`,
       env, { reply_markup: mainKeyboard(user.autoEnabled) });
   }
 
@@ -426,7 +421,7 @@ async function handleCallback(cb, env) {
     user.lastSignalAt = 0;
     await saveUser(chatId, user, env);
     return editMessage(chatId, msgId,
-      `✅ Interval set to *${mins} min*\n\n💱 Pair: *${user.pair}*  ${user.autoEnabled ? '🔄 Auto ON' : '🔕 Auto OFF'}`,
+      `✅ Interval set to *${mins} min*\n\n💱 *${displayPair(user.pair)}*  ${user.autoEnabled ? '🔄 Auto ON' : '🔕 Auto OFF'}`,
       env, { reply_markup: mainKeyboard(user.autoEnabled) });
   }
 }
@@ -434,22 +429,22 @@ async function handleCallback(cb, env) {
 // ─── COMMAND ACTIONS ──────────────────────────────────────────────────────────
 
 async function doSignal(chatId, env, editMsgId = null) {
-  const user = await getUser(chatId, env);
-  const loading = `⏳ Fetching *${user.pair}* signal\\.\\.\\.`;
+  const user    = await getUser(chatId, env);
+  const label   = displayPair(user.pair);
+  const loading = `⏳ Fetching *${label}* signal...`;
 
   if (editMsgId) await editMessage(chatId, editMsgId, loading, env);
   else           await sendMessage(chatId, loading, env);
 
   try {
     const data = await fetchSignal(user.pair);
-    const text  = formatSignal(data, user.pair, user.interval);
-    const kb    = signalKeyboard(user.autoEnabled);
-
+    const text = formatSignal(data, user.pair, user.interval);
+    const kb   = signalKeyboard(user.autoEnabled);
     if (editMsgId) await editMessage(chatId, editMsgId, text, env, { reply_markup: kb });
     else           await sendMessage(chatId, text, env, { reply_markup: kb });
   } catch (e) {
-    console.error('doSignal error:', e.message);
-    const errText = `❌ *Error fetching signal*\n\n\`${e.message.slice(0, 300)}\``;
+    console.error('doSignal:', e.message);
+    const errText = `❌ *Signal fetch failed*\n\n\`${e.message.slice(0, 300)}\``;
     if (editMsgId) await editMessage(chatId, editMsgId, errText, env, { reply_markup: mainKeyboard(user.autoEnabled) });
     else           await sendMessage(chatId, errText, env, { reply_markup: mainKeyboard(user.autoEnabled) });
   }
@@ -466,7 +461,7 @@ async function doToggleAuto(chatId, env, editMsgId = null) {
   else                  await removeAutoUser(chatId, env);
 
   const txt = user.autoEnabled
-    ? `🔄 *Auto Scan ON*\n\n💱 Pair: *${user.pair}*\n⏱ Interval: *${user.interval} min*\n\nBUY/SELL alerts will be sent automatically.`
+    ? `🔄 *Auto Scan ON*\n\n💱 Pair: *${displayPair(user.pair)}*\n⏱ Interval: *${user.interval} min*\n\nBUY/SELL alerts will be sent automatically.`
     : `🔕 *Auto Scan OFF*\n\nUse *Signal Now* to check manually.`;
 
   if (editMsgId) await editMessage(chatId, editMsgId, txt, env, { reply_markup: mainKeyboard(user.autoEnabled) });
@@ -476,13 +471,11 @@ async function doToggleAuto(chatId, env, editMsgId = null) {
 async function doStatus(chatId, env, editMsgId = null) {
   const user       = await getUser(chatId, env);
   const autoStatus = user.autoEnabled ? '✅ ON' : '🔕 OFF';
-  const lastSent   = user.lastSignalAt
-    ? new Date(user.lastSignalAt).toUTCString()
-    : 'Never';
+  const lastSent   = user.lastSignalAt ? new Date(user.lastSignalAt).toUTCString() : 'Never';
 
   const text = (
     `📋 *Settings*\n\n` +
-    `💱 Pair: *${user.pair}*\n` +
+    `💱 Pair: *${displayPair(user.pair)}*\n` +
     `⏱ Interval: *${user.interval} min*\n` +
     `🔄 Auto Scan: *${autoStatus}*\n` +
     `🕐 Last signal: ${lastSent}`
@@ -491,8 +484,8 @@ async function doStatus(chatId, env, editMsgId = null) {
   const kb = {
     inline_keyboard: [
       [
-        { text: '💱 Change Pair',     callback_data: 'pairpage:0'    },
-        { text: '⏱ Change Interval',  callback_data: 'cmd:intervals' },
+        { text: '💱 Change Pair',    callback_data: 'pairpage:0'    },
+        { text: '⏱ Change Interval', callback_data: 'cmd:intervals' },
       ],
       [{ text: '🔙 Back', callback_data: 'cmd:main' }],
     ],
@@ -500,18 +493,6 @@ async function doStatus(chatId, env, editMsgId = null) {
 
   if (editMsgId) await editMessage(chatId, editMsgId, text, env, { reply_markup: kb });
   else           await sendMessage(chatId, text, env, { reply_markup: kb });
-}
-
-async function doHelp(chatId, user, env) {
-  return sendMessage(chatId,
-    `*FTT Signal Bot — Commands*\n\n` +
-    `/signal — Get signal now\n` +
-    `/auto — Toggle auto scan on/off\n` +
-    `/status — View current settings\n` +
-    `/pair EURUSD — Set pair manually\n` +
-    `/interval 5 — Set interval (1, 5, 15)\n\n` +
-    `Or use the inline buttons 👇`,
-    env, { reply_markup: mainKeyboard(user.autoEnabled) });
 }
 
 // ─── AUTO SCAN (CRON every 1 min) ────────────────────────────────────────────
@@ -547,14 +528,14 @@ async function runAutoScan(env) {
         user.noTradeStreak = 0;
       } else {
         user.noTradeStreak = (user.noTradeStreak || 0) + 1;
-
-        // After 10 consecutive NO_TRADEs, send one nudge (not spam)
         if (user.noTradeStreak >= 10) {
           await sendMessage(chatId,
-            `📊 *${user.pair}* | ${user.interval}min\n━━━━━━━━━━━━━━\n⚪ No clear setup for ${user.noTradeStreak} scans — still watching.`,
+            `📊 *${displayPair(user.pair)}* | ${user.interval}min\n━━━━━━━━━━━━━━\n⚪ No clear setup for ${user.noTradeStreak} scans — still watching.`,
             env, {
               reply_markup: {
-                inline_keyboard: [[{ text: '🔕 Stop Auto', callback_data: 'cmd:toggle_auto' }]],
+                inline_keyboard: [[
+                  { text: '🔕 Stop Auto', callback_data: 'cmd:toggle_auto' },
+                ]],
               },
             });
           user.noTradeStreak = 0;
@@ -565,7 +546,7 @@ async function runAutoScan(env) {
       await saveUser(chatId, user, env);
 
     } catch (e) {
-      console.error(`Auto scan error [${chatId}]:`, e.message);
+      console.error(`Auto scan [${chatId}]:`, e.message);
     }
   }
 }
