@@ -1,3 +1,7 @@
 name = "ftt-telegram-bot"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
+
+kv_namespaces = [
+  { binding = "SIGNAL_CACHE", id = "39653d1f9b5147259cf3791658f131d7" }
+]
