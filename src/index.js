@@ -16,7 +16,7 @@
  * KV Binding: BOT_KV
  */
 
-const SIGNAL_API = 'https://signal-engine-ftt-v.umuhammadiswa.workers.dev';
+const SIGNAL_API = 'https://my-worker-601.umuhammadiswa.workers.dev';
 
 // ─── PAIR PAGES (keyboard pages) ─────────────────────────────────────────────
 
