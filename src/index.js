@@ -1,15 +1,14 @@
 /**
  * FTT Signal Telegram Bot — Cloudflare Worker
- * v1.2 — Fixed fetchSignal URL (no encoding on slash)
+ * v1.3 — Fixed: Service Binding replaces HTTP fetch (fixes error 1042)
  *
  * Secrets (Cloudflare Dashboard → Worker → Settings → Variables):
  *   BOT_TOKEN    — Telegram bot token from @BotFather
  *   SETUP_SECRET — Any password to protect /setup endpoint
  *
- * KV Binding: BOT_KV
+ * KV Binding  : BOT_KV
+ * Service Binding: SIGNAL_WORKER → my-worker-601
  */
-
-const SIGNAL_API = 'https://my-worker-601.umuhammadiswa.workers.dev';
 
 const PAIR_PAGES = [
   ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD'],
@@ -33,11 +32,11 @@ export default {
       return new Response('OK');
     }
 
-    // Test signal API directly in browser: /debug?pair=EURUSD
+    // Test in browser: /debug?pair=EURUSD
     if (url.pathname === '/debug') {
       const pair = url.searchParams.get('pair') || 'EURUSD';
       try {
-        const data = await fetchSignal(pair);
+        const data = await fetchSignal(pair, env);
         return new Response(JSON.stringify(data, null, 2), {
           headers: { 'Content-Type': 'application/json' },
         });
@@ -75,6 +74,34 @@ export default {
     ctx.waitUntil(runAutoScan(env));
   },
 };
+
+// ─── SIGNAL FETCH — Service Binding (fixes error 1042) ────────────────────────
+
+async function fetchSignal(pair, env) {
+  // Use Service Binding if available (worker-to-worker, no HTTP block)
+  // Falls back to direct fetch for /debug testing from browser
+  const req = new Request(`https://signal/api/signal?pair=${pair}`, {
+    headers: { Accept: 'application/json' },
+  });
+
+  let res;
+  if (env.SIGNAL_WORKER) {
+    // Service Binding — direct internal call, no 1042
+    res = await env.SIGNAL_WORKER.fetch(req);
+  } else {
+    // Fallback (should not happen in production)
+    res = await fetch(
+      `https://my-worker-601.umuhammadiswa.workers.dev/api/signal?pair=${pair}`,
+      { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20000) }
+    );
+  }
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`HTTP ${res.status} — ${body.slice(0, 400)}`);
+  }
+  return res.json();
+}
 
 // ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
 
@@ -219,27 +246,6 @@ function signalKeyboard(autoEnabled) {
   };
 }
 
-// ─── SIGNAL FETCH ─────────────────────────────────────────────────────────────
-// KEY FIX: pair is passed as-is (e.g. EURUSD or EUR/USD).
-// No encodeURIComponent — the signal worker's sanitizePair() handles both formats.
-
-async function fetchSignal(pair) {
-  const url = `${SIGNAL_API}/api/signal?pair=${pair}`;
-  console.log('fetchSignal:', url);
-
-  const res = await fetch(url, {
-    headers: { Accept: 'application/json' },
-    signal: AbortSignal.timeout(20000),
-  });
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`HTTP ${res.status} — ${body.slice(0, 400)}`);
-  }
-
-  return res.json();
-}
-
 // ─── SIGNAL FORMATTER ─────────────────────────────────────────────────────────
 
 function esc(text) {
@@ -248,10 +254,8 @@ function esc(text) {
 }
 
 function displayPair(pair) {
-  // Show with slash: EURUSD → EUR/USD
-  if (!pair.includes('/') && pair.length === 6) {
+  if (!pair.includes('/') && pair.length === 6)
     return pair.slice(0, 3) + '/' + pair.slice(3);
-  }
   return pair;
 }
 
@@ -269,9 +273,7 @@ function formatSignal(data, pair, interval) {
   }
 
   const sig = data.signal;
-  if (!sig) {
-    return `📊 *${label}* | ${interval}min\n━━━━━━━━━━━━━━\n❌ No signal data`;
-  }
+  if (!sig) return `📊 *${label}* | ${interval}min\n━━━━━━━━━━━━━━\n❌ No signal data`;
 
   const dir      = sig.finalSignal   || 'NO_TRADE';
   const conf     = sig.confidence    || '0%';
@@ -336,12 +338,10 @@ async function handleMessage(msg, env) {
   if (text.startsWith('/status'))   return doStatus(chatId, env);
 
   if (text.startsWith('/pair ')) {
-    const raw = text.slice(6).trim().toUpperCase().replace(/\s/g, '');
-    // Store without slash for URL safety; display adds slash
-    const stored = raw.replace('/', '');
-    user.pair = stored;
+    const raw    = text.slice(6).trim().toUpperCase().replace(/[\s/]/g, '');
+    user.pair    = raw;
     await saveUser(chatId, user, env);
-    return sendMessage(chatId, `✅ Pair set to *${displayPair(stored)}*`, env,
+    return sendMessage(chatId, `✅ Pair set to *${displayPair(raw)}*`, env,
       { reply_markup: mainKeyboard(user.autoEnabled) });
   }
 
@@ -358,13 +358,9 @@ async function handleMessage(msg, env) {
 
   if (text.startsWith('/help')) {
     return sendMessage(chatId,
-      `*Commands*\n\n` +
-      `/signal — Get signal now\n` +
-      `/auto — Toggle auto scan\n` +
-      `/status — View settings\n` +
-      `/pair EURUSD — Set pair\n` +
-      `/interval 5 — Set interval (1, 5, 15)\n\n` +
-      `Or use the inline buttons 👇`,
+      `*Commands*\n\n/signal — Get signal now\n/auto — Toggle auto scan\n` +
+      `/status — View settings\n/pair EURUSD — Set pair\n` +
+      `/interval 5 — Set interval (1, 5, 15)\n\nOr use buttons 👇`,
       env, { reply_markup: mainKeyboard(user.autoEnabled) });
   }
 
@@ -405,19 +401,17 @@ async function handleCallback(cb, env) {
   }
 
   if (data.startsWith('pair:')) {
-    const raw  = data.slice(5);
-    // Store without slash
-    const stored = raw.replace('/', '');
-    user.pair = stored;
+    const raw    = data.slice(5).replace('/', '');
+    user.pair    = raw;
     await saveUser(chatId, user, env);
     return editMessage(chatId, msgId,
-      `✅ Pair set to *${displayPair(stored)}*\n\n⏱ Interval: *${user.interval}min*  ${user.autoEnabled ? '🔄 Auto ON' : '🔕 Auto OFF'}`,
+      `✅ Pair set to *${displayPair(raw)}*\n\n⏱ Interval: *${user.interval}min*  ${user.autoEnabled ? '🔄 Auto ON' : '🔕 Auto OFF'}`,
       env, { reply_markup: mainKeyboard(user.autoEnabled) });
   }
 
   if (data.startsWith('interval:')) {
-    const mins = parseInt(data.split(':')[1], 10);
-    user.interval = mins;
+    const mins        = parseInt(data.split(':')[1], 10);
+    user.interval     = mins;
     user.lastSignalAt = 0;
     await saveUser(chatId, user, env);
     return editMessage(chatId, msgId,
@@ -437,7 +431,7 @@ async function doSignal(chatId, env, editMsgId = null) {
   else           await sendMessage(chatId, loading, env);
 
   try {
-    const data = await fetchSignal(user.pair);
+    const data = await fetchSignal(user.pair, env);
     const text = formatSignal(data, user.pair, user.interval);
     const kb   = signalKeyboard(user.autoEnabled);
     if (editMsgId) await editMessage(chatId, editMsgId, text, env, { reply_markup: kb });
@@ -451,7 +445,7 @@ async function doSignal(chatId, env, editMsgId = null) {
 }
 
 async function doToggleAuto(chatId, env, editMsgId = null) {
-  const user = await getUser(chatId, env);
+  const user         = await getUser(chatId, env);
   user.autoEnabled   = !user.autoEnabled;
   user.lastSignalAt  = 0;
   user.noTradeStreak = 0;
@@ -511,7 +505,7 @@ async function runAutoScan(env) {
       const intervalMs = user.interval * 60 * 1000;
       if (now - (user.lastSignalAt || 0) < intervalMs) continue;
 
-      const data = await fetchSignal(user.pair);
+      const data = await fetchSignal(user.pair, env);
       const sig  = data.signal;
       const dir  = sig ? sig.finalSignal : null;
 
@@ -530,7 +524,7 @@ async function runAutoScan(env) {
         user.noTradeStreak = (user.noTradeStreak || 0) + 1;
         if (user.noTradeStreak >= 10) {
           await sendMessage(chatId,
-            `📊 *${displayPair(user.pair)}* | ${user.interval}min\n━━━━━━━━━━━━━━\n⚪ No clear setup for ${user.noTradeStreak} scans — still watching.`,
+            `📊 *${displayPair(user.pair)}* | ${user.interval}min\n━━━━━━━━━━━━━━\n⚪ No clear setup for ${user.noTradeStreak} scans.`,
             env, {
               reply_markup: {
                 inline_keyboard: [[
