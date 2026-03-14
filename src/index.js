@@ -307,6 +307,20 @@ async function removePendingId(tradeId, env) {
   const ids = await getPendingIds(env);
   await kvPut('pending_ids', ids.filter(id => id !== tradeId), env);
 }
+// Active signal lock per user+pair+direction
+// Key: lock:{chatId}:{pair}  Value: { direction, expiryAt }
+async function getActiveLock(chatId, pair, env) {
+  return await kvGet(`lock:${chatId}:${pair}`, env);
+}
+
+async function setActiveLock(chatId, pair, direction, expiryAt, env) {
+  const ttlSeconds = Math.ceil((expiryAt - Date.now()) / 1000) + 60; // +60s buffer
+  await kvPut(`lock:${chatId}:${pair}`, { direction, expiryAt }, env, { expirationTtl: ttlSeconds });
+}
+
+async function clearActiveLock(chatId, pair, env) {
+  try { await env.BOT_KV.delete(`lock:${chatId}:${pair}`); } catch {}
+}
 
 // ─── KEYBOARDS ────────────────────────────────────────────────────────────────
 
@@ -674,6 +688,29 @@ async function logAndSchedule(chatId, pair, sig, env) {
     chatId: String(chatId), tradeId, pair, direction: dir,
     entryPrice, expiryAt,
   }, env);
+
+  // Block this pair until expiry
+  await setActivePair(chatId, pair, expiryAt, env);
+}
+
+// Active pair lock — per user per pair
+async function setActivePair(chatId, pair, expiryAt, env) {
+  const key  = `active:${chatId}`;
+  const data = (await kvGet(key, env)) || {};
+  data[pair] = expiryAt;
+  await kvPut(key, data, env, { expirationTtl: 7200 });
+}
+
+async function isActivePair(chatId, pair, env) {
+  const key  = `active:${chatId}`;
+  const data = (await kvGet(key, env)) || {};
+  const exp  = data[pair];
+  if (!exp) return false;
+  if (Date.now() < exp) return true;
+  // Expired — clean up
+  delete data[pair];
+  await kvPut(key, data, env, { expirationTtl: 7200 });
+  return false;
 }
 
 async function doToggle(chatId, env, msgId = null) {
@@ -763,6 +800,12 @@ async function runAutoScan(env, log = console.log, force = false) {
 
       for (const pair of scanList) {
 
+        // Skip if this pair already has an active trade in progress
+        if (await isActivePair(chatId, pair, env)) {
+          log(`Skipping ${pair} — active trade in progress`);
+          continue;
+        }
+
         log(`Scanning ${pair} for ${chatId}`);
 
         try {
@@ -771,8 +814,18 @@ async function runAutoScan(env, log = console.log, force = false) {
           const dir  = sig?.finalSignal;
 
           if (dir === 'BUY' || dir === 'SELL') {
+            // Check active lock — skip if same direction still running
+            const lock = await getActiveLock(chatId, pair, env);
+            if (lock && lock.direction === dir && lock.expiryAt > Date.now()) {
+              log(`Skipped ${pair} ${dir} — same signal active until ${new Date(lock.expiryAt).toUTCString()}`);
+              continue;
+            }
+
             const text = fmtSignal(data, pair, user.interval);
             await send(chatId, text, env, { reply_markup: afterKb() });
+            const expiryMinutes = sig.bestTimeframe?.expiry?.totalMinutes || user.interval;
+            const expiryAt = Date.now() + expiryMinutes * 60 * 1000;
+            await setActiveLock(chatId, pair, dir, expiryAt, env);
             await logAndSchedule(chatId, pair, sig, env);
             user.noTradeStreak = 0;
           } else {
@@ -827,6 +880,7 @@ async function runResultCheck(env, log = console.log) {
 
       if (currentPrice === null || trade.entryPrice === null) {
         await setTradeResult(trade.chatId, tradeId, 'SKIP', null, null, env);
+        await clearActiveLock(trade.chatId, trade.pair, env);
         await send(trade.chatId,
           `⏭ Trade expired — could not verify price for ${disp(trade.pair)}\nID: ${tradeId}`,
           env, { reply_markup: afterKb() });
@@ -847,6 +901,7 @@ async function runResultCheck(env, log = console.log) {
       const unit   = crypto ? '$' : ' pips';
 
       await setTradeResult(trade.chatId, tradeId, result, current, pips, env);
+      await clearActiveLock(trade.chatId, trade.pair, env);
 
       const dirE = trade.direction === 'BUY' ? '🟢' : '🔴';
       const resE = result === 'WIN' ? '✅ WIN' : '❌ LOSS';
