@@ -116,6 +116,42 @@ export default {
       });
     }
 
+    // Export history as CSV
+    if (url.pathname === '/export') {
+      if (url.searchParams.get('secret') !== env.SETUP_SECRET)
+        return new Response('Unauthorized', { status: 401 });
+      const chatId = url.searchParams.get('chat');
+      if (!chatId) return new Response('Missing ?chat=CHAT_ID', { status: 400 });
+
+      const history = (await kvGet(`h:${chatId}`, env)) || [];
+      if (!history.length) return new Response('No data', { status: 404 });
+
+      const header = 'ID,Pair,Direction,Confidence,Entry Price,Expiry (min),Result,Exit Price,Pips,Timestamp,Resolved At';
+      const rows = history.map(h => [
+        h.id || '',
+        h.pair || '',
+        h.direction || '',
+        h.confidence || '',
+        h.entryPrice || '',
+        h.expiryMinutes || '',
+        h.result || 'PENDING',
+        h.exitPrice || '',
+        h.pips || '',
+        h.timestamp || '',
+        h.resolvedAt || '',
+      ].join(','));
+
+      const csv = [header, ...rows].join('\n');
+      const filename = `ftt-signals-${chatId}-${new Date().toISOString().slice(0,10)}.csv`;
+
+      return new Response(csv, {
+        headers: {
+          'Content-Type': 'text/csv',
+          'Content-Disposition': `attachment; filename="${filename}"`,
+        },
+      });
+    }
+
     return new Response('FTT Signal Bot v2.2 — OK');
   },
 
@@ -274,7 +310,12 @@ async function getHistory(chatId, env) {
 async function addToHistory(chatId, entry, env) {
   const h = await getHistory(chatId, env);
   h.unshift(entry);
-  await kvPut(`h:${chatId}`, h.slice(0, MAX_HISTORY), env);
+  // Keep max 50 entries + only last 30 days
+  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const trimmed = h
+    .slice(0, MAX_HISTORY)
+    .filter(x => new Date(x.timestamp).getTime() > cutoff);
+  await kvPut(`h:${chatId}`, trimmed, env);
 }
 
 async function setTradeResult(chatId, tradeId, result, exitPrice, pips, env) {
@@ -906,8 +947,13 @@ async function runResultCheck(env, log = console.log) {
       const dirE = trade.direction === 'BUY' ? '🟢' : '🔴';
       const resE = result === 'WIN' ? '✅ WIN' : '❌ LOSS';
 
+      // How late was the result check vs expiry?
+      const lateMs  = now - trade.expiryAt;
+      const lateMin = Math.round(lateMs / 60000);
+      const lateStr = lateMin > 0 ? ` (+${lateMin}min late)` : '';
+
       await send(trade.chatId,
-        `${resE} — Auto Result\n` +
+        `${resE} — Auto Result${lateStr}\n` +
         `━━━━━━━━━━━━━━\n` +
         `${dirE} ${trade.direction} ${disp(trade.pair)}\n` +
         `Entry:  ${entry.toFixed(5)}\n` +
