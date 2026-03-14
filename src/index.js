@@ -51,7 +51,8 @@ export default {
       if (url.searchParams.get('secret') !== env.SETUP_SECRET)
         return new Response('Unauthorized', { status: 401 });
       const logs = [];
-      await runCron(env, logs);
+      const force = url.searchParams.get('force') === 'true';
+      await runCron(env, logs, force);
       return new Response(logs.join('\n') || 'Cron done (no logs)', {
         headers: { 'Content-Type': 'text/plain' },
       });
@@ -89,8 +90,10 @@ export default {
       await env.BOT_KV.put('auto_users', JSON.stringify(list));
       const user = (await env.BOT_KV.get(`u:${chatId}`, 'json')) || {};
       user.autoEnabled = true;
+      user.lastPairScanAt = {};  // reset so scan runs immediately
+      user.noTradeStreak = 0;
       await env.BOT_KV.put(`u:${chatId}`, JSON.stringify(user));
-      return new Response(JSON.stringify({ ok: true, autoUsers: list }), {
+      return new Response(JSON.stringify({ ok: true, autoUsers: list, user }), {
         headers: { 'Content-Type': 'application/json' },
       });
     }
@@ -118,16 +121,18 @@ export default {
 
   // Cron: every 1 minute
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runCron(env, []));
+    ctx.waitUntil(runCron(env, [], true));
   },
 };
 
 // ─── CRON MASTER ──────────────────────────────────────────────────────────────
 
-async function runCron(env, logs = []) {
+async function runCron(env, logs = [], force = false) {
   const log = (m) => { console.log(m); logs.push(String(m)); };
   log('Cron started: ' + new Date().toISOString());
-  try { await runAutoScan(env, log); }    catch (e) { log('AutoScan error: ' + e.message); }
+  if (!env.BOT_TOKEN) { log('ERROR: BOT_TOKEN missing in env'); return; }
+  if (!env.BOT_KV)    { log('ERROR: BOT_KV binding missing');  return; }
+  try { await runAutoScan(env, log, force); }    catch (e) { log('AutoScan error: ' + e.message); }
   try { await runResultCheck(env, log); } catch (e) { log('ResultCheck error: ' + e.message); }
   log('Cron done');
 }
@@ -169,6 +174,7 @@ async function fetchCurrentPrice(pair, env) {
 function tgApi(env) { return `https://api.telegram.org/bot${env.BOT_TOKEN}`; }
 
 async function tgCall(method, body, env) {
+  if (!env.BOT_TOKEN) { console.error('tgCall: BOT_TOKEN missing'); return; }
   try {
     const res = await fetch(`${tgApi(env)}/${method}`, {
       method: 'POST',
@@ -177,9 +183,9 @@ async function tgCall(method, body, env) {
     });
     if (!res.ok) {
       const t = await res.text();
-      console.error(`tgCall ${method} ${res.status}:`, t.slice(0, 200));
+      console.error(`tgCall ${method} ${res.status}: ${t.slice(0, 300)}`);
     }
-  } catch (e) { console.error(`tgCall ${method}:`, e.message); }
+  } catch (e) { console.error(`tgCall ${method}: ${e.message}`); }
 }
 
 // Plain text only — no Markdown parse errors
@@ -739,7 +745,7 @@ async function doWatchlist(chatId, env, msgId = null) {
 
 // ─── AUTO SCAN ────────────────────────────────────────────────────────────────
 
-async function runAutoScan(env, log = console.log) {
+async function runAutoScan(env, log = console.log, force = false) {
   const autoUsers = await getAutoUsers(env);
   log('Auto scan users: ' + autoUsers.length);
   if (!autoUsers.length) return;
@@ -751,14 +757,11 @@ async function runAutoScan(env, log = console.log) {
       const user = await getUser(chatId, env);
       if (!user.autoEnabled) continue;
 
-      const intervalMs = user.interval * 60 * 1000;
       const scanList   = [user.pair, ...(user.watchlist || [])].filter(
         (p, i, a) => a.indexOf(p) === i
       );
 
       for (const pair of scanList) {
-        const lastScan = (user.lastPairScanAt || {})[pair] || 0;
-        if (now - lastScan < intervalMs) continue;
 
         log(`Scanning ${pair} for ${chatId}`);
 
@@ -784,8 +787,7 @@ async function runAutoScan(env, log = console.log) {
             }
           }
 
-          if (!user.lastPairScanAt) user.lastPairScanAt = {};
-          user.lastPairScanAt[pair] = now;
+
 
         } catch (e) {
           console.error(`Scan ${pair} [${chatId}]:`, e.message);
