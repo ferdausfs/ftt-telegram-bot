@@ -721,28 +721,39 @@ async function doSignal(chatId, env, msgId = null) {
 
 async function logAndSchedule(chatId, pair, sig, env) {
   const dir           = sig.finalSignal;
-  const expiryMinutes = sig.bestTimeframe?.expiry?.totalMinutes || 5;
-  const expiryAt      = Date.now() + expiryMinutes * 60 * 1000;
-  const entryPrice    = sig.recommendations?.['1min']?.entry?.price
-                     || sig.recommendations?.['5min']?.entry?.price
-                     || null;
+  const best          = sig.bestTimeframe;
+  const expiryMinutes = best?.expiry?.totalMinutes || 5;
+  const nextCandleClose = best?.expiry?.nextCandleClose
+    ? new Date(best.expiry.nextCandleClose).getTime() : null;
+  const expiryAt = nextCandleClose || (Date.now() + expiryMinutes * 60 * 1000);
+
+  const entryPrice = sig.recommendations?.['1min']?.entry?.price
+                  || sig.recommendations?.['5min']?.entry?.price
+                  || null;
   const tradeId = uid();
 
-  await addToHistory(chatId, {
+  // addToHistory returns the signal number
+  const signalNo = await addToHistory(chatId, {
     id: tradeId, pair, direction: dir,
     confidence: sig.confidence || '0%',
     entryPrice, expiryMinutes,
+    expiryAt: new Date(expiryAt).toISOString(),
     timestamp: new Date().toISOString(),
     result: null,
   }, env);
 
   await addPendingTrade({
-    chatId: String(chatId), tradeId, pair, direction: dir,
-    entryPrice, expiryAt,
+    chatId: String(chatId),
+    tradeId, pair,
+    direction: dir,
+    entryPrice,
+    expiryAt,
+    signalNo,
   }, env);
 
-  // Block this pair until expiry
   await setActivePair(chatId, pair, expiryAt, env);
+
+  return signalNo;  // ← must return
 }
 
 // Active pair lock — per user per pair
