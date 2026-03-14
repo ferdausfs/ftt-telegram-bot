@@ -309,9 +309,9 @@ async function getHistory(chatId, env) {
 
 async function addToHistory(chatId, entry, env) {
   const h = await getHistory(chatId, env);
-  // Assign signal number (total ever = last no + 1)
-  const lastNo = h.length > 0 ? (h[0].no || h.length) : 0;
-  entry.no = lastNo + 1;
+  // Find highest existing number, increment by 1
+  const maxNo = h.reduce((m, x) => Math.max(m, x.no || 0), 0);
+  entry.no = maxNo + 1;
   h.unshift(entry);
   // Keep max 50 entries + only last 30 days
   const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
@@ -319,7 +319,7 @@ async function addToHistory(chatId, entry, env) {
     .slice(0, MAX_HISTORY)
     .filter(x => new Date(x.timestamp).getTime() > cutoff);
   await kvPut(`h:${chatId}`, trimmed, env);
-  return entry.no;
+  return entry.no;  // return signal number
 }
 
 async function setTradeResult(chatId, tradeId, result, exitPrice, pips, env) {
@@ -957,7 +957,8 @@ async function runResultCheck(env, log = console.log) {
 
       const dirE   = trade.direction === 'BUY' ? '🟢' : '🔴';
       const resE   = result === 'WIN' ? '✅ WIN' : '❌ LOSS';
-      const noStr  = trade.signalNo ? `No. ${trade.signalNo}` : tradeId;
+      const noStr  = (trade.signalNo !== undefined && trade.signalNo !== null)
+                     ? `No. ${trade.signalNo}` : tradeId;
 
       // How late was the result check vs expiry?
       const lateMs  = now - trade.expiryAt;
