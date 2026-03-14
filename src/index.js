@@ -309,6 +309,9 @@ async function getHistory(chatId, env) {
 
 async function addToHistory(chatId, entry, env) {
   const h = await getHistory(chatId, env);
+  // Assign signal number (total ever = last no + 1)
+  const lastNo = h.length > 0 ? (h[0].no || h.length) : 0;
+  entry.no = lastNo + 1;
   h.unshift(entry);
   // Keep max 50 entries + only last 30 days
   const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
@@ -316,6 +319,7 @@ async function addToHistory(chatId, entry, env) {
     .slice(0, MAX_HISTORY)
     .filter(x => new Date(x.timestamp).getTime() > cutoff);
   await kvPut(`h:${chatId}`, trimmed, env);
+  return entry.no;
 }
 
 async function setTradeResult(chatId, tradeId, result, exitPrice, pips, env) {
@@ -504,7 +508,12 @@ function fmtSignal(data, pair, interval) {
   let msg = `📊 ${label} | ${interval}min\n━━━━━━━━━━━━━━\n`;
 
   if (dir === 'BUY' || dir === 'SELL') {
+    const entryPrice = sig.recommendations?.['1min']?.entry?.price
+                    || sig.recommendations?.['5min']?.entry?.price
+                    || sig.recommendations?.['15min']?.entry?.price
+                    || null;
     msg += `${dirE} ${dir}  ${conf}  ${grade}\n`;
+    if (entryPrice) msg += `💰 Entry: ${parseFloat(entryPrice).toFixed(5)}\n`;
     if (expiry) msg += `⏰ Expiry: ${expiry}\n`;
     if (cd)     msg += `🕐 Candle closes: ${cd}\n`;
     msg += `${htfE} HTF 15min: ${htf}\n`;
@@ -694,12 +703,14 @@ async function doSignal(chatId, env, msgId = null) {
     const dir  = sig?.finalSignal;
     const text = fmtSignal(data, user.pair, user.interval);
 
+    let displayText = text;
     if (dir === 'BUY' || dir === 'SELL') {
-      await logAndSchedule(chatId, user.pair, sig, env);
+      const signalNo = await logAndSchedule(chatId, user.pair, sig, env);
+      displayText = `📌 Signal No. ${signalNo}\n` + text;
     }
 
-    if (msgId) await edit(chatId, msgId, text, env, { reply_markup: afterKb() });
-    else       await send(chatId, text, env, { reply_markup: afterKb() });
+    if (msgId) await edit(chatId, msgId, displayText, env, { reply_markup: afterKb() });
+    else       await send(chatId, displayText, env, { reply_markup: afterKb() });
   } catch (e) {
     console.error('doSignal:', e.message);
     const err = `❌ Signal fetch failed\n${e.message.slice(0, 200)}`;
@@ -862,12 +873,12 @@ async function runAutoScan(env, log = console.log, force = false) {
               continue;
             }
 
-            const text = fmtSignal(data, pair, user.interval);
-            await send(chatId, text, env, { reply_markup: afterKb() });
+            const signalNo = await logAndSchedule(chatId, pair, sig, env);
             const expiryMinutes = sig.bestTimeframe?.expiry?.totalMinutes || user.interval;
             const expiryAt = Date.now() + expiryMinutes * 60 * 1000;
             await setActiveLock(chatId, pair, dir, expiryAt, env);
-            await logAndSchedule(chatId, pair, sig, env);
+            const text = `📌 Signal No. ${signalNo}\n` + fmtSignal(data, pair, user.interval);
+            await send(chatId, text, env, { reply_markup: afterKb() });
             user.noTradeStreak = 0;
           } else {
             user.noTradeStreak = (user.noTradeStreak || 0) + 1;
@@ -944,22 +955,22 @@ async function runResultCheck(env, log = console.log) {
       await setTradeResult(trade.chatId, tradeId, result, current, pips, env);
       await clearActiveLock(trade.chatId, trade.pair, env);
 
-      const dirE = trade.direction === 'BUY' ? '🟢' : '🔴';
-      const resE = result === 'WIN' ? '✅ WIN' : '❌ LOSS';
+      const dirE   = trade.direction === 'BUY' ? '🟢' : '🔴';
+      const resE   = result === 'WIN' ? '✅ WIN' : '❌ LOSS';
+      const noStr  = trade.signalNo ? `No. ${trade.signalNo}` : tradeId;
 
       // How late was the result check vs expiry?
       const lateMs  = now - trade.expiryAt;
       const lateMin = Math.round(lateMs / 60000);
-      const lateStr = lateMin > 0 ? ` (+${lateMin}min late)` : '';
+      const lateStr = lateMin > 1 ? ` (+${lateMin}min)` : '';
 
       await send(trade.chatId,
-        `${resE} — Auto Result${lateStr}\n` +
+        `📊 Tracking ${noStr}${lateStr}\n` +
         `━━━━━━━━━━━━━━\n` +
-        `${dirE} ${trade.direction} ${disp(trade.pair)}\n` +
-        `Entry:  ${entry.toFixed(5)}\n` +
-        `Exit:   ${current.toFixed(5)}\n` +
-        `Move:   ${diff > 0 ? '+' : ''}${pips}${unit}\n` +
-        `ID: ${tradeId}`,
+        `${resE}  ${dirE} ${trade.direction} ${disp(trade.pair)}\n` +
+        `💰 Entry:  ${entry.toFixed(5)}\n` +
+        `🏁 Exit:   ${current.toFixed(5)}\n` +
+        `📏 Move:   ${diff > 0 ? '+' : ''}${pips}${unit}`,
         env, { reply_markup: afterKb() });
 
     } catch (e) {
