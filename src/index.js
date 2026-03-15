@@ -1,6 +1,7 @@
 /**
- * FTT Signal Telegram Bot — v2.2
- * Fixed: Cron auto scan, auto win/loss tracking, KV reliability
+ * FTT Signal Telegram Bot — v3.0
+ * New: Grade filter, /scan all pairs, daily summary, milestone fix,
+ *      quick stats in menu, history pagination, pair quick-signal
  *
  * KV Binding     : BOT_KV
  * Service Binding: SIGNAL_WORKER → my-worker-601
@@ -8,17 +9,17 @@
  */
 
 const PAIR_PAGES = [
-  ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD'],
-  ['USD/CAD', 'GBP/JPY', 'EUR/GBP', 'NZD/USD'],
-  ['USD/CHF', 'EUR/JPY', 'EUR/AUD', 'AUD/JPY'],
-  ['BTC/USD', 'ETH/USD', 'SOL/USD', 'BNB/USD'],
-  ['XRP/USD', 'ADA/USD', 'DOGE/USD', 'AVAX/USD'],
+  ['EUR/USD','GBP/USD','USD/JPY','AUD/USD'],
+  ['USD/CAD','GBP/JPY','EUR/GBP','NZD/USD'],
+  ['USD/CHF','EUR/JPY','EUR/AUD','AUD/JPY'],
+  ['BTC/USD','ETH/USD','SOL/USD','BNB/USD'],
+  ['XRP/USD','ADA/USD','DOGE/USD','AVAX/USD'],
 ];
-
-const VALID_INTERVALS = [1, 5, 15];
-const MAX_WATCHLIST   = 6;
-const MAX_HISTORY     = 50;
-const CRYPTO_BASES    = ['BTC','ETH','BNB','XRP','SOL','ADA','DOGE','AVAX','DOT','LINK'];
+const VALID_INTERVALS  = [1,5,15];
+const MAX_WATCHLIST    = 6;
+const MAX_HISTORY      = 100;  // increased
+const MILESTONE_COUNT  = 50;
+const CRYPTO_BASES     = ['BTC','ETH','BNB','XRP','SOL','ADA','DOGE','AVAX','DOT','LINK'];
 
 // ─── ENTRY POINTS ─────────────────────────────────────────────────────────────
 
@@ -32,175 +33,120 @@ export default {
       return new Response('OK');
     }
 
-    if (url.pathname === '/debug') {
-      const pair = url.searchParams.get('pair') || 'EURUSD';
-      try {
-        const data = await fetchSignal(pair, env);
-        return new Response(JSON.stringify(data, null, 2), {
-          headers: { 'Content-Type': 'application/json' },
-        });
-      } catch (e) {
-        return new Response(JSON.stringify({ error: e.message }), {
-          headers: { 'Content-Type': 'application/json' }, status: 500,
-        });
-      }
+    if (url.pathname === '/setup') {
+      if (url.searchParams.get('secret') !== env.SETUP_SECRET)
+        return new Response('Unauthorized', { status: 401 });
+      const webhookUrl = `https://${url.hostname}/webhook`;
+      const res = await fetch(`${tgApi(env)}/setWebhook`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: webhookUrl, allowed_updates: ['message','callback_query'], drop_pending_updates: true }),
+      });
+      return new Response(JSON.stringify(await res.json(), null, 2), { headers: { 'Content-Type': 'application/json' } });
     }
 
-    // Debug cron manually (waits for result)
     if (url.pathname === '/runcron') {
       if (url.searchParams.get('secret') !== env.SETUP_SECRET)
         return new Response('Unauthorized', { status: 401 });
       const logs = [];
       const force = url.searchParams.get('force') === 'true';
       await runCron(env, logs, force);
-      return new Response(logs.join('\n') || 'Cron done (no logs)', {
-        headers: { 'Content-Type': 'text/plain' },
-      });
+      return new Response(logs.join('\n'), { headers: { 'Content-Type': 'text/plain' } });
     }
 
-    // Check KV state
     if (url.pathname === '/debugkv') {
       if (url.searchParams.get('secret') !== env.SETUP_SECRET)
         return new Response('Unauthorized', { status: 401 });
-      try {
-        const autoUsers  = (await env.BOT_KV.get('auto_users', 'json')) || [];
-        const pendingIds = (await env.BOT_KV.get('pending_ids', 'json')) || [];
-        const result     = { autoUsers, pendingIds, users: {} };
-        for (const id of autoUsers) {
-          result.users[id] = (await env.BOT_KV.get(`u:${id}`, 'json')) || null;
-        }
-        return new Response(JSON.stringify(result, null, 2), {
-          headers: { 'Content-Type': 'application/json' },
-        });
-      } catch (e) {
-        return new Response(JSON.stringify({ error: e.message }), {
-          headers: { 'Content-Type': 'application/json' }, status: 500,
-        });
-      }
+      const autoUsers  = (await kvGet('auto_users', env)) || [];
+      const pendingIds = (await kvGet('pending_ids', env)) || [];
+      const users = {};
+      for (const id of autoUsers) users[id] = await kvGet(`u:${id}`, env);
+      return new Response(JSON.stringify({ autoUsers, pendingIds, users }, null, 2), { headers: { 'Content-Type': 'application/json' } });
     }
 
-    // Register chatId for auto (call from Telegram to force-add)
     if (url.pathname === '/addauto') {
       if (url.searchParams.get('secret') !== env.SETUP_SECRET)
         return new Response('Unauthorized', { status: 401 });
       const chatId = url.searchParams.get('chat');
       if (!chatId) return new Response('Missing ?chat=', { status: 400 });
-      const list = (await env.BOT_KV.get('auto_users', 'json')) || [];
+      const list = (await kvGet('auto_users', env)) || [];
       if (!list.includes(chatId)) list.push(chatId);
-      await env.BOT_KV.put('auto_users', JSON.stringify(list));
-      const user = (await env.BOT_KV.get(`u:${chatId}`, 'json')) || {};
+      await kvPut('auto_users', list, env);
+      const user = (await kvGet(`u:${chatId}`, env)) || defaultUser();
       user.autoEnabled = true;
-      user.lastPairScanAt = {};  // reset so scan runs immediately
-      user.noTradeStreak = 0;
-      await env.BOT_KV.put(`u:${chatId}`, JSON.stringify(user));
-      return new Response(JSON.stringify({ ok: true, autoUsers: list, user }), {
-        headers: { 'Content-Type': 'application/json' },
-      });
+      user.lastPairScanAt = {};
+      await kvPut(`u:${chatId}`, user, env);
+      return new Response(JSON.stringify({ ok: true, autoUsers: list }), { headers: { 'Content-Type': 'application/json' } });
     }
 
-    if (url.pathname === '/setup') {
-      if (url.searchParams.get('secret') !== env.SETUP_SECRET)
-        return new Response('Unauthorized', { status: 401 });
-      const webhookUrl = `https://${url.hostname}/webhook`;
-      const res = await fetch(`${tgApi(env)}/setWebhook`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          url: webhookUrl,
-          allowed_updates: ['message', 'callback_query'],
-          drop_pending_updates: true,
-        }),
-      });
-      return new Response(JSON.stringify(await res.json(), null, 2), {
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
-
-    // Export history as CSV
     if (url.pathname === '/export') {
       if (url.searchParams.get('secret') !== env.SETUP_SECRET)
         return new Response('Unauthorized', { status: 401 });
       const chatId = url.searchParams.get('chat');
-      if (!chatId) return new Response('Missing ?chat=CHAT_ID', { status: 400 });
-
+      if (!chatId) return new Response('Missing ?chat=', { status: 400 });
       const history = (await kvGet(`h:${chatId}`, env)) || [];
       if (!history.length) return new Response('No data', { status: 404 });
-
-      const header = 'ID,Pair,Direction,Confidence,Entry Price,Expiry (min),Result,Exit Price,Pips,Timestamp,Resolved At';
+      const header = 'No,ID,Pair,Direction,Grade,Confidence,Entry,Exit,Pips,Result,Expiry(min),Timestamp,ResolvedAt';
       const rows = history.map(h => [
-        h.id || '',
-        h.pair || '',
-        h.direction || '',
-        h.confidence || '',
-        h.entryPrice || '',
-        h.expiryMinutes || '',
-        h.result || 'PENDING',
-        h.exitPrice || '',
-        h.pips || '',
-        h.timestamp || '',
-        h.resolvedAt || '',
+        h.no||'', h.id||'', h.pair||'', h.direction||'', h.grade||'',
+        h.confidence||'', h.entryPrice||'', h.exitPrice||'', h.pips||'',
+        h.result||'PENDING', h.expiryMinutes||'', h.timestamp||'', h.resolvedAt||''
       ].join(','));
-
       const csv = [header, ...rows].join('\n');
-      const filename = `ftt-signals-${chatId}-${new Date().toISOString().slice(0,10)}.csv`;
-
-      return new Response(csv, {
-        headers: {
-          'Content-Type': 'text/csv',
-          'Content-Disposition': `attachment; filename="${filename}"`,
-        },
-      });
+      return new Response(csv, { headers: {
+        'Content-Type': 'text/csv',
+        'Content-Disposition': `attachment; filename="ftt-signals-${chatId}-${new Date().toISOString().slice(0,10)}.csv"`,
+      }});
     }
 
-    return new Response('FTT Signal Bot v2.2 — OK');
+    if (url.pathname === '/debug') {
+      const pair = url.searchParams.get('pair') || 'EURUSD';
+      try {
+        const data = await fetchSignal(pair, env);
+        return new Response(JSON.stringify(data, null, 2), { headers: { 'Content-Type': 'application/json' } });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: e.message }), { headers: { 'Content-Type': 'application/json' }, status: 500 });
+      }
+    }
+
+    return new Response('FTT Signal Bot v3.0');
   },
 
-  // Cron: every 1 minute
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runCron(env, [], true));
   },
 };
 
-// ─── CRON MASTER ──────────────────────────────────────────────────────────────
+// ─── CRON ─────────────────────────────────────────────────────────────────────
 
 async function runCron(env, logs = [], force = false) {
-  const log = (m) => { console.log(m); logs.push(String(m)); };
-  log('Cron started: ' + new Date().toISOString());
-  if (!env.BOT_TOKEN) { log('ERROR: BOT_TOKEN missing in env'); return; }
-  if (!env.BOT_KV)    { log('ERROR: BOT_KV binding missing');  return; }
-  try { await runAutoScan(env, log, force); }    catch (e) { log('AutoScan error: ' + e.message); }
-  try { await runResultCheck(env, log); } catch (e) { log('ResultCheck error: ' + e.message); }
-  log('Cron done');
+  const log = m => { console.log(m); logs.push(String(m)); };
+  log('Cron ' + new Date().toISOString());
+  if (!env.BOT_TOKEN) { log('ERROR: BOT_TOKEN missing'); return; }
+  if (!env.BOT_KV)    { log('ERROR: BOT_KV missing');    return; }
+  try { await runAutoScan(env, log, force); }   catch (e) { log('ScanErr: ' + e.message); }
+  try { await runResultCheck(env, log); }        catch (e) { log('ResultErr: ' + e.message); }
+  try { await runDailySummary(env, log); }       catch (e) { log('SummaryErr: ' + e.message); }
+  log('Done');
 }
 
 // ─── SIGNAL FETCH ─────────────────────────────────────────────────────────────
 
 async function fetchSignal(pair, env) {
-  const req = new Request(`https://signal/api/signal?pair=${pair}`, {
-    headers: { Accept: 'application/json' },
-  });
-  let res;
-  if (env.SIGNAL_WORKER) {
-    res = await env.SIGNAL_WORKER.fetch(req);
-  } else {
-    res = await fetch(
-      `https://my-worker-601.umuhammadiswa.workers.dev/api/signal?pair=${pair}`,
-      { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20000) }
-    );
-  }
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`HTTP ${res.status} — ${body.slice(0, 200)}`);
-  }
+  const req = new Request(`https://signal/api/signal?pair=${pair}`, { headers: { Accept: 'application/json' } });
+  const res = env.SIGNAL_WORKER
+    ? await env.SIGNAL_WORKER.fetch(req)
+    : await fetch(`https://my-worker-601.umuhammadiswa.workers.dev/api/signal?pair=${pair}`,
+        { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status} — ${(await res.text().catch(()=>'')).slice(0,200)}`);
   return res.json();
 }
 
 async function fetchCurrentPrice(pair, env) {
   try {
-    const data = await fetchSignal(pair, env);
-    return data?.signal?.recommendations?.['1min']?.entry?.price
-        || data?.signal?.recommendations?.['5min']?.entry?.price
-        || data?.signal?.recommendations?.['15min']?.entry?.price
+    const d = await fetchSignal(pair, env);
+    return d?.signal?.recommendations?.['1min']?.entry?.price
+        || d?.signal?.recommendations?.['5min']?.entry?.price
+        || d?.signal?.recommendations?.['15min']?.entry?.price
         || null;
   } catch { return null; }
 }
@@ -210,70 +156,48 @@ async function fetchCurrentPrice(pair, env) {
 function tgApi(env) { return `https://api.telegram.org/bot${env.BOT_TOKEN}`; }
 
 async function tgCall(method, body, env) {
-  if (!env.BOT_TOKEN) { console.error('tgCall: BOT_TOKEN missing'); return; }
+  if (!env.BOT_TOKEN) return;
   try {
     const res = await fetch(`${tgApi(env)}/${method}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     });
-    if (!res.ok) {
-      const t = await res.text();
-      console.error(`tgCall ${method} ${res.status}: ${t.slice(0, 300)}`);
-    }
-  } catch (e) { console.error(`tgCall ${method}: ${e.message}`); }
+    if (!res.ok) console.error(`tg ${method} ${res.status}:`, (await res.text()).slice(0,200));
+  } catch (e) { console.error(`tg ${method}:`, e.message); }
 }
 
-// Plain text only — no Markdown parse errors
 function send(chatId, text, env, extra = {}) {
-  return tgCall('sendMessage', {
-    chat_id: chatId,
-    text: clean(text),
-    disable_web_page_preview: true,
-    ...extra,
-  }, env);
+  return tgCall('sendMessage', { chat_id: chatId, text: cl(text), disable_web_page_preview: true, ...extra }, env);
 }
-
 function edit(chatId, msgId, text, env, extra = {}) {
-  return tgCall('editMessageText', {
-    chat_id: chatId,
-    message_id: msgId,
-    text: clean(text),
-    disable_web_page_preview: true,
-    ...extra,
-  }, env);
+  return tgCall('editMessageText', { chat_id: chatId, message_id: msgId, text: cl(text), disable_web_page_preview: true, ...extra }, env);
 }
-
 function answerCb(id, text, env) {
   return tgCall('answerCallbackQuery', { callback_query_id: id, text: text || '' }, env);
 }
+function cl(t) { return String(t||'').replace(/[*_`\[\]]/g,''); }
 
-function clean(t) {
-  return String(t || '').replace(/[*_`\[\]]/g, '');
-}
-
-// ─── KV HELPERS ───────────────────────────────────────────────────────────────
+// ─── KV ───────────────────────────────────────────────────────────────────────
 
 async function kvGet(key, env) {
-  try { return await env.BOT_KV.get(key, 'json'); }
-  catch (e) { console.error('kvGet', key, e.message); return null; }
+  try { return await env.BOT_KV.get(key, 'json'); } catch { return null; }
 }
-
 async function kvPut(key, value, env, opts = {}) {
   try { await env.BOT_KV.put(key, JSON.stringify(value), opts); return true; }
   catch (e) { console.error('kvPut', key, e.message); return false; }
 }
+async function kvDel(key, env) {
+  try { await env.BOT_KV.delete(key); } catch {}
+}
 
-// ─── USER DATA ────────────────────────────────────────────────────────────────
+// ─── USER ─────────────────────────────────────────────────────────────────────
 
 function defaultUser() {
   return {
-    pair: 'EURUSD',
-    watchlist: [],
-    interval: 5,
-    autoEnabled: false,
-    lastPairScanAt: {},
-    noTradeStreak: 0,
+    pair: 'EURUSD', watchlist: [], interval: 5,
+    autoEnabled: false, noTradeStreak: 0,
+    gradeFilter: 'ALL',    // ALL / A / AB
+    dailySummary: false,   // send daily summary
+    summaryHour: 20,       // UTC hour for daily summary
   };
 }
 
@@ -281,21 +205,13 @@ async function getUser(chatId, env) {
   const d = await kvGet(`u:${chatId}`, env);
   return d ? { ...defaultUser(), ...d } : defaultUser();
 }
+async function saveUser(chatId, data, env) { await kvPut(`u:${chatId}`, data, env); }
 
-async function saveUser(chatId, data, env) {
-  await kvPut(`u:${chatId}`, data, env);
-}
-
-async function getAutoUsers(env) {
-  return (await kvGet('auto_users', env)) || [];
-}
-
+async function getAutoUsers(env) { return (await kvGet('auto_users', env)) || []; }
 async function addAutoUser(chatId, env) {
   const list = await getAutoUsers(env);
-  const id   = String(chatId);
-  if (!list.includes(id)) await kvPut('auto_users', [...list, id], env);
+  if (!list.includes(String(chatId))) await kvPut('auto_users', [...list, String(chatId)], env);
 }
-
 async function removeAutoUser(chatId, env) {
   const list = await getAutoUsers(env);
   await kvPut('auto_users', list.filter(id => id !== String(chatId)), env);
@@ -303,27 +219,22 @@ async function removeAutoUser(chatId, env) {
 
 // ─── HISTORY ──────────────────────────────────────────────────────────────────
 
-async function getHistory(chatId, env) {
-  return (await kvGet(`h:${chatId}`, env)) || [];
-}
+async function getHistory(chatId, env) { return (await kvGet(`h:${chatId}`, env)) || []; }
 
 async function addToHistory(chatId, entry, env) {
   const h = await getHistory(chatId, env);
-  // Find highest existing number, increment by 1
-  const maxNo = h.reduce((m, x) => Math.max(m, x.no || 0), 0);
-  entry.no = maxNo + 1;
+  // Persistent signal counter (never resets with history trim)
+  const counter = ((await kvGet(`cnt:${chatId}`, env)) || 0) + 1;
+  await kvPut(`cnt:${chatId}`, counter, env);
+  entry.no = counter;
   h.unshift(entry);
-  // Keep max 50 entries + only last 30 days
   const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
-  const trimmed = h
-    .slice(0, MAX_HISTORY)
-    .filter(x => new Date(x.timestamp).getTime() > cutoff);
-  await kvPut(`h:${chatId}`, trimmed, env);
-  return entry.no;  // return signal number
+  await kvPut(`h:${chatId}`, h.slice(0, MAX_HISTORY).filter(x => new Date(x.timestamp).getTime() > cutoff), env);
+  return counter;
 }
 
 async function setTradeResult(chatId, tradeId, result, exitPrice, pips, env) {
-  const h   = await getHistory(chatId, env);
+  const h = await getHistory(chatId, env);
   const idx = h.findIndex(x => x.id === tradeId);
   if (idx !== -1) {
     h[idx] = { ...h[idx], result, exitPrice, pips, resolvedAt: new Date().toISOString() };
@@ -332,56 +243,65 @@ async function setTradeResult(chatId, tradeId, result, exitPrice, pips, env) {
 }
 
 // ─── PENDING TRADES ───────────────────────────────────────────────────────────
-// Each trade stored as individual KV key: pt:{tradeId}
-// List of trade IDs: pending_ids
-// This avoids list race conditions
 
-async function getPendingIds(env) {
-  return (await kvGet('pending_ids', env)) || [];
-}
-
+async function getPendingIds(env) { return (await kvGet('pending_ids', env)) || []; }
 async function addPendingTrade(trade, env) {
-  await kvPut(`pt:${trade.tradeId}`, trade, env, { expirationTtl: 3600 }); // auto-expire 1h
+  await kvPut(`pt:${trade.tradeId}`, trade, env, { expirationTtl: 7200 });
   const ids = await getPendingIds(env);
-  if (!ids.includes(trade.tradeId)) {
-    await kvPut('pending_ids', [...ids, trade.tradeId], env);
-  }
+  if (!ids.includes(trade.tradeId)) await kvPut('pending_ids', [...ids, trade.tradeId], env);
 }
+async function savePendingIds(ids, env) { await kvPut('pending_ids', ids, env); }
 
-async function removePendingId(tradeId, env) {
-  const ids = await getPendingIds(env);
-  await kvPut('pending_ids', ids.filter(id => id !== tradeId), env);
-}
-// Active signal lock per user+pair+direction
-// Key: lock:{chatId}:{pair}  Value: { direction, expiryAt }
-async function getActiveLock(chatId, pair, env) {
-  return await kvGet(`lock:${chatId}:${pair}`, env);
-}
+// ─── ACTIVE LOCK ──────────────────────────────────────────────────────────────
 
+async function getActiveLock(chatId, pair, env) { return kvGet(`lock:${chatId}:${pair}`, env); }
 async function setActiveLock(chatId, pair, direction, expiryAt, env) {
-  const ttlSeconds = Math.ceil((expiryAt - Date.now()) / 1000) + 60; // +60s buffer
-  await kvPut(`lock:${chatId}:${pair}`, { direction, expiryAt }, env, { expirationTtl: ttlSeconds });
+  const ttl = Math.max(60, Math.ceil((expiryAt - Date.now()) / 1000) + 120);
+  await kvPut(`lock:${chatId}:${pair}`, { direction, expiryAt }, env, { expirationTtl: ttl });
 }
+async function clearActiveLock(chatId, pair, env) { await kvDel(`lock:${chatId}:${pair}`, env); }
 
-async function clearActiveLock(chatId, pair, env) {
-  try { await env.BOT_KV.delete(`lock:${chatId}:${pair}`); } catch {}
+// ─── LOG & SCHEDULE ───────────────────────────────────────────────────────────
+
+async function logAndSchedule(chatId, pair, sig, env) {
+  const dir           = sig.finalSignal;
+  const best          = sig.bestTimeframe;
+  const expiryMinutes = best?.expiry?.totalMinutes || 5;
+  const expiryAt      = Date.now() + expiryMinutes * 60 * 1000;
+  const entryPrice    = sig.recommendations?.['1min']?.entry?.price
+                     || sig.recommendations?.['5min']?.entry?.price || null;
+  const grade         = sig.grade ? `${sig.grade.grade} ${sig.grade.label}` : '';
+  const tradeId       = uid();
+
+  const signalNo = await addToHistory(chatId, {
+    id: tradeId, pair, direction: dir,
+    confidence: sig.confidence || '0%', grade,
+    entryPrice, expiryMinutes,
+    expiryAt: new Date(expiryAt).toISOString(),
+    timestamp: new Date().toISOString(), result: null,
+  }, env);
+
+  await addPendingTrade({ chatId: String(chatId), tradeId, pair, direction: dir, entryPrice, expiryAt, signalNo, grade }, env);
+  await setActiveLock(chatId, pair, dir, expiryAt, env);
+  return signalNo;
 }
 
 // ─── KEYBOARDS ────────────────────────────────────────────────────────────────
 
-function mainKb(autoEnabled) {
+function mainKb(user) {
+  const auto = user.autoEnabled;
   return { inline_keyboard: [
     [
-      { text: '📊 Signal Now',  callback_data: 'cmd:signal'      },
-      { text: autoEnabled ? '🔕 Stop Auto' : '🔄 Start Auto', callback_data: 'cmd:toggle_auto' },
+      { text: '📊 Signal Now',  callback_data: 'cmd:signal'     },
+      { text: auto ? '🔕 Stop Auto' : '🔄 Start Auto', callback_data: 'cmd:toggle_auto' },
     ],
     [
-      { text: '💱 Change Pair', callback_data: 'pairpage:0'    },
-      { text: '⏱ Interval',    callback_data: 'cmd:intervals'  },
+      { text: '🔍 Scan All',    callback_data: 'cmd:scanall'    },
+      { text: '⚙️ Settings',    callback_data: 'cmd:settings'   },
     ],
     [
       { text: '👁 Watchlist',   callback_data: 'cmd:watchlist'  },
-      { text: '📈 History',     callback_data: 'cmd:history'    },
+      { text: '📈 History',     callback_data: 'cmd:history:0'  },
     ],
     [
       { text: '🏆 Stats',       callback_data: 'cmd:stats'      },
@@ -390,35 +310,45 @@ function mainKb(autoEnabled) {
   ]};
 }
 
+function settingsKb(user) {
+  const gf = user.gradeFilter || 'ALL';
+  const ds = user.dailySummary ? 'ON' : 'OFF';
+  return { inline_keyboard: [
+    [
+      { text: '💱 Change Pair',   callback_data: 'pairpage:0'    },
+      { text: '⏱ Interval',       callback_data: 'cmd:intervals' },
+    ],
+    [
+      { text: `🎯 Grade Filter: ${gf}`, callback_data: 'cmd:gradefilter' },
+      { text: `📅 Daily Summary: ${ds}`, callback_data: 'cmd:togglesummary' },
+    ],
+    [{ text: '🔙 Back', callback_data: 'cmd:main' }],
+  ]};
+}
+
 function pairsKb(page) {
   page = Math.max(0, Math.min(page, PAIR_PAGES.length - 1));
-  const kb = [];
-  for (let i = 0; i < PAIR_PAGES[page].length; i += 2) {
-    const row = [{ text: PAIR_PAGES[page][i], callback_data: `pair:${PAIR_PAGES[page][i]}` }];
-    if (PAIR_PAGES[page][i+1]) row.push({ text: PAIR_PAGES[page][i+1], callback_data: `pair:${PAIR_PAGES[page][i+1]}` });
-    kb.push(row);
-  }
+  const kb = PAIR_PAGES[page].reduce((rows, p, i) => {
+    if (i % 2 === 0) rows.push([]);
+    rows[rows.length-1].push({ text: p, callback_data: `pair:${p}` });
+    return rows;
+  }, []);
   const nav = [];
   if (page > 0)                     nav.push({ text: '◀ Prev', callback_data: `pairpage:${page-1}` });
   if (page < PAIR_PAGES.length - 1) nav.push({ text: 'Next ▶', callback_data: `pairpage:${page+1}` });
   if (nav.length) kb.push(nav);
-  kb.push([{ text: '🔙 Back', callback_data: 'cmd:main' }]);
+  kb.push([{ text: '🔙 Back', callback_data: 'cmd:settings' }]);
   return { inline_keyboard: kb };
 }
 
-function wlAddKb(page, watchlist) {
+function wlAddKb(page, wl) {
   page = Math.max(0, Math.min(page, PAIR_PAGES.length - 1));
-  const kb = [];
-  for (let i = 0; i < PAIR_PAGES[page].length; i += 2) {
-    const row = [];
-    for (let j = i; j < Math.min(i+2, PAIR_PAGES[page].length); j++) {
-      const p    = PAIR_PAGES[page][j];
-      const code = norm(p);
-      const inWL = watchlist.includes(code);
-      row.push({ text: inWL ? `✅ ${p}` : p, callback_data: inWL ? `wl:rm:${code}` : `wl:add:${code}` });
-    }
-    kb.push(row);
-  }
+  const kb = PAIR_PAGES[page].reduce((rows, p, i) => {
+    if (i % 2 === 0) rows.push([]);
+    const code = norm(p), inWL = wl.includes(code);
+    rows[rows.length-1].push({ text: inWL ? `✅ ${p}` : p, callback_data: inWL ? `wl:rm:${code}` : `wl:add:${code}` });
+    return rows;
+  }, []);
   const nav = [];
   if (page > 0)                     nav.push({ text: '◀ Prev', callback_data: `wlpage:${page-1}` });
   if (page < PAIR_PAGES.length - 1) nav.push({ text: 'Next ▶', callback_data: `wlpage:${page+1}` });
@@ -427,13 +357,20 @@ function wlAddKb(page, watchlist) {
   return { inline_keyboard: kb };
 }
 
-function wlKb(watchlist) {
-  const kb = [];
-  for (let i = 0; i < watchlist.length; i += 2) {
-    const row = [];
-    for (let j = i; j < Math.min(i+2, watchlist.length); j++)
-      row.push({ text: `❌ ${disp(watchlist[j])}`, callback_data: `wl:rm:${watchlist[j]}` });
-    kb.push(row);
+function wlKb(wl) {
+  const kb = wl.reduce((rows, p, i) => {
+    if (i % 2 === 0) rows.push([]);
+    rows[rows.length-1].push({ text: `❌ ${disp(p)}`, callback_data: `wl:rm:${p}` });
+    return rows;
+  }, []);
+  // Quick signal buttons for each watchlist pair
+  if (wl.length > 0) {
+    const qRows = wl.reduce((rows, p, i) => {
+      if (i % 2 === 0) rows.push([]);
+      rows[rows.length-1].push({ text: `📊 ${disp(p)}`, callback_data: `qs:${p}` });
+      return rows;
+    }, []);
+    kb.push(...qRows);
   }
   kb.push([{ text: '➕ Add Pairs', callback_data: 'wlpage:0' }]);
   kb.push([{ text: '🔙 Back', callback_data: 'cmd:main' }]);
@@ -447,138 +384,177 @@ function intervalKb() {
       { text: '📊 5 min',  callback_data: 'interval:5'  },
       { text: '🕐 15 min', callback_data: 'interval:15' },
     ],
-    [{ text: '🔙 Back', callback_data: 'cmd:main' }],
+    [{ text: '🔙 Back', callback_data: 'cmd:settings' }],
+  ]};
+}
+
+function gradeFilterKb() {
+  return { inline_keyboard: [
+    [
+      { text: '🌐 All grades',    callback_data: 'gf:ALL' },
+      { text: '⭐ A + B only',    callback_data: 'gf:AB'  },
+      { text: '🏆 A grade only',  callback_data: 'gf:A'   },
+    ],
+    [{ text: '🔙 Back', callback_data: 'cmd:settings' }],
   ]};
 }
 
 function afterKb() {
   return { inline_keyboard: [[
-    { text: '🔁 New Signal', callback_data: 'cmd:signal'  },
-    { text: '📈 History',    callback_data: 'cmd:history' },
-    { text: '🔙 Menu',       callback_data: 'cmd:main'    },
+    { text: '🔁 New Signal', callback_data: 'cmd:signal'   },
+    { text: '📈 History',    callback_data: 'cmd:history:0'},
+    { text: '🔙 Menu',       callback_data: 'cmd:main'     },
   ]]};
+}
+
+function historyNavKb(page, total) {
+  const perPage = 10, totalPages = Math.ceil(total / perPage);
+  const nav = [];
+  if (page > 0)               nav.push({ text: '◀ Prev', callback_data: `cmd:history:${page-1}` });
+  if (page < totalPages - 1)  nav.push({ text: 'Next ▶', callback_data: `cmd:history:${page+1}` });
+  const kb = [];
+  if (nav.length) kb.push(nav);
+  kb.push([
+    { text: '🏆 Stats',  callback_data: 'cmd:stats'    },
+    { text: '🔙 Back',   callback_data: 'cmd:main'     },
+  ]);
+  return { inline_keyboard: kb };
 }
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-function disp(pair) {
-  if (!pair.includes('/') && pair.length === 6)
-    return pair.slice(0,3) + '/' + pair.slice(3);
-  return pair;
+function disp(p) { return (!p.includes('/') && p.length===6) ? p.slice(0,3)+'/'+p.slice(3) : p; }
+function norm(p) { return p.replace('/',''); }
+function uid()  { return Math.random().toString(36).slice(2,8).toUpperCase(); }
+function isCrypto(p) { return CRYPTO_BASES.some(b => p.startsWith(b)); }
+
+function passesGradeFilter(sig, filter) {
+  if (filter === 'ALL') return true;
+  const g = sig.grade?.grade || '';
+  if (filter === 'A')  return g === 'A';
+  if (filter === 'AB') return g === 'A' || g === 'B';
+  return true;
 }
 
-function norm(pair) { return pair.replace('/', ''); }
+// ─── FORMATTERS ───────────────────────────────────────────────────────────────
 
-function uid() { return Math.random().toString(36).slice(2,8).toUpperCase(); }
-
-function isCrypto(pair) {
-  return CRYPTO_BASES.some(b => pair.startsWith(b));
-}
-
-// ─── SIGNAL FORMATTER ─────────────────────────────────────────────────────────
-
-function fmtSignal(data, pair, interval) {
+function fmtSignal(data, pair, interval, signalNo) {
   const label = disp(pair);
-
   if (data.marketStatus === 'CLOSED') {
-    return `📊 ${label} | ${interval}min\n` +
-           `━━━━━━━━━━━━━━\n` +
-           `🔴 Forex Market CLOSED\n` +
-           `🕐 Opens in: ${data.opensIn || 'Soon'}\n\n` +
-           `💡 Try BTC/USD (24/7)`;
+    return `📊 ${label} | ${interval}min\n━━━━━━━━━━━━━━\n🔴 Forex Market CLOSED\n💡 Try BTC/USD (24/7)`;
   }
-
   const sig = data.signal;
   if (!sig) return `📊 ${label} | ${interval}min\n━━━━━━━━━━━━━━\nNo signal data`;
 
-  const dir      = sig.finalSignal   || 'NO_TRADE';
-  const conf     = sig.confidence    || '0%';
-  const grade    = sig.grade ? `${sig.grade.grade} ${sig.grade.label}` : '';
-  const htf      = sig.higherTFTrend || 'NEUTRAL';
-  const reason   = sig.entryReason   || '';
-  const filters  = sig.filtersApplied || [];
-  const align    = sig.alignment     || '';
-  const best     = sig.bestTimeframe;
-  const expiry   = best?.expiry?.humanReadable || null;
-  const cd       = best?.expiry?.countdown?.label || null;
+  const dir    = sig.finalSignal || 'NO_TRADE';
+  const conf   = sig.confidence  || '0%';
+  const grade  = sig.grade ? `${sig.grade.grade} ${sig.grade.label}` : '';
+  const htf    = sig.higherTFTrend || 'NEUTRAL';
+  const reason = sig.entryReason  || '';
+  const best   = sig.bestTimeframe;
+  const expiry = best?.expiry?.humanReadable || null;
+  const cd     = best?.expiry?.countdown?.label || null;
 
-  const dirE = dir === 'BUY' ? '🟢' : dir === 'SELL' ? '🔴' : '⚪';
-  const htfE = htf === 'BUY' ? '📈' : htf === 'SELL' ? '📉' : '➡️';
+  const dE = dir==='BUY'?'🟢':dir==='SELL'?'🔴':'⚪';
+  const hE = htf==='BUY'?'📈':htf==='SELL'?'📉':'➡️';
 
-  let msg = `📊 ${label} | ${interval}min\n━━━━━━━━━━━━━━\n`;
+  const entryPrice = sig.recommendations?.['1min']?.entry?.price
+                  || sig.recommendations?.['5min']?.entry?.price
+                  || sig.recommendations?.['15min']?.entry?.price || null;
+
+  let msg = '';
+  if (signalNo) msg += `📌 Signal No. ${signalNo}\n`;
+  msg += `📊 ${label} | ${interval}min\n━━━━━━━━━━━━━━\n`;
 
   if (dir === 'BUY' || dir === 'SELL') {
-    const entryPrice = sig.recommendations?.['1min']?.entry?.price
-                    || sig.recommendations?.['5min']?.entry?.price
-                    || sig.recommendations?.['15min']?.entry?.price
-                    || null;
-    msg += `${dirE} ${dir}  ${conf}  ${grade}\n`;
+    msg += `${dE} ${dir}  ${conf}  ${grade}\n`;
     if (entryPrice) msg += `💰 Entry: ${parseFloat(entryPrice).toFixed(5)}\n`;
-    if (expiry) msg += `⏰ Expiry: ${expiry}\n`;
-    if (cd)     msg += `🕐 Candle closes: ${cd}\n`;
-    msg += `${htfE} HTF 15min: ${htf}\n`;
-    if (reason) msg += `\n📝 ${reason}\n`;
+    if (expiry)     msg += `⏰ Expiry: ${expiry}\n`;
+    if (cd)         msg += `🕐 Candle closes: ${cd}\n`;
+    msg += `${hE} HTF 15min: ${htf}\n`;
+    if (reason)     msg += `\n📝 ${reason}\n`;
     msg += `\n⏳ Result will be tracked automatically`;
   } else {
+    const filters = sig.filtersApplied || [];
+    const align   = sig.alignment || '';
     msg += `⚪ NO TRADE\n`;
-    msg += filters.length > 0
-      ? `🔕 ${filters.join(' · ')}`
-      : `🔕 ${align === 'MIXED' ? 'Timeframes mixed' : 'Setup not clear'}`;
+    msg += filters.length > 0 ? `🔕 ${filters.join(' · ')}` : `🔕 ${align==='MIXED'?'Timeframes mixed':'Setup not clear'}`;
   }
-
   return msg;
 }
 
-function fmtHistory(history) {
-  if (!history.length) return 'No signals logged yet.';
-  let msg = `📈 Signal History (last ${history.length})\n━━━━━━━━━━━━━━\n`;
-  for (const h of history.slice(0, 15)) {
-    const dE = h.direction === 'BUY' ? '🟢' : '🔴';
-    const rE = h.result === 'WIN' ? '✅' : h.result === 'LOSS' ? '❌' : h.result === 'SKIP' ? '⏭' : '⏳';
-    const t  = new Date(h.timestamp).toUTCString().slice(5, 22);
-    const p  = h.pips != null ? ` (${h.pips > 0 ? '+' : ''}${h.pips})` : '';
-    msg += `${rE} ${dE} ${disp(h.pair)} ${h.confidence}${p}  ${t}\n`;
+function fmtHistory(history, page = 0) {
+  const perPage = 10;
+  const start   = page * perPage;
+  const slice   = history.slice(start, start + perPage);
+  if (!slice.length) return 'No signals yet.';
+
+  let msg = `📈 Signal History (${start+1}-${start+slice.length} of ${history.length})\n━━━━━━━━━━━━━━\n`;
+  for (const h of slice) {
+    const dE = h.direction==='BUY'?'🟢':'🔴';
+    const rE = h.result==='WIN'?'✅':h.result==='LOSS'?'❌':h.result==='SKIP'?'⏭':'⏳';
+    const g  = h.grade ? ` ${h.grade.split(' ')[0]}` : '';
+    const t  = new Date(h.timestamp).toUTCString().slice(5,17);
+    const p  = h.pips != null ? ` ${h.pips>0?'+':''}${h.pips}` : '';
+    msg += `${rE} #${h.no||'?'} ${dE} ${disp(h.pair)}${g} ${h.confidence}${p}  ${t}\n`;
   }
   return msg;
 }
 
 function fmtStats(history) {
-  const trades   = history.filter(h => h.direction === 'BUY' || h.direction === 'SELL');
-  const resolved = trades.filter(h => h.result === 'WIN' || h.result === 'LOSS');
-  const wins     = resolved.filter(h => h.result === 'WIN').length;
-  const losses   = resolved.filter(h => h.result === 'LOSS').length;
+  const trades   = history.filter(h => h.direction==='BUY'||h.direction==='SELL');
+  const resolved = trades.filter(h => h.result==='WIN'||h.result==='LOSS');
+  const wins     = resolved.filter(h => h.result==='WIN').length;
+  const losses   = resolved.filter(h => h.result==='LOSS').length;
   const total    = resolved.length;
-  const wr       = total > 0 ? Math.round((wins / total) * 100) : 0;
-  const pending  = trades.filter(h => !h.result).length;
+  const wr       = total > 0 ? Math.round(wins/total*100) : 0;
+  const pending  = trades.filter(h => !h.result||h.result==='SKIP').length;
 
   // Streak
-  let streak = 0; let sType = '';
+  let streak = 0, sType = '';
   for (const h of resolved) {
-    if (!sType) { sType = h.result; streak = 1; }
-    else if (h.result === sType) streak++;
+    if (!sType) { sType=h.result; streak=1; }
+    else if (h.result===sType) streak++;
     else break;
   }
 
   // Per pair
   const pm = {};
   for (const h of resolved) {
-    if (!pm[h.pair]) pm[h.pair] = { w: 0, l: 0 };
-    if (h.result === 'WIN')  pm[h.pair].w++;
-    if (h.result === 'LOSS') pm[h.pair].l++;
+    if (!pm[h.pair]) pm[h.pair]={w:0,l:0};
+    h.result==='WIN' ? pm[h.pair].w++ : pm[h.pair].l++;
+  }
+
+  // Per grade
+  const gm = {};
+  for (const h of resolved) {
+    const g = (h.grade||'Unknown').split(' ')[0];
+    if (!gm[g]) gm[g]={w:0,l:0};
+    h.result==='WIN' ? gm[g].w++ : gm[g].l++;
   }
 
   let msg = `🏆 Win/Loss Stats\n━━━━━━━━━━━━━━\n`;
-  msg += `✅ Wins:    ${wins}\n`;
-  msg += `❌ Losses:  ${losses}\n`;
+  msg += `✅ Wins:     ${wins}\n`;
+  msg += `❌ Losses:   ${losses}\n`;
   msg += `📊 Win Rate: ${wr}% (${total} trades)\n`;
-  msg += `⏳ Pending: ${pending}`;
+  msg += `⏳ Pending:  ${pending}`;
   if (streak >= 2) msg += `\n🔥 Streak: ${streak} ${sType}s`;
-  if (Object.keys(pm).length > 0) {
-    msg += `\n\nPer Pair:\n`;
-    for (const [pair, s] of Object.entries(pm)) {
-      const t  = s.w + s.l;
-      msg += `• ${disp(pair)}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)\n`;
+
+  if (Object.keys(gm).length > 0) {
+    msg += `\n\nGrade Breakdown:\n`;
+    for (const [g, s] of Object.entries(gm)) {
+      const t = s.w+s.l;
+      msg += `  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)\n`;
     }
+  }
+
+  if (Object.keys(pm).length > 0) {
+    msg += `\nTop Pairs:\n`;
+    Object.entries(pm).sort((a,b)=>(b[1].w+b[1].l)-(a[1].w+a[1].l)).slice(0,5)
+      .forEach(([p,s]) => {
+        const t=s.w+s.l;
+        msg += `  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)\n`;
+      });
   }
   return msg;
 }
@@ -594,44 +570,41 @@ async function handleUpdate(update, env) {
 
 async function handleMessage(msg, env) {
   const chatId = msg.chat.id;
-  const text   = (msg.text || '').trim();
+  const text   = (msg.text||'').trim();
   const user   = await getUser(chatId, env);
 
   if (text.startsWith('/start')) {
     return send(chatId,
-      `👋 FTT Signal Bot v2.2\n\n` +
-      `Signals + Watchlist + Auto Win/Loss Tracking\n\n` +
-      `Pair: EUR/USD  Interval: 5min  Auto OFF\n\nUse the buttons below 👇`,
-      env, { reply_markup: mainKb(user.autoEnabled) });
+      `👋 FTT Signal Bot v3.0\n\nSignals + Watchlist + Auto W/L Tracking + Grade Filter + Daily Summary\n\nPair: EUR/USD  5min  Auto OFF`,
+      env, { reply_markup: mainKb(user) });
   }
   if (text.startsWith('/signal'))    return doSignal(chatId, env);
+  if (text.startsWith('/scan'))      return doScanAll(chatId, env);
   if (text.startsWith('/auto'))      return doToggle(chatId, env);
   if (text.startsWith('/status'))    return doStatus(chatId, env);
-  if (text.startsWith('/history'))   return doHistory(chatId, env);
+  if (text.startsWith('/history'))   return doHistory(chatId, env, null, 0);
   if (text.startsWith('/stats'))     return doStats(chatId, env);
   if (text.startsWith('/watchlist')) return doWatchlist(chatId, env);
 
   if (text.startsWith('/pair ')) {
     const raw = text.slice(6).trim().toUpperCase().replace(/[\s/]/g,'');
-    user.pair = raw;
-    await saveUser(chatId, user, env);
-    return send(chatId, `✅ Pair set to ${disp(raw)}`, env, { reply_markup: mainKb(user.autoEnabled) });
+    user.pair = raw; await saveUser(chatId, user, env);
+    return send(chatId, `✅ Pair → ${disp(raw)}`, env, { reply_markup: mainKb(user) });
   }
   if (text.startsWith('/interval ')) {
     const m = parseInt(text.slice(10).trim(), 10);
     if (VALID_INTERVALS.includes(m)) {
-      user.interval = m;
-      await saveUser(chatId, user, env);
-      return send(chatId, `✅ Interval set to ${m} min`, env, { reply_markup: mainKb(user.autoEnabled) });
+      user.interval = m; await saveUser(chatId, user, env);
+      return send(chatId, `✅ Interval → ${m} min`, env, { reply_markup: mainKb(user) });
     }
     return send(chatId, `❌ Valid: 1, 5, 15`, env);
   }
   if (text.startsWith('/help')) {
     return send(chatId,
-      `/signal /auto /watchlist /history /stats /status\n/pair EURUSD\n/interval 5`,
-      env, { reply_markup: mainKb(user.autoEnabled) });
+      `FTT Signal Bot v3.0\n\n/signal — Signal for default pair\n/scan — Scan all pairs now\n/auto — Toggle auto scan\n/watchlist — Manage pairs\n/history — Signal history\n/stats — Win/Loss stats\n/status — Settings\n/pair EURUSD — Set pair\n/interval 5 — Set interval`,
+      env, { reply_markup: mainKb(user) });
   }
-  return send(chatId, `Use the buttons below 👇`, env, { reply_markup: mainKb(user.autoEnabled) });
+  return send(chatId, `Use the buttons below 👇`, env, { reply_markup: mainKb(user) });
 }
 
 async function handleCb(cb, env) {
@@ -642,44 +615,64 @@ async function handleCb(cb, env) {
   const user = await getUser(chatId, env);
 
   if (data === 'cmd:main') {
+    const h    = await getHistory(chatId, env);
+    const res  = h.filter(x => x.result==='WIN'||x.result==='LOSS');
+    const wr   = res.length > 0 ? Math.round(res.filter(x=>x.result==='WIN').length/res.length*100) : 0;
+    const cnt  = (await kvGet(`cnt:${chatId}`, env)) || 0;
     return edit(chatId, msgId,
-      `FTT Signal Bot\n\n${disp(user.pair)}  ${user.interval}min  ${user.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nWatchlist: ${user.watchlist.length} pairs`,
-      env, { reply_markup: mainKb(user.autoEnabled) });
+      `FTT Signal Bot v3.0\n\n${disp(user.pair)}  ${user.interval}min  ${user.autoEnabled?'Auto ON':'Auto OFF'}\nWatchlist: ${user.watchlist.length} pairs  |  Grade: ${user.gradeFilter||'ALL'}\n\nTotal Signals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`,
+      env, { reply_markup: mainKb(user) });
   }
-  if (data === 'cmd:signal')      return doSignal(chatId, env, msgId);
-  if (data === 'cmd:toggle_auto') return doToggle(chatId, env, msgId);
-  if (data === 'cmd:status')      return doStatus(chatId, env, msgId);
-  if (data === 'cmd:history')     return doHistory(chatId, env, msgId);
-  if (data === 'cmd:stats')       return doStats(chatId, env, msgId);
-  if (data === 'cmd:watchlist')   return doWatchlist(chatId, env, msgId);
+
+  if (data === 'cmd:signal')       return doSignal(chatId, env, msgId);
+  if (data === 'cmd:toggle_auto')  return doToggle(chatId, env, msgId);
+  if (data === 'cmd:status')       return doStatus(chatId, env, msgId);
+  if (data === 'cmd:stats')        return doStats(chatId, env, msgId);
+  if (data === 'cmd:watchlist')    return doWatchlist(chatId, env, msgId);
+  if (data === 'cmd:scanall')      return doScanAll(chatId, env, msgId);
+  if (data === 'cmd:settings')     return doSettings(chatId, env, msgId);
+  if (data === 'cmd:gradefilter') {
+    return edit(chatId, msgId, `🎯 Grade Filter\n\nOnly send signals above selected grade:`, env, { reply_markup: gradeFilterKb() });
+  }
+  if (data === 'cmd:togglesummary') {
+    user.dailySummary = !user.dailySummary;
+    await saveUser(chatId, user, env);
+    return doSettings(chatId, env, msgId);
+  }
   if (data === 'cmd:intervals') {
-    return edit(chatId, msgId, `Select interval:`, env, { reply_markup: intervalKb() });
+    return edit(chatId, msgId, `⏱ Select Interval:`, env, { reply_markup: intervalKb() });
   }
+  if (data.startsWith('cmd:history:')) {
+    const page = parseInt(data.split(':')[2], 10) || 0;
+    return doHistory(chatId, env, msgId, page);
+  }
+
   if (data.startsWith('pairpage:')) {
     const page = parseInt(data.split(':')[1], 10);
-    return edit(chatId, msgId, `Select pair:`, env, { reply_markup: pairsKb(page) });
+    return edit(chatId, msgId, `💱 Select default pair:`, env, { reply_markup: pairsKb(page) });
   }
   if (data.startsWith('pair:')) {
-    user.pair = norm(data.slice(5));
-    await saveUser(chatId, user, env);
-    return edit(chatId, msgId, `✅ Pair → ${disp(user.pair)}`, env, { reply_markup: mainKb(user.autoEnabled) });
+    user.pair = norm(data.slice(5)); await saveUser(chatId, user, env);
+    return doSettings(chatId, env, msgId);
   }
   if (data.startsWith('interval:')) {
     user.interval = parseInt(data.split(':')[1], 10);
-    user.lastPairScanAt = {};
     await saveUser(chatId, user, env);
-    return edit(chatId, msgId, `✅ Interval → ${user.interval} min`, env, { reply_markup: mainKb(user.autoEnabled) });
+    return doSettings(chatId, env, msgId);
+  }
+  if (data.startsWith('gf:')) {
+    user.gradeFilter = data.slice(3); await saveUser(chatId, user, env);
+    return doSettings(chatId, env, msgId);
   }
   if (data.startsWith('wlpage:')) {
     const page = parseInt(data.split(':')[1], 10);
-    return edit(chatId, msgId, `Add to Watchlist (${user.watchlist.length}/${MAX_WATCHLIST}):`, env,
+    return edit(chatId, msgId, `👁 Add to Watchlist (${user.watchlist.length}/${MAX_WATCHLIST}):`, env,
       { reply_markup: wlAddKb(page, user.watchlist) });
   }
   if (data.startsWith('wl:add:')) {
     const p = data.slice(7);
     if (!user.watchlist.includes(p) && user.watchlist.length < MAX_WATCHLIST) {
-      user.watchlist = [...user.watchlist, p];
-      await saveUser(chatId, user, env);
+      user.watchlist = [...user.watchlist, p]; await saveUser(chatId, user, env);
     }
     return doWatchlist(chatId, env, msgId);
   }
@@ -688,136 +681,122 @@ async function handleCb(cb, env) {
     await saveUser(chatId, user, env);
     return doWatchlist(chatId, env, msgId);
   }
+  // Quick signal for watchlist pair
+  if (data.startsWith('qs:')) {
+    const pair = data.slice(3);
+    return doQuickSignal(chatId, pair, env, msgId);
+  }
 }
 
 // ─── ACTIONS ──────────────────────────────────────────────────────────────────
 
 async function doSignal(chatId, env, msgId = null) {
   const user = await getUser(chatId, env);
-  if (msgId) await edit(chatId, msgId, `⏳ Fetching ${disp(user.pair)} signal...`, env);
-  else       await send(chatId, `⏳ Fetching ${disp(user.pair)} signal...`, env);
-
+  if (msgId) await edit(chatId, msgId, `⏳ Fetching ${disp(user.pair)}...`, env);
+  else       await send(chatId, `⏳ Fetching ${disp(user.pair)}...`, env);
   try {
     const data = await fetchSignal(user.pair, env);
     const sig  = data.signal;
     const dir  = sig?.finalSignal;
-    const text = fmtSignal(data, user.pair, user.interval);
-
-    let displayText = text;
-    if (dir === 'BUY' || dir === 'SELL') {
-      const signalNo = await logAndSchedule(chatId, user.pair, sig, env);
-      displayText = `📌 Signal No. ${signalNo}\n` + text;
-    }
-
-    if (msgId) await edit(chatId, msgId, displayText, env, { reply_markup: afterKb() });
-    else       await send(chatId, displayText, env, { reply_markup: afterKb() });
+    let signalNo = null;
+    if (dir==='BUY'||dir==='SELL') signalNo = await logAndSchedule(chatId, user.pair, sig, env);
+    const text = fmtSignal(data, user.pair, user.interval, signalNo);
+    const kb   = afterKb();
+    if (msgId) await edit(chatId, msgId, text, env, { reply_markup: kb });
+    else       await send(chatId, text, env, { reply_markup: kb });
   } catch (e) {
-    console.error('doSignal:', e.message);
-    const err = `❌ Signal fetch failed\n${e.message.slice(0, 200)}`;
-    if (msgId) await edit(chatId, msgId, err, env, { reply_markup: mainKb(user.autoEnabled) });
-    else       await send(chatId, err, env, { reply_markup: mainKb(user.autoEnabled) });
+    const err = `❌ Signal fetch failed\n${e.message.slice(0,200)}`;
+    if (msgId) await edit(chatId, msgId, err, env, { reply_markup: mainKb(user) });
+    else       await send(chatId, err, env, { reply_markup: mainKb(user) });
   }
 }
 
-async function logAndSchedule(chatId, pair, sig, env) {
-  const dir           = sig.finalSignal;
-  const best          = sig.bestTimeframe;
-  const expiryMinutes = best?.expiry?.totalMinutes || 5;
-  // Always use totalMinutes from now — nextCandleClose is candle close, not signal expiry
-  const expiryAt = Date.now() + expiryMinutes * 60 * 1000;
-
-  const entryPrice = sig.recommendations?.['1min']?.entry?.price
-                  || sig.recommendations?.['5min']?.entry?.price
-                  || null;
-  const tradeId = uid();
-
-  // addToHistory returns the signal number
-  const signalNo = await addToHistory(chatId, {
-    id: tradeId, pair, direction: dir,
-    confidence: sig.confidence || '0%',
-    entryPrice, expiryMinutes,
-    expiryAt: new Date(expiryAt).toISOString(),
-    timestamp: new Date().toISOString(),
-    result: null,
-  }, env);
-
-  await addPendingTrade({
-    chatId: String(chatId),
-    tradeId, pair,
-    direction: dir,
-    entryPrice,
-    expiryAt,
-    signalNo,
-  }, env);
-
-  await setActivePair(chatId, pair, expiryAt, env);
-
-  return signalNo;  // ← must return
+async function doQuickSignal(chatId, pair, env, msgId = null) {
+  const user = await getUser(chatId, env);
+  if (msgId) await edit(chatId, msgId, `⏳ Fetching ${disp(pair)}...`, env);
+  else       await send(chatId, `⏳ Fetching ${disp(pair)}...`, env);
+  try {
+    const data = await fetchSignal(pair, env);
+    const sig  = data.signal;
+    const dir  = sig?.finalSignal;
+    let signalNo = null;
+    if (dir==='BUY'||dir==='SELL') signalNo = await logAndSchedule(chatId, pair, sig, env);
+    const text = fmtSignal(data, pair, user.interval, signalNo);
+    if (msgId) await edit(chatId, msgId, text, env, { reply_markup: afterKb() });
+    else       await send(chatId, text, env, { reply_markup: afterKb() });
+  } catch (e) {
+    const err = `❌ Failed: ${e.message.slice(0,150)}`;
+    if (msgId) await edit(chatId, msgId, err, env, { reply_markup: mainKb(user) });
+    else       await send(chatId, err, env, { reply_markup: mainKb(user) });
+  }
 }
 
-// Active pair lock — per user per pair
-async function setActivePair(chatId, pair, expiryAt, env) {
-  const key  = `active:${chatId}`;
-  const data = (await kvGet(key, env)) || {};
-  data[pair] = expiryAt;
-  await kvPut(key, data, env, { expirationTtl: 7200 });
-}
+async function doScanAll(chatId, env, msgId = null) {
+  const user     = await getUser(chatId, env);
+  const scanList = [user.pair, ...user.watchlist].filter((p,i,a)=>a.indexOf(p)===i);
+  if (msgId) await edit(chatId, msgId, `🔍 Scanning ${scanList.length} pairs...`, env);
+  else       await send(chatId, `🔍 Scanning ${scanList.length} pairs...`, env);
 
-async function isActivePair(chatId, pair, env) {
-  const key  = `active:${chatId}`;
-  const data = (await kvGet(key, env)) || {};
-  const exp  = data[pair];
-  if (!exp) return false;
-  if (Date.now() < exp) return true;
-  // Expired — clean up
-  delete data[pair];
-  await kvPut(key, data, env, { expirationTtl: 7200 });
-  return false;
+  let found = 0;
+  for (const pair of scanList) {
+    try {
+      const data = await fetchSignal(pair, env);
+      const sig  = data.signal;
+      const dir  = sig?.finalSignal;
+      if (dir==='BUY'||dir==='SELL') {
+        if (!passesGradeFilter(sig, user.gradeFilter||'ALL')) continue;
+        const signalNo = await logAndSchedule(chatId, pair, sig, env);
+        await send(chatId, fmtSignal(data, pair, user.interval, signalNo), env, { reply_markup: afterKb() });
+        found++;
+      }
+    } catch (e) { console.error(`scanAll ${pair}:`, e.message); }
+  }
+
+  const summary = found > 0
+    ? `✅ Scan complete — ${found} signal(s) found across ${scanList.length} pairs`
+    : `⚪ Scan complete — No actionable signals across ${scanList.length} pairs`;
+  await send(chatId, summary, env, { reply_markup: mainKb(user) });
 }
 
 async function doToggle(chatId, env, msgId = null) {
   const user       = await getUser(chatId, env);
   user.autoEnabled = !user.autoEnabled;
-  user.lastPairScanAt = {};
-  user.noTradeStreak  = 0;
+  user.noTradeStreak = 0;
   await saveUser(chatId, user, env);
   if (user.autoEnabled) await addAutoUser(chatId, env);
   else                  await removeAutoUser(chatId, env);
 
   const wl  = user.watchlist.map(disp).join(', ');
   const txt = user.autoEnabled
-    ? `🔄 Auto Scan ON\n\n${disp(user.pair)}${wl ? '\nWatchlist: ' + wl : ''}\nInterval: ${user.interval} min\n\nSignals auto-logged. Results checked after expiry.`
+    ? `🔄 Auto Scan ON\n\n${disp(user.pair)}${wl?'\nWatchlist: '+wl:''}\nInterval: ${user.interval} min  Grade: ${user.gradeFilter||'ALL'}\n\nSignals logged + results auto-tracked.`
     : `🔕 Auto Scan OFF`;
+  if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: mainKb(user) });
+  else       await send(chatId, txt, env, { reply_markup: mainKb(user) });
+}
 
-  if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: mainKb(user.autoEnabled) });
-  else       await send(chatId, txt, env, { reply_markup: mainKb(user.autoEnabled) });
+async function doSettings(chatId, env, msgId = null) {
+  const user = await getUser(chatId, env);
+  const txt  = `⚙️ Settings\n\nPair: ${disp(user.pair)}\nInterval: ${user.interval} min\nGrade Filter: ${user.gradeFilter||'ALL'}\nDaily Summary: ${user.dailySummary?`ON (${user.summaryHour}:00 UTC)`:'OFF'}`;
+  if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: settingsKb(user) });
+  else       await send(chatId, txt, env, { reply_markup: settingsKb(user) });
 }
 
 async function doStatus(chatId, env, msgId = null) {
   const user = await getUser(chatId, env);
-  const txt  = `📋 Settings\n\n` +
-    `Pair: ${disp(user.pair)}\n` +
-    `Watchlist: ${user.watchlist.map(disp).join(', ') || 'None'}\n` +
-    `Interval: ${user.interval} min\n` +
-    `Auto Scan: ${user.autoEnabled ? 'ON' : 'OFF'}`;
-  const kb = { inline_keyboard: [[
-    { text: '💱 Pair',      callback_data: 'pairpage:0'    },
-    { text: '⏱ Interval',   callback_data: 'cmd:intervals' },
-  ],[
-    { text: '👁 Watchlist', callback_data: 'cmd:watchlist' },
-    { text: '🔙 Back',      callback_data: 'cmd:main'      },
+  const cnt  = (await kvGet(`cnt:${chatId}`, env)) || 0;
+  const txt  = `📋 Status\n\nPair: ${disp(user.pair)}\nWatchlist: ${user.watchlist.map(disp).join(', ')||'None'}\nInterval: ${user.interval} min\nAuto: ${user.autoEnabled?'ON':'OFF'}\nGrade Filter: ${user.gradeFilter||'ALL'}\nDaily Summary: ${user.dailySummary?'ON':'OFF'}\nTotal Signals: ${cnt}`;
+  const kb   = { inline_keyboard: [[
+    { text: '⚙️ Settings',  callback_data: 'cmd:settings'  },
+    { text: '🔙 Back',      callback_data: 'cmd:main'       },
   ]]};
   if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: kb });
   else       await send(chatId, txt, env, { reply_markup: kb });
 }
 
-async function doHistory(chatId, env, msgId = null) {
+async function doHistory(chatId, env, msgId = null, page = 0) {
   const h   = await getHistory(chatId, env);
-  const txt = fmtHistory(h);
-  const kb  = { inline_keyboard: [[
-    { text: '🏆 Stats', callback_data: 'cmd:stats' },
-    { text: '🔙 Back',  callback_data: 'cmd:main'  },
-  ]]};
+  const txt = fmtHistory(h, page);
+  const kb  = historyNavKb(page, h.length);
   if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: kb });
   else       await send(chatId, txt, env, { reply_markup: kb });
 }
@@ -826,8 +805,8 @@ async function doStats(chatId, env, msgId = null) {
   const h   = await getHistory(chatId, env);
   const txt = fmtStats(h);
   const kb  = { inline_keyboard: [[
-    { text: '📈 History', callback_data: 'cmd:history' },
-    { text: '🔙 Back',    callback_data: 'cmd:main'    },
+    { text: '📈 History', callback_data: 'cmd:history:0' },
+    { text: '🔙 Back',    callback_data: 'cmd:main'       },
   ]]};
   if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: kb });
   else       await send(chatId, txt, env, { reply_markup: kb });
@@ -836,262 +815,218 @@ async function doStats(chatId, env, msgId = null) {
 async function doWatchlist(chatId, env, msgId = null) {
   const user = await getUser(chatId, env);
   const wl   = user.watchlist;
-  const txt  = `👁 Watchlist (${wl.length}/${MAX_WATCHLIST})\n\n` +
-    (wl.length > 0 ? `${wl.map(disp).join(', ')}\n\nTap to remove.` : `Empty — tap + Add Pairs`);
+  const txt  = `👁 Watchlist (${wl.length}/${MAX_WATCHLIST})\n\n${wl.length>0?wl.map(disp).join(', '):'Empty'}\n\nTap pair name to get quick signal.\nTap ❌ pair to remove.`;
   if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: wlKb(wl) });
   else       await send(chatId, txt, env, { reply_markup: wlKb(wl) });
 }
 
 // ─── AUTO SCAN ────────────────────────────────────────────────────────────────
 
-async function runAutoScan(env, log = console.log, force = false) {
+async function runAutoScan(env, log, force = false) {
   const autoUsers = await getAutoUsers(env);
-  log('Auto scan users: ' + autoUsers.length);
-  if (!autoUsers.length) return;
-
-  const now = Date.now();
+  log(`AutoScan: ${autoUsers.length} users`);
 
   for (const chatId of autoUsers) {
     try {
       const user = await getUser(chatId, env);
       if (!user.autoEnabled) continue;
 
-      const scanList   = [user.pair, ...(user.watchlist || [])].filter(
-        (p, i, a) => a.indexOf(p) === i
-      );
+      const scanList = [user.pair, ...(user.watchlist||[])].filter((p,i,a)=>a.indexOf(p)===i);
 
       for (const pair of scanList) {
-
-        // Skip if this pair already has an active trade in progress
-        if (await isActivePair(chatId, pair, env)) {
-          log(`Skipping ${pair} — active trade in progress`);
-          continue;
-        }
-
-        log(`Scanning ${pair} for ${chatId}`);
-
         try {
           const data = await fetchSignal(pair, env);
           const sig  = data.signal;
           const dir  = sig?.finalSignal;
 
-          if (dir === 'BUY' || dir === 'SELL') {
-            // Check active lock — skip if same direction still running
+          if (dir==='BUY'||dir==='SELL') {
+            // Grade filter
+            if (!passesGradeFilter(sig, user.gradeFilter||'ALL')) {
+              log(`Filtered ${pair} ${dir} grade ${sig.grade?.grade}`);
+              continue;
+            }
+            // Duplicate lock
             const lock = await getActiveLock(chatId, pair, env);
-            if (lock && lock.direction === dir && lock.expiryAt > Date.now()) {
-              log(`Skipped ${pair} ${dir} — same signal active until ${new Date(lock.expiryAt).toUTCString()}`);
+            if (lock && lock.direction===dir && lock.expiryAt>Date.now()) {
+              log(`Locked ${pair} ${dir}`);
               continue;
             }
 
             const signalNo = await logAndSchedule(chatId, pair, sig, env);
-            const expiryMinutes = sig.bestTimeframe?.expiry?.totalMinutes || user.interval;
-            const expiryAt = Date.now() + expiryMinutes * 60 * 1000;
-            await setActiveLock(chatId, pair, dir, expiryAt, env);
-            const text = `📌 Signal No. ${signalNo}\n` + fmtSignal(data, pair, user.interval);
+            const text     = fmtSignal(data, pair, user.interval, signalNo);
             await send(chatId, text, env, { reply_markup: afterKb() });
+            log(`Sent #${signalNo} ${pair} ${dir}`);
             user.noTradeStreak = 0;
+
           } else {
-            user.noTradeStreak = (user.noTradeStreak || 0) + 1;
-            if (user.noTradeStreak >= 10) {
-              await send(chatId,
-                `⚪ No clear setup across ${scanList.length} pair(s) for ${user.noTradeStreak} scans.`,
-                env, { reply_markup: { inline_keyboard: [[
-                  { text: '🔕 Stop Auto', callback_data: 'cmd:toggle_auto' },
-                ]]}});
+            user.noTradeStreak = (user.noTradeStreak||0) + 1;
+            if (user.noTradeStreak >= 12) {
+              await send(chatId, `⚪ No clear setup for ${user.noTradeStreak} scans across ${scanList.length} pair(s).`, env,
+                { reply_markup: { inline_keyboard: [[{ text: '🔕 Stop Auto', callback_data: 'cmd:toggle_auto' }]]}});
               user.noTradeStreak = 0;
             }
           }
-
-
-
-        } catch (e) {
-          console.error(`Scan ${pair} [${chatId}]:`, e.message);
-        }
+        } catch (e) { log(`ScanPair ${pair} [${chatId}]: ${e.message}`); }
       }
 
       await saveUser(chatId, user, env);
-
-    } catch (e) {
-      console.error(`AutoScan [${chatId}]:`, e.message);
-    }
+    } catch (e) { log(`ScanUser ${chatId}: ${e.message}`); }
   }
 }
 
-// ─── AUTO RESULT CHECK ────────────────────────────────────────────────────────
-// ─── 50-SIGNAL MILESTONE REPORT ──────────────────────────────────────────────
-
-async function checkMilestone(chatId, env) {
-  try {
-    const history  = await getHistory(chatId, env);
-    const resolved = history.filter(h => h.result === 'WIN' || h.result === 'LOSS');
-
-    // Count since last milestone reset
-    const milestone = (await kvGet(`milestone:${chatId}`, env)) || { lastResetAt: 0, countAtReset: 0 };
-    const countSinceReset = resolved.length - milestone.countAtReset;
-
-    if (countSinceReset < 50) return;  // not yet
-
-    // ── Build 50-signal report ──
-    const batch = resolved.slice(0, countSinceReset).reverse(); // oldest first
-    const wins   = batch.filter(h => h.result === 'WIN').length;
-    const losses = batch.filter(h => h.result === 'LOSS').length;
-    const wr     = Math.round((wins / batch.length) * 100);
-
-    // Grade breakdown
-    const grades = {};
-    for (const h of batch) {
-      const g = (h.grade || 'Unknown').split(' ')[0];
-      if (!grades[g]) grades[g] = { w: 0, l: 0 };
-      if (h.result === 'WIN')  grades[g].w++;
-      if (h.result === 'LOSS') grades[g].l++;
-    }
-
-    // Per pair breakdown
-    const pairs = {};
-    for (const h of batch) {
-      if (!pairs[h.pair]) pairs[h.pair] = { w: 0, l: 0 };
-      if (h.result === 'WIN')  pairs[h.pair].w++;
-      if (h.result === 'LOSS') pairs[h.pair].l++;
-    }
-
-    // Streak
-    let streak = 0; let sType = '';
-    for (const h of [...resolved].reverse()) {
-      if (!sType) { sType = h.result; streak = 1; }
-      else if (h.result === sType) streak++;
-      else break;
-    }
-
-    let msg = `🏁 50-Signal Report (No. ${batch[0]?.no || '?'} - ${batch[batch.length-1]?.no || '?'})
-`;
-    msg += `━━━━━━━━━━━━━━
-`;
-    msg += `✅ Wins:    ${wins}
-`;
-    msg += `❌ Losses:  ${losses}
-`;
-    msg += `📊 Win Rate: ${wr}%
-`;
-    if (streak >= 3) msg += `🔥 Streak: ${streak} ${sType}s
-`;
-
-    msg += `
-Grade Breakdown:
-`;
-    for (const [g, s] of Object.entries(grades)) {
-      const t  = s.w + s.l;
-      const gwr = Math.round(s.w / t * 100);
-      msg += `  ${g}: ${s.w}W/${s.l}L (${gwr}%)
-`;
-    }
-
-    msg += `
-Top Pairs:
-`;
-    const sortedPairs = Object.entries(pairs).sort((a, b) => (b[1].w + b[1].l) - (a[1].w + a[1].l));
-    for (const [pair, s] of sortedPairs.slice(0, 5)) {
-      const t   = s.w + s.l;
-      const pwr = Math.round(s.w / t * 100);
-      msg += `  ${disp(pair)}: ${s.w}W/${s.l}L (${pwr}%)
-`;
-    }
-
-    msg += `
-🔄 Count reset — next 50 signals tracking starts now.`;
-
-    await send(chatId, msg, env, { reply_markup: { inline_keyboard: [[
-      { text: '📈 Full History', callback_data: 'cmd:history' },
-      { text: '🏆 All Stats',    callback_data: 'cmd:stats'   },
-    ]]}});
-
-    // Reset milestone counter
-    await kvPut(`milestone:${chatId}`, {
-      lastResetAt:  Date.now(),
-      countAtReset: resolved.length,
-    }, env);
-
-  } catch (e) {
-    console.error('checkMilestone:', e.message);
-  }
-}
-
-
+// ─── RESULT CHECK ─────────────────────────────────────────────────────────────
 
 async function runResultCheck(env, log = console.log) {
   const ids = await getPendingIds(env);
   if (!ids.length) return;
-  log('Checking results for ' + ids.length + ' trades');
+  log(`ResultCheck: ${ids.length} pending`);
 
-  const now       = Date.now();
-  const remaining = [];
+  const now = Date.now(), remaining = [];
 
   for (const tradeId of ids) {
     try {
       const trade = await kvGet(`pt:${tradeId}`, env);
-      if (!trade) continue; // expired from KV
+      if (!trade) continue;
+      if (trade.expiryAt > now) { remaining.push(tradeId); continue; }
 
-      if (trade.expiryAt > now) {
-        remaining.push(tradeId);
-        continue;
-      }
-
-      // Expired — check price
       const currentPrice = await fetchCurrentPrice(trade.pair, env);
-
       if (currentPrice === null || trade.entryPrice === null) {
         await setTradeResult(trade.chatId, tradeId, 'SKIP', null, null, env);
         await clearActiveLock(trade.chatId, trade.pair, env);
-        await send(trade.chatId,
-          `⏭ Trade expired — could not verify price for ${disp(trade.pair)}\nID: ${tradeId}`,
-          env, { reply_markup: afterKb() });
+        await send(trade.chatId, `⏭ Tracking No. ${trade.signalNo||tradeId} — could not verify price`, env, { reply_markup: afterKb() });
         continue;
       }
 
-      const entry   = parseFloat(trade.entryPrice);
+      const entry  = parseFloat(trade.entryPrice);
       const current = parseFloat(currentPrice);
       const diff    = current - entry;
-      const result  = trade.direction === 'BUY'
-        ? (diff > 0 ? 'WIN' : 'LOSS')
-        : (diff < 0 ? 'WIN' : 'LOSS');
+      const result  = trade.direction==='BUY' ? (diff>0?'WIN':'LOSS') : (diff<0?'WIN':'LOSS');
 
       const crypto = isCrypto(trade.pair);
-      const pips   = crypto
-        ? Math.round(Math.abs(diff) * 100) / 100
-        : Math.round(Math.abs(diff) * 10000 * 10) / 10;
+      const pips   = crypto ? Math.round(Math.abs(diff)*100)/100 : Math.round(Math.abs(diff)*10000*10)/10;
       const unit   = crypto ? '$' : ' pips';
 
       await setTradeResult(trade.chatId, tradeId, result, current, pips, env);
       await clearActiveLock(trade.chatId, trade.pair, env);
 
-      const dirE   = trade.direction === 'BUY' ? '🟢' : '🔴';
-      const resE   = result === 'WIN' ? '✅ WIN' : '❌ LOSS';
-      const noStr  = (trade.signalNo !== undefined && trade.signalNo !== null)
-                     ? `No. ${trade.signalNo}` : tradeId;
-
-      // How late was the result check vs expiry?
-      const lateMs  = now - trade.expiryAt;
-      const lateMin = Math.round(lateMs / 60000);
+      const lateMin = Math.round((now - trade.expiryAt) / 60000);
       const lateStr = lateMin > 1 ? ` (+${lateMin}min)` : '';
-
       const gradeStr = trade.grade ? `  ${trade.grade}` : '';
+      const dE = trade.direction==='BUY'?'🟢':'🔴';
+      const rE = result==='WIN'?'✅ WIN':'❌ LOSS';
 
       await send(trade.chatId,
-        `📊 Tracking ${noStr}${lateStr}\n` +
-        `━━━━━━━━━━━━━━\n` +
-        `${resE}  ${dirE} ${trade.direction} ${disp(trade.pair)}${gradeStr}\n` +
-        `💰 Entry:  ${entry.toFixed(5)}\n` +
-        `🏁 Exit:   ${current.toFixed(5)}\n` +
-        `📏 Move:   ${diff > 0 ? '+' : ''}${pips}${unit}`,
+        `📊 Tracking No. ${trade.signalNo||tradeId}${lateStr}\n━━━━━━━━━━━━━━\n${rE}  ${dE} ${trade.direction} ${disp(trade.pair)}${gradeStr}\n💰 Entry:  ${entry.toFixed(5)}\n🏁 Exit:   ${current.toFixed(5)}\n📏 Move:   ${diff>0?'+':''}${pips}${unit}`,
         env, { reply_markup: afterKb() });
 
-      // Check 50-signal milestone
       await checkMilestone(trade.chatId, env);
 
-    } catch (e) {
-      console.error(`ResultCheck ${tradeId}:`, e.message);
-      remaining.push(tradeId);
-    }
+    } catch (e) { log(`ResultCheck ${tradeId}: ${e.message}`); remaining.push(tradeId); }
   }
 
-  await kvPut('pending_ids', remaining, env);
+  await savePendingIds(remaining, env);
+}
+
+// ─── MILESTONE (every 50 resolved) ───────────────────────────────────────────
+
+async function checkMilestone(chatId, env) {
+  try {
+    // Use persistent resolved counter separate from history
+    const mKey     = `ms:${chatId}`;
+    const ms       = (await kvGet(mKey, env)) || { lastCount: 0 };
+    const history  = await getHistory(chatId, env);
+    const resolved = history.filter(h => h.result==='WIN'||h.result==='LOSS');
+
+    // Total resolved = persistent counter
+    const totalResolved = (await kvGet(`rct:${chatId}`, env)) || resolved.length;
+    await kvPut(`rct:${chatId}`, totalResolved, env);
+
+    const since = totalResolved - ms.lastCount;
+    if (since < MILESTONE_COUNT) return;
+
+    // Build batch from current history (up to 50 newest resolved)
+    const batch = resolved.slice(0, Math.min(since, 50));
+    const wins  = batch.filter(h=>h.result==='WIN').length;
+    const losses= batch.filter(h=>h.result==='LOSS').length;
+    const wr    = Math.round(wins/batch.length*100);
+
+    const gm = {}, pm = {};
+    for (const h of batch) {
+      const g = (h.grade||'?').split(' ')[0];
+      if (!gm[g]) gm[g]={w:0,l:0};
+      h.result==='WIN'?gm[g].w++:gm[g].l++;
+      if (!pm[h.pair]) pm[h.pair]={w:0,l:0};
+      h.result==='WIN'?pm[h.pair].w++:pm[h.pair].l++;
+    }
+
+    let streak=0, sType='';
+    for (const h of resolved) {
+      if (!sType){sType=h.result;streak=1;}
+      else if(h.result===sType)streak++;
+      else break;
+    }
+
+    let msg = `🏁 ${MILESTONE_COUNT}-Signal Report\n(#${batch[batch.length-1]?.no||'?'} to #${batch[0]?.no||'?'})\n━━━━━━━━━━━━━━\n`;
+    msg += `✅ Wins:    ${wins}\n❌ Losses:  ${losses}\n📊 Win Rate: ${wr}%`;
+    if (streak>=3) msg += `\n🔥 Streak: ${streak} ${sType}s`;
+    msg += `\n\nGrade:\n`;
+    for (const [g,s] of Object.entries(gm)) {
+      msg += `  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w/(s.w+s.l)*100)}%)\n`;
+    }
+    msg += `\nTop Pairs:\n`;
+    Object.entries(pm).sort((a,b)=>(b[1].w+b[1].l)-(a[1].w+a[1].l)).slice(0,4)
+      .forEach(([p,s])=>{ msg+=`  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w/(s.w+s.l)*100)}%)\n`; });
+    msg += `\n🔄 Next ${MILESTONE_COUNT} signals tracking starts now.`;
+
+    await send(chatId, msg, env, { reply_markup: { inline_keyboard: [[
+      { text: '📈 History', callback_data: 'cmd:history:0' },
+      { text: '🏆 Stats',   callback_data: 'cmd:stats'     },
+    ]]}});
+
+    await kvPut(mKey, { lastCount: totalResolved }, env);
+  } catch (e) { console.error('milestone:', e.message); }
+}
+
+// ─── DAILY SUMMARY ────────────────────────────────────────────────────────────
+
+async function runDailySummary(env, log = console.log) {
+  const now   = new Date();
+  const hour  = now.getUTCHours();
+  const users = await getAutoUsers(env);
+
+  for (const chatId of users) {
+    try {
+      const user = await getUser(chatId, env);
+      if (!user.dailySummary) continue;
+      if (hour !== (user.summaryHour || 20)) continue;
+
+      // Avoid sending twice in same hour
+      const lastSent = (await kvGet(`ds:${chatId}`, env)) || 0;
+      if (Date.now() - lastSent < 60 * 60 * 1000) continue;
+
+      const history  = await getHistory(chatId, env);
+      const today    = new Date().toISOString().slice(0, 10);
+      const todayH   = history.filter(h => h.timestamp?.startsWith(today));
+      const resolved = todayH.filter(h => h.result==='WIN'||h.result==='LOSS');
+      const wins     = resolved.filter(h=>h.result==='WIN').length;
+      const losses   = resolved.filter(h=>h.result==='LOSS').length;
+      const wr       = resolved.length > 0 ? Math.round(wins/resolved.length*100) : 0;
+
+      if (todayH.length === 0) continue;
+
+      let msg = `📅 Daily Summary — ${today}\n━━━━━━━━━━━━━━\n`;
+      msg += `Signals today: ${todayH.length}\n`;
+      msg += `Resolved: ${resolved.length}  (${wins}W / ${losses}L)\n`;
+      msg += `Win Rate: ${wr}%\n`;
+      msg += `Pending: ${todayH.filter(h=>!h.result).length}`;
+
+      await send(chatId, msg, env, { reply_markup: { inline_keyboard: [[
+        { text: '📈 History', callback_data: 'cmd:history:0' },
+        { text: '🏆 Stats',   callback_data: 'cmd:stats'     },
+      ]]}});
+
+      await kvPut(`ds:${chatId}`, Date.now(), env);
+      log(`Daily summary sent to ${chatId}`);
+    } catch (e) { log(`DailySummary ${chatId}: ${e.message}`); }
+  }
 }
