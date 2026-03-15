@@ -216,6 +216,15 @@ async function removeAutoUser(chatId, env) {
   const list = await getAutoUsers(env);
   await kvPut('auto_users', list.filter(id => id !== String(chatId)), env);
 }
+async function getSummaryUsers(env) { return (await kvGet('summary_users', env)) || []; }
+async function addSummaryUser(chatId, env) {
+  const list = await getSummaryUsers(env);
+  if (!list.includes(String(chatId))) await kvPut('summary_users', [...list, String(chatId)], env);
+}
+async function removeSummaryUser(chatId, env) {
+  const list = await getSummaryUsers(env);
+  await kvPut('summary_users', list.filter(id => id !== String(chatId)), env);
+}
 
 // ─── HISTORY ──────────────────────────────────────────────────────────────────
 
@@ -297,7 +306,7 @@ function mainKb(user) {
     ],
     [
       { text: '🔍 Scan All',    callback_data: 'cmd:scanall'    },
-      { text: '⚙️ Settings',    callback_data: 'cmd:settings'   },
+      { text: '📅 Today',       callback_data: 'cmd:today'      },
     ],
     [
       { text: '👁 Watchlist',   callback_data: 'cmd:watchlist'  },
@@ -305,24 +314,66 @@ function mainKb(user) {
     ],
     [
       { text: '🏆 Stats',       callback_data: 'cmd:stats'      },
+      { text: '📋 Summary',     callback_data: 'cmd:summary'    },
+    ],
+    [
+      { text: '⚙️ Settings',    callback_data: 'cmd:settings'   },
       { text: '📋 Status',      callback_data: 'cmd:status'     },
     ],
   ]};
 }
 
 function settingsKb(user) {
-  const gf = user.gradeFilter || 'ALL';
-  const ds = user.dailySummary ? 'ON' : 'OFF';
+  const gf   = user.gradeFilter || 'ALL';
+  const ds   = user.dailySummary ? 'ON' : 'OFF';
+  const sh   = user.summaryHour ?? 20;
+  const minC = user.minConfidence || 0;
   return { inline_keyboard: [
     [
-      { text: '💱 Change Pair',   callback_data: 'pairpage:0'    },
-      { text: '⏱ Interval',       callback_data: 'cmd:intervals' },
+      { text: '💱 Change Pair',          callback_data: 'pairpage:0'         },
+      { text: `⏱ Interval: ${user.interval}min`, callback_data: 'cmd:intervals' },
     ],
     [
-      { text: `🎯 Grade Filter: ${gf}`, callback_data: 'cmd:gradefilter' },
-      { text: `📅 Daily Summary: ${ds}`, callback_data: 'cmd:togglesummary' },
+      { text: `🎯 Grade: ${gf}`,          callback_data: 'cmd:gradefilter'    },
+      { text: `📊 Min Conf: ${minC}%`,    callback_data: 'cmd:conffilter'     },
+    ],
+    [
+      { text: `📅 Summary: ${ds}`,        callback_data: 'cmd:togglesummary'  },
+      { text: `🕐 Time: ${sh}:00 UTC`,    callback_data: 'cmd:summarytime'    },
     ],
     [{ text: '🔙 Back', callback_data: 'cmd:main' }],
+  ]};
+}
+
+function summaryTimeKb() {
+  return { inline_keyboard: [
+    [
+      { text: '06:00 UTC', callback_data: 'sumhour:6'  },
+      { text: '12:00 UTC', callback_data: 'sumhour:12' },
+      { text: '18:00 UTC', callback_data: 'sumhour:18' },
+    ],
+    [
+      { text: '20:00 UTC', callback_data: 'sumhour:20' },
+      { text: '22:00 UTC', callback_data: 'sumhour:22' },
+      { text: '00:00 UTC', callback_data: 'sumhour:0'  },
+    ],
+    [{ text: '🔙 Back', callback_data: 'cmd:settings' }],
+  ]};
+}
+
+function confFilterKb() {
+  return { inline_keyboard: [
+    [
+      { text: 'Any',   callback_data: 'cf:0'  },
+      { text: '60%+',  callback_data: 'cf:60' },
+      { text: '70%+',  callback_data: 'cf:70' },
+    ],
+    [
+      { text: '75%+',  callback_data: 'cf:75' },
+      { text: '80%+',  callback_data: 'cf:80' },
+      { text: '85%+',  callback_data: 'cf:85' },
+    ],
+    [{ text: '🔙 Back', callback_data: 'cmd:settings' }],
   ]};
 }
 
@@ -434,6 +485,12 @@ function passesGradeFilter(sig, filter) {
   if (filter === 'A')  return g === 'A';
   if (filter === 'AB') return g === 'A' || g === 'B';
   return true;
+}
+
+function passesConfFilter(sig, minConf) {
+  if (!minConf || minConf === 0) return true;
+  const conf = parseInt((sig.confidence || '0%').replace('%',''), 10);
+  return conf >= minConf;
 }
 
 // ─── FORMATTERS ───────────────────────────────────────────────────────────────
@@ -599,6 +656,8 @@ async function handleMessage(msg, env) {
     }
     return send(chatId, `❌ Valid: 1, 5, 15`, env);
   }
+  if (text.startsWith('/today'))   return doToday(chatId, env);
+  if (text.startsWith('/summary')) return doManualSummary(chatId, env);
   if (text.startsWith('/help')) {
     return send(chatId,
       `FTT Signal Bot v3.0\n\n/signal — Signal for default pair\n/scan — Scan all pairs now\n/auto — Toggle auto scan\n/watchlist — Manage pairs\n/history — Signal history\n/stats — Win/Loss stats\n/status — Settings\n/pair EURUSD — Set pair\n/interval 5 — Set interval`,
@@ -637,8 +696,30 @@ async function handleCb(cb, env) {
   if (data === 'cmd:togglesummary') {
     user.dailySummary = !user.dailySummary;
     await saveUser(chatId, user, env);
+    if (user.dailySummary) await addSummaryUser(chatId, env);
+    else                   await removeSummaryUser(chatId, env);
     return doSettings(chatId, env, msgId);
   }
+  if (data.startsWith('sumhour:')) {
+    user.summaryHour = parseInt(data.split(':')[1], 10);
+    await saveUser(chatId, user, env);
+    return doSettings(chatId, env, msgId);
+  }
+  if (data === 'cmd:summarytime') {
+    return edit(chatId, msgId, `🕐 Select Daily Summary Time (UTC):`, env, { reply_markup: summaryTimeKb() });
+  }
+  if (data === 'cmd:conffilter') {
+    return edit(chatId, msgId, `📊 Minimum Confidence Filter:
+
+Only send signals at or above this confidence level.`, env, { reply_markup: confFilterKb() });
+  }
+  if (data.startsWith('cf:')) {
+    user.minConfidence = parseInt(data.split(':')[1], 10);
+    await saveUser(chatId, user, env);
+    return doSettings(chatId, env, msgId);
+  }
+  if (data === 'cmd:today') return doToday(chatId, env, msgId);
+  if (data === 'cmd:summary') return doManualSummary(chatId, env, msgId);
   if (data === 'cmd:intervals') {
     return edit(chatId, msgId, `⏱ Select Interval:`, env, { reply_markup: intervalKb() });
   }
@@ -820,6 +901,110 @@ async function doWatchlist(chatId, env, msgId = null) {
   else       await send(chatId, txt, env, { reply_markup: wlKb(wl) });
 }
 
+// ─── TODAY & MANUAL SUMMARY ──────────────────────────────────────────────────
+
+async function doToday(chatId, env, msgId = null) {
+  const history = await getHistory(chatId, env);
+  const today   = new Date().toISOString().slice(0, 10);
+  const todayH  = history.filter(h => h.timestamp?.startsWith(today));
+  if (!todayH.length) {
+    const txt = `📅 Today (${today})
+
+No signals yet today.`;
+    if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: mainKb(await getUser(chatId, env)) });
+    else       await send(chatId, txt, env, { reply_markup: mainKb(await getUser(chatId, env)) });
+    return;
+  }
+  const resolved = todayH.filter(h => h.result==='WIN'||h.result==='LOSS');
+  const wins  = resolved.filter(h => h.result==='WIN').length;
+  const losses= resolved.filter(h => h.result==='LOSS').length;
+  const wr    = resolved.length > 0 ? Math.round(wins/resolved.length*100) : 0;
+  const pending = todayH.filter(h => !h.result || h.result==='SKIP').length;
+
+  let txt = `📅 Today — ${today}
+━━━━━━━━━━━━━━
+`;
+  txt += `📊 Signals: ${todayH.length}
+`;
+  txt += `✅ ${wins}W  ❌ ${losses}L  ⏳ ${pending} pending
+`;
+  txt += `📈 Win Rate: ${wr}%
+
+Recent:
+`;
+  for (const h of todayH.slice(0, 8)) {
+    const dE = h.direction==='BUY'?'🟢':'🔴';
+    const rE = h.result==='WIN'?'✅':h.result==='LOSS'?'❌':'⏳';
+    const g  = h.grade ? ` ${h.grade.split(' ')[0]}` : '';
+    txt += `${rE} #${h.no} ${dE} ${disp(h.pair)}${g} ${h.confidence}
+`;
+  }
+  const kb = { inline_keyboard: [[
+    { text: '📈 Full History', callback_data: 'cmd:history:0' },
+    { text: '🔙 Menu',         callback_data: 'cmd:main'       },
+  ]]};
+  if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: kb });
+  else       await send(chatId, txt, env, { reply_markup: kb });
+}
+
+async function doManualSummary(chatId, env, msgId = null) {
+  const user    = await getUser(chatId, env);
+  const history = await getHistory(chatId, env);
+  const today   = new Date().toISOString().slice(0, 10);
+  const todayH  = history.filter(h => h.timestamp?.startsWith(today));
+  if (!todayH.length) {
+    const t = `No signals today yet.`;
+    if (msgId) await edit(chatId, msgId, t, env, { reply_markup: mainKb(user) });
+    else       await send(chatId, t, env, { reply_markup: mainKb(user) });
+    return;
+  }
+  const resolved = todayH.filter(h => h.result==='WIN'||h.result==='LOSS');
+  const wins  = resolved.filter(h => h.result==='WIN').length;
+  const losses= resolved.filter(h => h.result==='LOSS').length;
+  const wr    = resolved.length > 0 ? Math.round(wins/resolved.length*100) : 0;
+
+  const gm = {};
+  for (const h of resolved) {
+    const g = (h.grade||'?').split(' ')[0];
+    if (!gm[g]) gm[g]={w:0,l:0};
+    h.result==='WIN'?gm[g].w++:gm[g].l++;
+  }
+
+  const allResolved = history.filter(h => h.result==='WIN'||h.result==='LOSS');
+  const allWins     = allResolved.filter(h => h.result==='WIN').length;
+  const allWR       = allResolved.length > 0 ? Math.round(allWins/allResolved.length*100) : 0;
+  const trend = wr > allWR ? '📈 Above average' : wr < allWR ? '📉 Below average' : '➡️ On average';
+
+  let txt = `📅 Daily Summary — ${today}
+━━━━━━━━━━━━━━
+`;
+  txt += `📊 Signals: ${todayH.length}  Resolved: ${resolved.length}
+`;
+  txt += `✅ Wins: ${wins}  ❌ Losses: ${losses}
+`;
+  txt += `📈 Win Rate: ${wr}%
+`;
+  if (Object.keys(gm).length > 0) {
+    txt += `
+Grades:
+`;
+    for (const [g,s] of Object.entries(gm)) {
+      const t=s.w+s.l;
+      txt += `  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)
+`;
+    }
+  }
+  txt += `
+${trend} (all-time: ${allWR}%)`;
+
+  const kb = { inline_keyboard: [[
+    { text: '📈 History', callback_data: 'cmd:history:0' },
+    { text: '🏆 Stats',   callback_data: 'cmd:stats'     },
+  ]]};
+  if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: kb });
+  else       await send(chatId, txt, env, { reply_markup: kb });
+}
+
 // ─── AUTO SCAN ────────────────────────────────────────────────────────────────
 
 async function runAutoScan(env, log, force = false) {
@@ -840,8 +1025,8 @@ async function runAutoScan(env, log, force = false) {
           const dir  = sig?.finalSignal;
 
           if (dir==='BUY'||dir==='SELL') {
-            // Grade filter
-            if (!passesGradeFilter(sig, user.gradeFilter||'ALL')) {
+            // Grade + Confidence filter
+            if (!passesGradeFilter(sig, user.gradeFilter||'ALL') || !passesConfFilter(sig, user.minConfidence||0)) {
               log(`Filtered ${pair} ${dir} grade ${sig.grade?.grade}`);
               continue;
             }
@@ -992,33 +1177,93 @@ async function checkMilestone(chatId, env) {
 async function runDailySummary(env, log = console.log) {
   const now   = new Date();
   const hour  = now.getUTCHours();
-  const users = await getAutoUsers(env);
+  // Use dedicated summary_users list (independent of auto scan)
+  const users = await getSummaryUsers(env);
+  log(`DailySummary: ${users.length} users, hour=${hour} UTC`);
 
   for (const chatId of users) {
     try {
       const user = await getUser(chatId, env);
       if (!user.dailySummary) continue;
-      if (hour !== (user.summaryHour || 20)) continue;
+      if (hour !== (user.summaryHour ?? 20)) continue;
 
       // Avoid sending twice in same hour
       const lastSent = (await kvGet(`ds:${chatId}`, env)) || 0;
-      if (Date.now() - lastSent < 60 * 60 * 1000) continue;
+      if (Date.now() - lastSent < 55 * 60 * 1000) continue;
 
-      const history  = await getHistory(chatId, env);
-      const today    = new Date().toISOString().slice(0, 10);
-      const todayH   = history.filter(h => h.timestamp?.startsWith(today));
+      const history = await getHistory(chatId, env);
+      const today   = now.toISOString().slice(0, 10);
+      const todayH  = history.filter(h => h.timestamp?.startsWith(today));
+      if (todayH.length === 0) {
+        log(`No signals today for ${chatId}, skipping`);
+        continue;
+      }
+
       const resolved = todayH.filter(h => h.result==='WIN'||h.result==='LOSS');
-      const wins     = resolved.filter(h=>h.result==='WIN').length;
-      const losses   = resolved.filter(h=>h.result==='LOSS').length;
+      const wins     = resolved.filter(h => h.result==='WIN').length;
+      const losses   = resolved.filter(h => h.result==='LOSS').length;
       const wr       = resolved.length > 0 ? Math.round(wins/resolved.length*100) : 0;
+      const pending  = todayH.filter(h => !h.result || h.result==='SKIP').length;
 
-      if (todayH.length === 0) continue;
+      // Per pair today
+      const pm = {};
+      for (const h of resolved) {
+        if (!pm[h.pair]) pm[h.pair] = {w:0,l:0};
+        h.result==='WIN' ? pm[h.pair].w++ : pm[h.pair].l++;
+      }
 
-      let msg = `📅 Daily Summary — ${today}\n━━━━━━━━━━━━━━\n`;
-      msg += `Signals today: ${todayH.length}\n`;
-      msg += `Resolved: ${resolved.length}  (${wins}W / ${losses}L)\n`;
-      msg += `Win Rate: ${wr}%\n`;
-      msg += `Pending: ${todayH.filter(h=>!h.result).length}`;
+      // Best/worst pair
+      let bestPair = '', worstPair = '';
+      let bestWR = -1, worstWR = 101;
+      for (const [p, s] of Object.entries(pm)) {
+        const t = s.w+s.l; if (t < 2) continue;
+        const pwr = s.w/t*100;
+        if (pwr > bestWR)  { bestWR = pwr;  bestPair = p; }
+        if (pwr < worstWR) { worstWR = pwr; worstPair = p; }
+      }
+
+      let msg = `📅 Daily Summary — ${today}
+━━━━━━━━━━━━━━
+`;
+      msg += `📊 Signals: ${todayH.length}  |  Resolved: ${resolved.length}
+`;
+      msg += `✅ Wins: ${wins}  |  ❌ Losses: ${losses}
+`;
+      msg += `📈 Win Rate: ${wr}%
+`;
+      if (pending > 0) msg += `⏳ Pending: ${pending}
+`;
+      if (bestPair)  msg += `
+🏆 Best:  ${disp(bestPair)} (${Math.round(bestWR)}%)
+`;
+      if (worstPair && worstPair !== bestPair) msg += `📉 Worst: ${disp(worstPair)} (${Math.round(worstWR)}%)
+`;
+
+      // Grade breakdown today
+      const gm = {};
+      for (const h of resolved) {
+        const g = (h.grade||'?').split(' ')[0];
+        if (!gm[g]) gm[g]={w:0,l:0};
+        h.result==='WIN'?gm[g].w++:gm[g].l++;
+      }
+      if (Object.keys(gm).length > 0) {
+        msg += `
+Grades:
+`;
+        for (const [g,s] of Object.entries(gm)) {
+          const t=s.w+s.l;
+          msg += `  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)
+`;
+        }
+      }
+
+      // Overall win rate comparison
+      const allResolved = history.filter(h => h.result==='WIN'||h.result==='LOSS');
+      const allWins     = allResolved.filter(h => h.result==='WIN').length;
+      const allWR       = allResolved.length > 0 ? Math.round(allWins/allResolved.length*100) : 0;
+      const trend       = wr > allWR ? '📈 Above average' : wr < allWR ? '📉 Below average' : '➡️ On average';
+      msg += `
+${trend} (all-time: ${allWR}%)`;
 
       await send(chatId, msg, env, { reply_markup: { inline_keyboard: [[
         { text: '📈 History', callback_data: 'cmd:history:0' },
