@@ -723,9 +723,8 @@ async function logAndSchedule(chatId, pair, sig, env) {
   const dir           = sig.finalSignal;
   const best          = sig.bestTimeframe;
   const expiryMinutes = best?.expiry?.totalMinutes || 5;
-  const nextCandleClose = best?.expiry?.nextCandleClose
-    ? new Date(best.expiry.nextCandleClose).getTime() : null;
-  const expiryAt = nextCandleClose || (Date.now() + expiryMinutes * 60 * 1000);
+  // Always use totalMinutes from now — nextCandleClose is candle close, not signal expiry
+  const expiryAt = Date.now() + expiryMinutes * 60 * 1000;
 
   const entryPrice = sig.recommendations?.['1min']?.entry?.price
                   || sig.recommendations?.['5min']?.entry?.price
