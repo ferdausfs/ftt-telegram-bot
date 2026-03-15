@@ -919,6 +919,104 @@ async function runAutoScan(env, log = console.log, force = false) {
 }
 
 // ─── AUTO RESULT CHECK ────────────────────────────────────────────────────────
+// ─── 50-SIGNAL MILESTONE REPORT ──────────────────────────────────────────────
+
+async function checkMilestone(chatId, env) {
+  try {
+    const history  = await getHistory(chatId, env);
+    const resolved = history.filter(h => h.result === 'WIN' || h.result === 'LOSS');
+
+    // Count since last milestone reset
+    const milestone = (await kvGet(`milestone:${chatId}`, env)) || { lastResetAt: 0, countAtReset: 0 };
+    const countSinceReset = resolved.length - milestone.countAtReset;
+
+    if (countSinceReset < 50) return;  // not yet
+
+    // ── Build 50-signal report ──
+    const batch = resolved.slice(0, countSinceReset).reverse(); // oldest first
+    const wins   = batch.filter(h => h.result === 'WIN').length;
+    const losses = batch.filter(h => h.result === 'LOSS').length;
+    const wr     = Math.round((wins / batch.length) * 100);
+
+    // Grade breakdown
+    const grades = {};
+    for (const h of batch) {
+      const g = (h.grade || 'Unknown').split(' ')[0];
+      if (!grades[g]) grades[g] = { w: 0, l: 0 };
+      if (h.result === 'WIN')  grades[g].w++;
+      if (h.result === 'LOSS') grades[g].l++;
+    }
+
+    // Per pair breakdown
+    const pairs = {};
+    for (const h of batch) {
+      if (!pairs[h.pair]) pairs[h.pair] = { w: 0, l: 0 };
+      if (h.result === 'WIN')  pairs[h.pair].w++;
+      if (h.result === 'LOSS') pairs[h.pair].l++;
+    }
+
+    // Streak
+    let streak = 0; let sType = '';
+    for (const h of [...resolved].reverse()) {
+      if (!sType) { sType = h.result; streak = 1; }
+      else if (h.result === sType) streak++;
+      else break;
+    }
+
+    let msg = `🏁 50-Signal Report (No. ${batch[0]?.no || '?'} - ${batch[batch.length-1]?.no || '?'})
+`;
+    msg += `━━━━━━━━━━━━━━
+`;
+    msg += `✅ Wins:    ${wins}
+`;
+    msg += `❌ Losses:  ${losses}
+`;
+    msg += `📊 Win Rate: ${wr}%
+`;
+    if (streak >= 3) msg += `🔥 Streak: ${streak} ${sType}s
+`;
+
+    msg += `
+Grade Breakdown:
+`;
+    for (const [g, s] of Object.entries(grades)) {
+      const t  = s.w + s.l;
+      const gwr = Math.round(s.w / t * 100);
+      msg += `  ${g}: ${s.w}W/${s.l}L (${gwr}%)
+`;
+    }
+
+    msg += `
+Top Pairs:
+`;
+    const sortedPairs = Object.entries(pairs).sort((a, b) => (b[1].w + b[1].l) - (a[1].w + a[1].l));
+    for (const [pair, s] of sortedPairs.slice(0, 5)) {
+      const t   = s.w + s.l;
+      const pwr = Math.round(s.w / t * 100);
+      msg += `  ${disp(pair)}: ${s.w}W/${s.l}L (${pwr}%)
+`;
+    }
+
+    msg += `
+🔄 Count reset — next 50 signals tracking starts now.`;
+
+    await send(chatId, msg, env, { reply_markup: { inline_keyboard: [[
+      { text: '📈 Full History', callback_data: 'cmd:history' },
+      { text: '🏆 All Stats',    callback_data: 'cmd:stats'   },
+    ]]}});
+
+    // Reset milestone counter
+    await kvPut(`milestone:${chatId}`, {
+      lastResetAt:  Date.now(),
+      countAtReset: resolved.length,
+    }, env);
+
+  } catch (e) {
+    console.error('checkMilestone:', e.message);
+  }
+}
+
+
 
 async function runResultCheck(env, log = console.log) {
   const ids = await getPendingIds(env);
@@ -976,14 +1074,19 @@ async function runResultCheck(env, log = console.log) {
       const lateMin = Math.round(lateMs / 60000);
       const lateStr = lateMin > 1 ? ` (+${lateMin}min)` : '';
 
+      const gradeStr = trade.grade ? `  ${trade.grade}` : '';
+
       await send(trade.chatId,
         `📊 Tracking ${noStr}${lateStr}\n` +
         `━━━━━━━━━━━━━━\n` +
-        `${resE}  ${dirE} ${trade.direction} ${disp(trade.pair)}\n` +
+        `${resE}  ${dirE} ${trade.direction} ${disp(trade.pair)}${gradeStr}\n` +
         `💰 Entry:  ${entry.toFixed(5)}\n` +
         `🏁 Exit:   ${current.toFixed(5)}\n` +
         `📏 Move:   ${diff > 0 ? '+' : ''}${pips}${unit}`,
         env, { reply_markup: afterKb() });
+
+      // Check 50-signal milestone
+      await checkMilestone(trade.chatId, env);
 
     } catch (e) {
       console.error(`ResultCheck ${tradeId}:`, e.message);
