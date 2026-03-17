@@ -1,8 +1,5 @@
 /**
- * FTT Signal Telegram Bot — v3.0
- * New: Grade filter, /scan all pairs, daily summary, milestone fix,
- *      quick stats in menu, history pagination, pair quick-signal
- *
+ * FTT Signal Telegram Bot — v3.1 (Clean Rewrite)
  * KV Binding     : BOT_KV
  * Service Binding: SIGNAL_WORKER → my-worker-601
  * Secrets        : BOT_TOKEN, SETUP_SECRET
@@ -15,1285 +12,857 @@ const PAIR_PAGES = [
   ['BTC/USD','ETH/USD','SOL/USD','BNB/USD'],
   ['XRP/USD','ADA/USD','DOGE/USD','AVAX/USD'],
 ];
-const VALID_INTERVALS  = [1,5,15];
-const MAX_WATCHLIST    = 6;
-const MAX_HISTORY      = 100;  // increased
-const MILESTONE_COUNT  = 50;
-const CRYPTO_BASES     = ['BTC','ETH','BNB','XRP','SOL','ADA','DOGE','AVAX','DOT','LINK'];
+const MAX_WL      = 6;
+const MAX_HIST    = 100;
+const MILESTONE   = 50;
+const CRYPTO      = ['BTC','ETH','BNB','XRP','SOL','ADA','DOGE','AVAX','DOT','LINK'];
 
-// ─── ENTRY POINTS ─────────────────────────────────────────────────────────────
+// ─── EXPORT ───────────────────────────────────────────────────────────────────
 
 export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
+  async fetch(req, env, ctx) {
+    const url = new URL(req.url);
+    const secret = () => url.searchParams.get('secret') === env.SETUP_SECRET;
 
-    if (request.method === 'POST' && url.pathname === '/webhook') {
-      const update = await request.json().catch(() => null);
-      if (update) ctx.waitUntil(handleUpdate(update, env));
+    if (req.method === 'POST' && url.pathname === '/webhook') {
+      const upd = await req.json().catch(() => null);
+      if (upd) ctx.waitUntil(dispatch(upd, env));
       return new Response('OK');
     }
 
-    if (url.pathname === '/setup') {
-      if (url.searchParams.get('secret') !== env.SETUP_SECRET)
-        return new Response('Unauthorized', { status: 401 });
-      const webhookUrl = `https://${url.hostname}/webhook`;
-      const res = await fetch(`${tgApi(env)}/setWebhook`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: webhookUrl, allowed_updates: ['message','callback_query'], drop_pending_updates: true }),
-      });
-      return new Response(JSON.stringify(await res.json(), null, 2), { headers: { 'Content-Type': 'application/json' } });
+    if (url.pathname === '/setup' && secret()) {
+      const hook = `https://${url.hostname}/webhook`;
+      const r = await fetch(`${TG(env)}/setWebhook`, post({ url: hook, allowed_updates: ['message','callback_query'], drop_pending_updates: true }));
+      return new Response(JSON.stringify(await r.json(), null, 2), json());
     }
 
-    if (url.pathname === '/runcron') {
-      if (url.searchParams.get('secret') !== env.SETUP_SECRET)
-        return new Response('Unauthorized', { status: 401 });
-      const logs = [];
-      const force = url.searchParams.get('force') === 'true';
-      await runCron(env, logs, force);
+    if (url.pathname === '/runcron' && secret()) {
+      const logs = [], force = url.searchParams.get('force') === 'true';
+      await cron(env, logs, force);
       return new Response(logs.join('\n'), { headers: { 'Content-Type': 'text/plain' } });
     }
 
-    if (url.pathname === '/debugkv') {
-      if (url.searchParams.get('secret') !== env.SETUP_SECRET)
-        return new Response('Unauthorized', { status: 401 });
-      const autoUsers  = (await kvGet('auto_users', env)) || [];
-      const pendingIds = (await kvGet('pending_ids', env)) || [];
+    if (url.pathname === '/debugkv' && secret()) {
+      const au = await kget('auto_users', env) || [];
       const users = {};
-      for (const id of autoUsers) users[id] = await kvGet(`u:${id}`, env);
-      return new Response(JSON.stringify({ autoUsers, pendingIds, users }, null, 2), { headers: { 'Content-Type': 'application/json' } });
+      for (const id of au) users[id] = await kget(`u:${id}`, env);
+      return new Response(JSON.stringify({ auto_users: au, users }, null, 2), json());
     }
 
-    if (url.pathname === '/addauto') {
-      if (url.searchParams.get('secret') !== env.SETUP_SECRET)
-        return new Response('Unauthorized', { status: 401 });
-      const chatId = url.searchParams.get('chat');
-      if (!chatId) return new Response('Missing ?chat=', { status: 400 });
-      const list = (await kvGet('auto_users', env)) || [];
-      if (!list.includes(chatId)) list.push(chatId);
-      await kvPut('auto_users', list, env);
-      const user = (await kvGet(`u:${chatId}`, env)) || defaultUser();
-      user.autoEnabled = true;
-      user.lastPairScanAt = {};
-      await kvPut(`u:${chatId}`, user, env);
-      return new Response(JSON.stringify({ ok: true, autoUsers: list }), { headers: { 'Content-Type': 'application/json' } });
+    if (url.pathname === '/addauto' && secret()) {
+      const id = url.searchParams.get('chat');
+      if (!id) return new Response('?chat= required', { status: 400 });
+      await addAutoUser(id, env);
+      const u = await getUser(id, env); u.autoEnabled = true;
+      await saveUser(id, u, env);
+      return new Response('OK', json());
     }
 
-    if (url.pathname === '/export') {
-      if (url.searchParams.get('secret') !== env.SETUP_SECRET)
-        return new Response('Unauthorized', { status: 401 });
-      const chatId = url.searchParams.get('chat');
-      if (!chatId) return new Response('Missing ?chat=', { status: 400 });
-      const history = (await kvGet(`h:${chatId}`, env)) || [];
-      if (!history.length) return new Response('No data', { status: 404 });
-      const header = 'No,ID,Pair,Direction,Grade,Confidence,Entry,Exit,Pips,Result,Expiry(min),Timestamp,ResolvedAt';
-      const rows = history.map(h => [
-        h.no||'', h.id||'', h.pair||'', h.direction||'', h.grade||'',
-        h.confidence||'', h.entryPrice||'', h.exitPrice||'', h.pips||'',
-        h.result||'PENDING', h.expiryMinutes||'', h.timestamp||'', h.resolvedAt||''
-      ].join(','));
-      const csv = [header, ...rows].join('\n');
-      return new Response(csv, { headers: {
-        'Content-Type': 'text/csv',
-        'Content-Disposition': `attachment; filename="ftt-signals-${chatId}-${new Date().toISOString().slice(0,10)}.csv"`,
-      }});
+    if (url.pathname === '/export' && secret()) {
+      const id = url.searchParams.get('chat');
+      if (!id) return new Response('?chat= required', { status: 400 });
+      const h = await getHist(id, env);
+      if (!h.length) return new Response('No data', { status: 404 });
+      const hdr = 'No,Pair,Dir,Grade,Conf,Entry,Exit,Pips,Result,Expiry,Time,ResolvedAt';
+      const rows = h.map(x => [x.no||'',x.pair||'',x.direction||'',x.grade||'',x.confidence||'',
+        x.entryPrice||'',x.exitPrice||'',x.pips||'',x.result||'PENDING',
+        x.expiryMinutes||'',x.timestamp||'',x.resolvedAt||''].join(','));
+      const fname = `ftt-${id}-${new Date().toISOString().slice(0,10)}.csv`;
+      return new Response([hdr,...rows].join('\n'), {
+        headers: { 'Content-Type':'text/csv', 'Content-Disposition':`attachment; filename="${fname}"` }
+      });
     }
 
-    if (url.pathname === '/debug') {
-      const pair = url.searchParams.get('pair') || 'EURUSD';
-      try {
-        const data = await fetchSignal(pair, env);
-        return new Response(JSON.stringify(data, null, 2), { headers: { 'Content-Type': 'application/json' } });
-      } catch (e) {
-        return new Response(JSON.stringify({ error: e.message }), { headers: { 'Content-Type': 'application/json' }, status: 500 });
-      }
-    }
-
-    return new Response('FTT Signal Bot v3.0');
+    return new Response('FTT Signal Bot v3.1');
   },
 
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(runCron(env, [], true));
+  async scheduled(e, env, ctx) {
+    ctx.waitUntil(cron(env, [], true));
   },
 };
 
-// ─── CRON ─────────────────────────────────────────────────────────────────────
+// ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
 
-async function runCron(env, logs = [], force = false) {
-  const log = m => { console.log(m); logs.push(String(m)); };
-  log('Cron ' + new Date().toISOString());
-  if (!env.BOT_TOKEN) { log('ERROR: BOT_TOKEN missing'); return; }
-  if (!env.BOT_KV)    { log('ERROR: BOT_KV missing');    return; }
-  try { await runAutoScan(env, log, force); }   catch (e) { log('ScanErr: ' + e.message); }
-  try { await runResultCheck(env, log); }        catch (e) { log('ResultErr: ' + e.message); }
-  try { await runDailySummary(env, log); }       catch (e) { log('SummaryErr: ' + e.message); }
-  log('Done');
-}
+const TG  = env => `https://api.telegram.org/bot${env.BOT_TOKEN}`;
+const post = body => ({ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+const json = () => ({ headers: { 'Content-Type': 'application/json' } });
+const safe = t  => String(t||'').replace(/[*_`\[\]]/g,'');
 
-// ─── SIGNAL FETCH ─────────────────────────────────────────────────────────────
-
-async function fetchSignal(pair, env) {
-  const req = new Request(`https://signal/api/signal?pair=${pair}`, { headers: { Accept: 'application/json' } });
-  const res = env.SIGNAL_WORKER
-    ? await env.SIGNAL_WORKER.fetch(req)
-    : await fetch(`https://my-worker-601.umuhammadiswa.workers.dev/api/signal?pair=${pair}`,
-        { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
-  if (!res.ok) throw new Error(`HTTP ${res.status} — ${(await res.text().catch(()=>'')).slice(0,200)}`);
-  return res.json();
-}
-
-async function fetchCurrentPrice(pair, env) {
+async function tg(method, body, env) {
+  if (!env?.BOT_TOKEN) return null;
   try {
-    const d = await fetchSignal(pair, env);
-    return d?.signal?.recommendations?.['1min']?.entry?.price
-        || d?.signal?.recommendations?.['5min']?.entry?.price
-        || d?.signal?.recommendations?.['15min']?.entry?.price
-        || null;
-  } catch { return null; }
-}
-
-// ─── TELEGRAM ─────────────────────────────────────────────────────────────────
-
-function tgApi(env) { return `https://api.telegram.org/bot${env.BOT_TOKEN}`; }
-
-async function tgCall(method, body, env) {
-  if (!env.BOT_TOKEN) return;
-  try {
-    const res = await fetch(`${tgApi(env)}/${method}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const t = await res.text();
-      // Ignore "message is not modified" — not a real error
-      if (!t.includes('message is not modified') && !t.includes('query is too old')) {
-        console.error(`tg ${method} ${res.status}:`, t.slice(0,200));
-      }
+    const r = await fetch(`${TG(env)}/${method}`, post(body));
+    if (!r.ok) {
+      const t = await r.text();
+      if (!t.includes('not modified') && !t.includes('too old'))
+        console.error(`tg/${method}:`, t.slice(0,150));
     }
-  } catch (e) { console.error(`tg ${method}:`, e.message); }
+    return r;
+  } catch(e) { console.error(`tg/${method}:`, e.message); return null; }
 }
 
-function send(chatId, text, env, extra = {}) {
-  return tgCall('sendMessage', { chat_id: chatId, text: cl(text), disable_web_page_preview: true, ...extra }, env);
-}
-function edit(chatId, msgId, text, env, extra = {}) {
-  return tgCall('editMessageText', { chat_id: chatId, message_id: msgId, text: cl(text), disable_web_page_preview: true, ...extra }, env);
-}
-function answerCb(id, text, env) {
-  return tgCall('answerCallbackQuery', { callback_query_id: id, text: text || '' }, env);
-}
-function cl(t) { return String(t||'').replace(/[*_`\[\]]/g,''); }
+const sendMsg = (cid, text, env, extra={}) =>
+  tg('sendMessage', { chat_id:cid, text:safe(text), disable_web_page_preview:true, ...extra }, env);
 
-// ─── KV ───────────────────────────────────────────────────────────────────────
+const editMsg = (cid, mid, text, env, extra={}) =>
+  tg('editMessageText', { chat_id:cid, message_id:mid, text:safe(text), disable_web_page_preview:true, ...extra }, env);
 
-async function kvGet(key, env) {
-  try { return await env.BOT_KV.get(key, 'json'); } catch { return null; }
-}
-async function kvPut(key, value, env, opts = {}) {
-  try { await env.BOT_KV.put(key, JSON.stringify(value), opts); return true; }
-  catch (e) { console.error('kvPut', key, e.message); return false; }
-}
-async function kvDel(key, env) {
-  try { await env.BOT_KV.delete(key); } catch {}
-}
+const answerCb = (id, env, text='') =>
+  tg('answerCallbackQuery', { callback_query_id:id, text }, env);
+
+// reply helper — edit if msgId given, else send new
+const reply = (cid, mid, text, env, kb) => mid
+  ? editMsg(cid, mid, text, env, { reply_markup: kb })
+  : sendMsg(cid, text, env, { reply_markup: kb });
+
+// ─── KV HELPERS ───────────────────────────────────────────────────────────────
+
+const kget = async (k, env) => { try { return await env.BOT_KV.get(k,'json'); } catch { return null; } };
+const kput = async (k, v, env, opts={}) => { try { await env.BOT_KV.put(k, JSON.stringify(v), opts); } catch(e){ console.error('kput',k,e.message); } };
+const kdel = async (k, env) => { try { await env.BOT_KV.delete(k); } catch {} };
 
 // ─── USER ─────────────────────────────────────────────────────────────────────
 
-function defaultUser() {
-  return {
-    pair: 'EURUSD', watchlist: [], interval: 5,
-    autoEnabled: false, noTradeStreak: 0,
-    gradeFilter: 'ALL',    // ALL / A / AB
-    dailySummary: false,   // send daily summary
-    summaryHour: 20,       // UTC hour for daily summary
-  };
-}
+const DEF_USER = () => ({
+  pair:'EURUSD', watchlist:[], interval:5, autoEnabled:false,
+  noTradeStreak:0, gradeFilter:'ALL', minConfidence:0,
+  dailySummary:false, summaryHour:20,
+});
 
-async function getUser(chatId, env) {
-  const d = await kvGet(`u:${chatId}`, env);
-  return d ? { ...defaultUser(), ...d } : defaultUser();
+async function getUser(cid, env) {
+  const d = await kget(`u:${cid}`, env);
+  return d ? { ...DEF_USER(), ...d } : DEF_USER();
 }
-async function saveUser(chatId, data, env) { await kvPut(`u:${chatId}`, data, env); }
+const saveUser = (cid, u, env) => kput(`u:${cid}`, u, env);
 
-async function getAutoUsers(env) { return (await kvGet('auto_users', env)) || []; }
-async function addAutoUser(chatId, env) {
+async function getAutoUsers(env) { return (await kget('auto_users', env)) || []; }
+async function addAutoUser(cid, env) {
   const list = await getAutoUsers(env);
-  if (!list.includes(String(chatId))) await kvPut('auto_users', [...list, String(chatId)], env);
+  if (!list.includes(String(cid))) await kput('auto_users', [...list, String(cid)], env);
 }
-async function removeAutoUser(chatId, env) {
+async function removeAutoUser(cid, env) {
   const list = await getAutoUsers(env);
-  await kvPut('auto_users', list.filter(id => id !== String(chatId)), env);
+  await kput('auto_users', list.filter(x => x !== String(cid)), env);
 }
-async function getSummaryUsers(env) { return (await kvGet('summary_users', env)) || []; }
-async function addSummaryUser(chatId, env) {
+async function getSummaryUsers(env) { return (await kget('summary_users', env)) || []; }
+async function addSummaryUser(cid, env) {
   const list = await getSummaryUsers(env);
-  if (!list.includes(String(chatId))) await kvPut('summary_users', [...list, String(chatId)], env);
+  if (!list.includes(String(cid))) await kput('summary_users', [...list, String(cid)], env);
 }
-async function removeSummaryUser(chatId, env) {
+async function removeSummaryUser(cid, env) {
   const list = await getSummaryUsers(env);
-  await kvPut('summary_users', list.filter(id => id !== String(chatId)), env);
+  await kput('summary_users', list.filter(x => x !== String(cid)), env);
 }
 
 // ─── HISTORY ──────────────────────────────────────────────────────────────────
 
-async function getHistory(chatId, env) { return (await kvGet(`h:${chatId}`, env)) || []; }
+const getHist    = async (cid, env) => (await kget(`h:${cid}`, env)) || [];
+const getCounter = async (cid, env) => (await kget(`cnt:${cid}`, env)) || 0;
 
-async function addToHistory(chatId, entry, env) {
-  const h = await getHistory(chatId, env);
-  // Persistent signal counter (never resets with history trim)
-  const counter = ((await kvGet(`cnt:${chatId}`, env)) || 0) + 1;
-  await kvPut(`cnt:${chatId}`, counter, env);
-  entry.no = counter;
+async function addHist(cid, entry, env) {
+  const h   = await getHist(cid, env);
+  const cnt = (await getCounter(cid, env)) + 1;
+  await kput(`cnt:${cid}`, cnt, env);
+  entry.no = cnt;
   h.unshift(entry);
-  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
-  await kvPut(`h:${chatId}`, h.slice(0, MAX_HISTORY).filter(x => new Date(x.timestamp).getTime() > cutoff), env);
-  return counter;
+  const cutoff = Date.now() - 30*24*60*60*1000;
+  await kput(`h:${cid}`, h.slice(0, MAX_HIST).filter(x => new Date(x.timestamp).getTime() > cutoff), env);
+  return cnt;
 }
 
-async function setTradeResult(chatId, tradeId, result, exitPrice, pips, env) {
-  const h = await getHistory(chatId, env);
-  const idx = h.findIndex(x => x.id === tradeId);
-  if (idx !== -1) {
-    h[idx] = { ...h[idx], result, exitPrice, pips, resolvedAt: new Date().toISOString() };
-    await kvPut(`h:${chatId}`, h, env);
+async function setResult(cid, tid, result, exitPrice, pips, env) {
+  const h = await getHist(cid, env);
+  const i = h.findIndex(x => x.id === tid);
+  if (i !== -1) {
+    h[i] = { ...h[i], result, exitPrice, pips, resolvedAt: new Date().toISOString() };
+    await kput(`h:${cid}`, h, env);
   }
 }
 
 // ─── PENDING TRADES ───────────────────────────────────────────────────────────
 
-async function getPendingIds(env) { return (await kvGet('pending_ids', env)) || []; }
-async function addPendingTrade(trade, env) {
-  await kvPut(`pt:${trade.tradeId}`, trade, env, { expirationTtl: 7200 });
+const getPendingIds = async env => (await kget('pending_ids', env)) || [];
+async function addPending(trade, env) {
+  await kput(`pt:${trade.tradeId}`, trade, env, { expirationTtl: 7200 });
   const ids = await getPendingIds(env);
-  if (!ids.includes(trade.tradeId)) await kvPut('pending_ids', [...ids, trade.tradeId], env);
+  if (!ids.includes(trade.tradeId))
+    await kput('pending_ids', [...ids, trade.tradeId], env);
 }
-async function savePendingIds(ids, env) { await kvPut('pending_ids', ids, env); }
+const savePendingIds = (ids, env) => kput('pending_ids', ids, env);
 
 // ─── ACTIVE LOCK ──────────────────────────────────────────────────────────────
 
-async function getActiveLock(chatId, pair, env) { return kvGet(`lock:${chatId}:${pair}`, env); }
-async function setActiveLock(chatId, pair, direction, expiryAt, env) {
+const getLock   = (cid, pair, env)                 => kget(`lock:${cid}:${pair}`, env);
+const clearLock = (cid, pair, env)                 => kdel(`lock:${cid}:${pair}`, env);
+async function setLock(cid, pair, dir, expiryAt, env) {
   const ttl = Math.max(60, Math.ceil((expiryAt - Date.now()) / 1000) + 120);
-  await kvPut(`lock:${chatId}:${pair}`, { direction, expiryAt }, env, { expirationTtl: ttl });
+  await kput(`lock:${cid}:${pair}`, { direction:dir, expiryAt }, env, { expirationTtl: ttl });
 }
-async function clearActiveLock(chatId, pair, env) { await kvDel(`lock:${chatId}:${pair}`, env); }
 
 // ─── LOG & SCHEDULE ───────────────────────────────────────────────────────────
 
-async function logAndSchedule(chatId, pair, sig, env) {
-  const dir           = sig.finalSignal;
-  const best          = sig.bestTimeframe;
-  const expiryMinutes = best?.expiry?.totalMinutes || 5;
-  const expiryAt      = Date.now() + expiryMinutes * 60 * 1000;
-  const entryPrice    = sig.recommendations?.['1min']?.entry?.price
-                     || sig.recommendations?.['5min']?.entry?.price || null;
-  const grade         = sig.grade ? `${sig.grade.grade} ${sig.grade.label}` : '';
-  const tradeId       = uid();
+async function logAndSchedule(cid, pair, sig, env) {
+  const dir     = sig.finalSignal;
+  const expMins = sig.bestTimeframe?.expiry?.totalMinutes || 5;
+  const expAt   = Date.now() + expMins * 60 * 1000;
+  const entry   = sig.recommendations?.['1min']?.entry?.price
+               || sig.recommendations?.['5min']?.entry?.price || null;
+  const grade   = sig.grade ? `${sig.grade.grade} ${sig.grade.label}` : '';
+  const tid     = uid();
 
-  const signalNo = await addToHistory(chatId, {
-    id: tradeId, pair, direction: dir,
-    confidence: sig.confidence || '0%', grade,
-    entryPrice, expiryMinutes,
-    expiryAt: new Date(expiryAt).toISOString(),
-    timestamp: new Date().toISOString(), result: null,
+  const no = await addHist(cid, {
+    id:tid, pair, direction:dir, confidence:sig.confidence||'0%', grade,
+    entryPrice:entry, expiryMinutes:expMins,
+    expiryAt:new Date(expAt).toISOString(),
+    timestamp:new Date().toISOString(), result:null,
   }, env);
 
-  await addPendingTrade({ chatId: String(chatId), tradeId, pair, direction: dir, entryPrice, expiryAt, signalNo, grade }, env);
-  await setActiveLock(chatId, pair, dir, expiryAt, env);
-  return signalNo;
+  await addPending({ chatId:String(cid), tradeId:tid, pair, direction:dir, entryPrice:entry, expiryAt:expAt, signalNo:no, grade }, env);
+  await setLock(cid, pair, dir, expAt, env);
+  return no;
 }
+
+// ─── FILTERS ──────────────────────────────────────────────────────────────────
+
+const passGrade = (sig, f) => {
+  if (!f || f==='ALL') return true;
+  const g = sig.grade?.grade || '';
+  return f==='A' ? g==='A' : f==='AB' ? 'AB'.includes(g) : true;
+};
+const passConf = (sig, min) => {
+  if (!min) return true;
+  return parseInt((sig.confidence||'0%').replace('%',''), 10) >= min;
+};
 
 // ─── KEYBOARDS ────────────────────────────────────────────────────────────────
 
-function mainKb(user) {
-  const auto = user.autoEnabled;
-  return { inline_keyboard: [
-    [
-      { text: '📊 Signal Now',  callback_data: 'cmd:signal'     },
-      { text: auto ? '🔕 Stop Auto' : '🔄 Start Auto', callback_data: 'cmd:toggle_auto' },
-    ],
-    [
-      { text: '🔍 Scan All',    callback_data: 'cmd:scanall'    },
-      { text: '📅 Today',       callback_data: 'cmd:today'      },
-    ],
-    [
-      { text: '👁 Watchlist',   callback_data: 'cmd:watchlist'  },
-      { text: '📈 History',     callback_data: 'cmd:history:0'  },
-    ],
-    [
-      { text: '🏆 Stats',       callback_data: 'cmd:stats'      },
-      { text: '📋 Summary',     callback_data: 'cmd:summary'    },
-    ],
-    [
-      { text: '⚙️ Settings',    callback_data: 'cmd:settings'   },
-      { text: '📋 Status',      callback_data: 'cmd:status'     },
-    ],
-  ]};
-}
+const kb = rows => ({ inline_keyboard: rows });
 
-function settingsKb(user) {
-  const gf   = user.gradeFilter || 'ALL';
-  const ds   = user.dailySummary ? 'ON' : 'OFF';
-  const sh   = user.summaryHour ?? 20;
-  const minC = user.minConfidence || 0;
-  return { inline_keyboard: [
-    [
-      { text: '💱 Change Pair',          callback_data: 'pairpage:0'         },
-      { text: `⏱ Interval: ${user.interval}min`, callback_data: 'cmd:intervals' },
-    ],
-    [
-      { text: `🎯 Grade: ${gf}`,          callback_data: 'cmd:gradefilter'    },
-      { text: `📊 Min Conf: ${minC}%`,    callback_data: 'cmd:conffilter'     },
-    ],
-    [
-      { text: `📅 Summary: ${ds}`,        callback_data: 'cmd:togglesummary'  },
-      { text: `🕐 Time: ${sh}:00 UTC`,    callback_data: 'cmd:summarytime'    },
-    ],
-    [{ text: '🔙 Back', callback_data: 'cmd:main' }],
-  ]};
-}
+const mainKb = u => kb([
+  [
+    btn('📊 Signal Now',  'cmd:signal'),
+    btn(u.autoEnabled ? '🔕 Stop Auto' : '🔄 Start Auto', 'cmd:toggle_auto'),
+  ],
+  [ btn('🔍 Scan All', 'cmd:scanall'),  btn('📅 Today',    'cmd:today')   ],
+  [ btn('👁 Watchlist', 'cmd:watchlist'), btn('📈 History', 'cmd:history:0') ],
+  [ btn('🏆 Stats',    'cmd:stats'),    btn('📋 Summary',  'cmd:summary')  ],
+  [ btn('⚙️ Settings', 'cmd:settings'), btn('📋 Status',   'cmd:status')   ],
+]);
 
-function summaryTimeKb() {
-  return { inline_keyboard: [
-    [
-      { text: '06:00 UTC', callback_data: 'sumhour:6'  },
-      { text: '12:00 UTC', callback_data: 'sumhour:12' },
-      { text: '18:00 UTC', callback_data: 'sumhour:18' },
-    ],
-    [
-      { text: '20:00 UTC', callback_data: 'sumhour:20' },
-      { text: '22:00 UTC', callback_data: 'sumhour:22' },
-      { text: '00:00 UTC', callback_data: 'sumhour:0'  },
-    ],
-    [{ text: '🔙 Back', callback_data: 'cmd:settings' }],
-  ]};
-}
+const settingsKb = u => kb([
+  [ btn(`💱 Pair: ${disp(u.pair)}`, 'pairpage:0'), btn(`⏱ Interval: ${u.interval}min`, 'cmd:intervals') ],
+  [ btn(`🎯 Grade: ${u.gradeFilter||'ALL'}`, 'cmd:gradefilter'), btn(`📊 Conf: ${u.minConfidence||0}%+`, 'cmd:conffilter') ],
+  [ btn(`📅 Summary: ${u.dailySummary?'ON':'OFF'}`, 'cmd:togglesummary'), btn(`🕐 Time: ${u.summaryHour??20}:00 UTC`, 'cmd:summarytime') ],
+  [ btn('🔙 Back', 'cmd:main') ],
+]);
 
-function confFilterKb() {
-  return { inline_keyboard: [
-    [
-      { text: 'Any',   callback_data: 'cf:0'  },
-      { text: '60%+',  callback_data: 'cf:60' },
-      { text: '70%+',  callback_data: 'cf:70' },
-    ],
-    [
-      { text: '75%+',  callback_data: 'cf:75' },
-      { text: '80%+',  callback_data: 'cf:80' },
-      { text: '85%+',  callback_data: 'cf:85' },
-    ],
-    [{ text: '🔙 Back', callback_data: 'cmd:settings' }],
-  ]};
-}
-
-function pairsKb(page) {
-  page = Math.max(0, Math.min(page, PAIR_PAGES.length - 1));
-  const kb = PAIR_PAGES[page].reduce((rows, p, i) => {
-    if (i % 2 === 0) rows.push([]);
-    rows[rows.length-1].push({ text: p, callback_data: `pair:${p}` });
-    return rows;
-  }, []);
+const pairsKb = (page, backTo='cmd:settings') => {
+  page = Math.max(0, Math.min(page, PAIR_PAGES.length-1));
+  const rows = chunk(PAIR_PAGES[page], 2).map(row => row.map(p => btn(p, `pair:${p}`)));
   const nav = [];
-  if (page > 0)                     nav.push({ text: '◀ Prev', callback_data: `pairpage:${page-1}` });
-  if (page < PAIR_PAGES.length - 1) nav.push({ text: 'Next ▶', callback_data: `pairpage:${page+1}` });
-  if (nav.length) kb.push(nav);
-  kb.push([{ text: '🔙 Back', callback_data: 'cmd:settings' }]);
-  return { inline_keyboard: kb };
-}
+  if (page > 0)                     nav.push(btn('◀ Prev', `pairpage:${page-1}`));
+  if (page < PAIR_PAGES.length - 1) nav.push(btn('Next ▶', `pairpage:${page+1}`));
+  if (nav.length) rows.push(nav);
+  rows.push([btn('🔙 Back', backTo)]);
+  return kb(rows);
+};
 
-function wlAddKb(page, wl) {
-  page = Math.max(0, Math.min(page, PAIR_PAGES.length - 1));
-  const kb = PAIR_PAGES[page].reduce((rows, p, i) => {
-    if (i % 2 === 0) rows.push([]);
-    const code = norm(p), inWL = wl.includes(code);
-    // Include page in callback so we return to same page after add/remove
-    rows[rows.length-1].push({
-      text: inWL ? `✅ ${p}` : p,
-      callback_data: inWL ? `wl:rmpage:${code}:${page}` : `wl:addpage:${code}:${page}`,
-    });
-    return rows;
-  }, []);
+const wlKb = wl => {
+  const rows = wl.map(p => [btn(`📊 ${disp(p)}`, `qs:${p}`), btn('❌', `wl:rm:${p}`)]);
+  rows.push([btn('➕ Add Pairs', 'wlpage:0')]);
+  rows.push([btn('🔙 Back', 'cmd:main')]);
+  return kb(rows);
+};
+
+const wlAddKb = (page, wl) => {
+  page = Math.max(0, Math.min(page, PAIR_PAGES.length-1));
+  const rows = chunk(PAIR_PAGES[page], 2).map(row =>
+    row.map(p => {
+      const code = norm(p), inWL = wl.includes(code);
+      return btn(inWL ? `✅ ${p}` : p, inWL ? `wl:rmpage:${code}:${page}` : `wl:addpage:${code}:${page}`);
+    })
+  );
   const nav = [];
-  if (page > 0)                     nav.push({ text: '◀ Prev', callback_data: `wlpage:${page-1}` });
-  if (page < PAIR_PAGES.length - 1) nav.push({ text: 'Next ▶', callback_data: `wlpage:${page+1}` });
-  if (nav.length) kb.push(nav);
-  kb.push([
-    { text: `✅ Done (${wl.length}/${MAX_WATCHLIST})`, callback_data: 'cmd:watchlist' },
-  ]);
-  return { inline_keyboard: kb };
-}
+  if (page > 0)                     nav.push(btn('◀ Prev', `wlpage:${page-1}`));
+  if (page < PAIR_PAGES.length - 1) nav.push(btn('Next ▶', `wlpage:${page+1}`));
+  if (nav.length) rows.push(nav);
+  rows.push([btn(`✅ Done (${wl.length}/${MAX_WL})`, 'cmd:watchlist')]);
+  return kb(rows);
+};
 
-function wlKb(wl) {
-  // Each pair: one row with [📊 Signal] [❌ Remove]
-  const kb = wl.map(p => ([
-    { text: `📊 ${disp(p)}`, callback_data: `qs:${p}` },
-    { text: `❌`,            callback_data: `wl:rm:${p}` },
-  ]));
-  kb.push([{ text: '➕ Add Pairs', callback_data: 'wlpage:0' }]);
-  kb.push([{ text: '🔙 Back',      callback_data: 'cmd:main'  }]);
-  return { inline_keyboard: kb };
-}
-
-function intervalKb() {
-  return { inline_keyboard: [
-    [
-      { text: '⚡ 1 min',  callback_data: 'interval:1'  },
-      { text: '📊 5 min',  callback_data: 'interval:5'  },
-      { text: '🕐 15 min', callback_data: 'interval:15' },
-    ],
-    [{ text: '🔙 Back', callback_data: 'cmd:settings' }],
-  ]};
-}
-
-function gradeFilterKb() {
-  return { inline_keyboard: [
-    [
-      { text: '🌐 All grades',    callback_data: 'gf:ALL' },
-      { text: '⭐ A + B only',    callback_data: 'gf:AB'  },
-      { text: '🏆 A grade only',  callback_data: 'gf:A'   },
-    ],
-    [{ text: '🔙 Back', callback_data: 'cmd:settings' }],
-  ]};
-}
-
-function afterKb() {
-  return { inline_keyboard: [[
-    { text: '🔁 New Signal', callback_data: 'cmd:signal'   },
-    { text: '📈 History',    callback_data: 'cmd:history:0'},
-    { text: '🔙 Menu',       callback_data: 'cmd:main'     },
-  ]]};
-}
-
-function historyNavKb(page, total) {
-  const perPage = 10, totalPages = Math.ceil(total / perPage);
+const intervalKb  = () => kb([
+  [ btn('⚡ 1min','interval:1'), btn('📊 5min','interval:5'), btn('🕐 15min','interval:15') ],
+  [ btn('🔙 Back','cmd:settings') ],
+]);
+const gradeKb     = () => kb([
+  [ btn('🌐 All','gf:ALL'), btn('⭐ A+B','gf:AB'), btn('🏆 A only','gf:A') ],
+  [ btn('🔙 Back','cmd:settings') ],
+]);
+const confKb      = () => kb([
+  [ btn('Any','cf:0'), btn('60%+','cf:60'), btn('70%+','cf:70') ],
+  [ btn('75%+','cf:75'), btn('80%+','cf:80'), btn('85%+','cf:85') ],
+  [ btn('🔙 Back','cmd:settings') ],
+]);
+const summTimeKb  = () => kb([
+  [ btn('06:00','sumhour:6'), btn('12:00','sumhour:12'), btn('18:00','sumhour:18') ],
+  [ btn('20:00','sumhour:20'), btn('22:00','sumhour:22'), btn('00:00','sumhour:0') ],
+  [ btn('🔙 Back','cmd:settings') ],
+]);
+const afterKb     = () => kb([[btn('🔁 New Signal','cmd:signal'), btn('📈 History','cmd:history:0'), btn('🔙 Menu','cmd:main')]]);
+const histNavKb   = (page, total) => {
   const nav = [];
-  if (page > 0)               nav.push({ text: '◀ Prev', callback_data: `cmd:history:${page-1}` });
-  if (page < totalPages - 1)  nav.push({ text: 'Next ▶', callback_data: `cmd:history:${page+1}` });
-  const kb = [];
-  if (nav.length) kb.push(nav);
-  kb.push([
-    { text: '🏆 Stats',  callback_data: 'cmd:stats'    },
-    { text: '🔙 Back',   callback_data: 'cmd:main'     },
-  ]);
-  return { inline_keyboard: kb };
-}
+  if (page > 0)                          nav.push(btn('◀ Prev', `cmd:history:${page-1}`));
+  if (page < Math.ceil(total/10) - 1)    nav.push(btn('Next ▶', `cmd:history:${page+1}`));
+  const rows = [];
+  if (nav.length) rows.push(nav);
+  rows.push([btn('🏆 Stats','cmd:stats'), btn('🔙 Back','cmd:main')]);
+  return kb(rows);
+};
+
+const btn = (text, cb) => ({ text, callback_data: cb });
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-function disp(p) { return (!p.includes('/') && p.length===6) ? p.slice(0,3)+'/'+p.slice(3) : p; }
-function norm(p) { return p.replace('/',''); }
-function uid()  { return Math.random().toString(36).slice(2,8).toUpperCase(); }
-function isCrypto(p) { return CRYPTO_BASES.some(b => p.startsWith(b)); }
-
-function passesGradeFilter(sig, filter) {
-  if (filter === 'ALL') return true;
-  const g = sig.grade?.grade || '';
-  if (filter === 'A')  return g === 'A';
-  if (filter === 'AB') return g === 'A' || g === 'B';
-  return true;
-}
-
-function passesConfFilter(sig, minConf) {
-  if (!minConf || minConf === 0) return true;
-  const conf = parseInt((sig.confidence || '0%').replace('%',''), 10);
-  return conf >= minConf;
-}
+const disp = p => (!p.includes('/') && p.length===6) ? p.slice(0,3)+'/'+p.slice(3) : p;
+const norm = p => p.replace('/','');
+const uid  = () => Math.random().toString(36).slice(2,8).toUpperCase();
+const isCr = p => CRYPTO.some(b => p.startsWith(b));
+const chunk = (arr, n) => arr.reduce((r,x,i) => (i%n===0?r.push([x]):r[r.length-1].push(x), r), []);
 
 // ─── FORMATTERS ───────────────────────────────────────────────────────────────
 
-function fmtSignal(data, pair, interval, signalNo) {
-  const label = disp(pair);
-  if (data.marketStatus === 'CLOSED') {
-    return `📊 ${label} | ${interval}min\n━━━━━━━━━━━━━━\n🔴 Forex Market CLOSED\n💡 Try BTC/USD (24/7)`;
-  }
-  const sig = data.signal;
-  if (!sig) return `📊 ${label} | ${interval}min\n━━━━━━━━━━━━━━\nNo signal data`;
+function fmtSignal(data, pair, interval, no) {
+  if (data.marketStatus === 'CLOSED')
+    return `📊 ${disp(pair)} | ${interval}min\n━━━━━━━━━━━━━━\n🔴 Forex Market CLOSED\n💡 Try BTC/USD (24/7)`;
 
-  const dir    = sig.finalSignal || 'NO_TRADE';
-  const conf   = sig.confidence  || '0%';
+  const sig = data.signal;
+  if (!sig) return `📊 ${disp(pair)} | ${interval}min\n━━━━━━━━━━━━━━\nNo signal data`;
+
+  const dir    = sig.finalSignal  || 'NO_TRADE';
+  const conf   = sig.confidence   || '0%';
   const grade  = sig.grade ? `${sig.grade.grade} ${sig.grade.label}` : '';
-  const htf    = sig.higherTFTrend || 'NEUTRAL';
+  const htf    = sig.higherTFTrend|| 'NEUTRAL';
   const reason = sig.entryReason  || '';
   const best   = sig.bestTimeframe;
   const expiry = best?.expiry?.humanReadable || null;
   const cd     = best?.expiry?.countdown?.label || null;
+  const price  = sig.recommendations?.['1min']?.entry?.price
+              || sig.recommendations?.['5min']?.entry?.price
+              || sig.recommendations?.['15min']?.entry?.price || null;
 
   const dE = dir==='BUY'?'🟢':dir==='SELL'?'🔴':'⚪';
   const hE = htf==='BUY'?'📈':htf==='SELL'?'📉':'➡️';
 
-  const entryPrice = sig.recommendations?.['1min']?.entry?.price
-                  || sig.recommendations?.['5min']?.entry?.price
-                  || sig.recommendations?.['15min']?.entry?.price || null;
+  let msg = no ? `📌 Signal No. ${no}\n` : '';
+  msg += `📊 ${disp(pair)} | ${interval}min\n━━━━━━━━━━━━━━\n`;
 
-  let msg = '';
-  if (signalNo) msg += `📌 Signal No. ${signalNo}\n`;
-  msg += `📊 ${label} | ${interval}min\n━━━━━━━━━━━━━━\n`;
-
-  if (dir === 'BUY' || dir === 'SELL') {
+  if (dir==='BUY'||dir==='SELL') {
     msg += `${dE} ${dir}  ${conf}  ${grade}\n`;
-    if (entryPrice) msg += `💰 Entry: ${parseFloat(entryPrice).toFixed(5)}\n`;
-    if (expiry)     msg += `⏰ Expiry: ${expiry}\n`;
-    if (cd)         msg += `🕐 Candle closes: ${cd}\n`;
+    if (price)  msg += `💰 Entry: ${parseFloat(price).toFixed(5)}\n`;
+    if (expiry) msg += `⏰ Expiry: ${expiry}\n`;
+    if (cd)     msg += `🕐 Candle closes: ${cd}\n`;
     msg += `${hE} HTF 15min: ${htf}\n`;
-    if (reason)     msg += `\n📝 ${reason}\n`;
+    if (reason) msg += `\n📝 ${reason}\n`;
     msg += `\n⏳ Result will be tracked automatically`;
   } else {
     const filters = sig.filtersApplied || [];
-    const align   = sig.alignment || '';
     msg += `⚪ NO TRADE\n`;
-    msg += filters.length > 0 ? `🔕 ${filters.join(' · ')}` : `🔕 ${align==='MIXED'?'Timeframes mixed':'Setup not clear'}`;
+    msg += filters.length ? `🔕 ${filters.join(' · ')}` : `🔕 ${sig.alignment==='MIXED'?'Timeframes mixed':'Setup not clear'}`;
   }
   return msg;
 }
 
-function fmtHistory(history, page = 0) {
-  const perPage = 10;
-  const start   = page * perPage;
-  const slice   = history.slice(start, start + perPage);
+function fmtHist(hist, page=0) {
+  const per=10, slice=hist.slice(page*per, page*per+per);
   if (!slice.length) return 'No signals yet.';
-
-  let msg = `📈 Signal History (${start+1}-${start+slice.length} of ${history.length})\n━━━━━━━━━━━━━━\n`;
+  let msg = `📈 History (${page*per+1}-${page*per+slice.length} of ${hist.length})\n━━━━━━━━━━━━━━\n`;
   for (const h of slice) {
-    const dE = h.direction==='BUY'?'🟢':'🔴';
-    const rE = h.result==='WIN'?'✅':h.result==='LOSS'?'❌':h.result==='SKIP'?'⏭':'⏳';
-    const g  = h.grade ? ` ${h.grade.split(' ')[0]}` : '';
-    const t  = new Date(h.timestamp).toUTCString().slice(5,17);
-    const p  = h.pips != null ? ` ${h.pips>0?'+':''}${h.pips}` : '';
+    const dE=h.direction==='BUY'?'🟢':'🔴';
+    const rE=h.result==='WIN'?'✅':h.result==='LOSS'?'❌':h.result==='SKIP'?'⏭':'⏳';
+    const g=h.grade?` ${h.grade.split(' ')[0]}`:'';
+    const p=h.pips!=null?` ${h.pips>0?'+':''}${h.pips}`:'';
+    const t=new Date(h.timestamp).toUTCString().slice(5,17);
     msg += `${rE} #${h.no||'?'} ${dE} ${disp(h.pair)}${g} ${h.confidence}${p}  ${t}\n`;
   }
   return msg;
 }
 
-function fmtStats(history) {
-  const trades   = history.filter(h => h.direction==='BUY'||h.direction==='SELL');
-  const resolved = trades.filter(h => h.result==='WIN'||h.result==='LOSS');
-  const wins     = resolved.filter(h => h.result==='WIN').length;
-  const losses   = resolved.filter(h => h.result==='LOSS').length;
-  const total    = resolved.length;
-  const wr       = total > 0 ? Math.round(wins/total*100) : 0;
-  const pending  = trades.filter(h => !h.result||h.result==='SKIP').length;
+function fmtStats(hist) {
+  const trades   = hist.filter(h=>h.direction==='BUY'||h.direction==='SELL');
+  const resolved = trades.filter(h=>h.result==='WIN'||h.result==='LOSS');
+  const wins     = resolved.filter(h=>h.result==='WIN').length;
+  const losses   = resolved.filter(h=>h.result==='LOSS').length;
+  const wr       = resolved.length>0 ? Math.round(wins/resolved.length*100) : 0;
+  const pending  = trades.filter(h=>!h.result).length;
+  let streak=0, sT='';
+  for (const h of resolved) { if(!sT){sT=h.result;streak=1;}else if(h.result===sT)streak++;else break; }
 
-  // Streak
-  let streak = 0, sType = '';
+  const pm={}, gm={};
   for (const h of resolved) {
-    if (!sType) { sType=h.result; streak=1; }
-    else if (h.result===sType) streak++;
-    else break;
-  }
-
-  // Per pair
-  const pm = {};
-  for (const h of resolved) {
-    if (!pm[h.pair]) pm[h.pair]={w:0,l:0};
-    h.result==='WIN' ? pm[h.pair].w++ : pm[h.pair].l++;
-  }
-
-  // Per grade
-  const gm = {};
-  for (const h of resolved) {
-    const g = (h.grade||'Unknown').split(' ')[0];
-    if (!gm[g]) gm[g]={w:0,l:0};
-    h.result==='WIN' ? gm[g].w++ : gm[g].l++;
+    if(!pm[h.pair])pm[h.pair]={w:0,l:0}; h.result==='WIN'?pm[h.pair].w++:pm[h.pair].l++;
+    const g=(h.grade||'?').split(' ')[0];
+    if(!gm[g])gm[g]={w:0,l:0}; h.result==='WIN'?gm[g].w++:gm[g].l++;
   }
 
   let msg = `🏆 Win/Loss Stats\n━━━━━━━━━━━━━━\n`;
-  msg += `✅ Wins:     ${wins}\n`;
-  msg += `❌ Losses:   ${losses}\n`;
-  msg += `📊 Win Rate: ${wr}% (${total} trades)\n`;
+  msg += `✅ Wins:     ${wins}\n❌ Losses:   ${losses}\n`;
+  msg += `📊 Win Rate: ${wr}% (${resolved.length} trades)\n`;
   msg += `⏳ Pending:  ${pending}`;
-  if (streak >= 2) msg += `\n🔥 Streak: ${streak} ${sType}s`;
-
-  if (Object.keys(gm).length > 0) {
-    msg += `\n\nGrade Breakdown:\n`;
-    for (const [g, s] of Object.entries(gm)) {
-      const t = s.w+s.l;
-      msg += `  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)\n`;
-    }
+  if (streak>=2) msg += `\n🔥 Streak: ${streak} ${sT}s`;
+  if (Object.keys(gm).length) {
+    msg += `\n\nGrade:\n`;
+    for (const [g,s] of Object.entries(gm)) { const t=s.w+s.l; msg+=`  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)\n`; }
   }
-
-  if (Object.keys(pm).length > 0) {
+  if (Object.keys(pm).length) {
     msg += `\nTop Pairs:\n`;
     Object.entries(pm).sort((a,b)=>(b[1].w+b[1].l)-(a[1].w+a[1].l)).slice(0,5)
-      .forEach(([p,s]) => {
-        const t=s.w+s.l;
-        msg += `  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)\n`;
-      });
+      .forEach(([p,s])=>{ const t=s.w+s.l; msg+=`  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)\n`; });
   }
   return msg;
 }
 
-// ─── UPDATE HANDLER ───────────────────────────────────────────────────────────
+// ─── DISPATCH ─────────────────────────────────────────────────────────────────
 
-async function handleUpdate(update, env) {
+async function dispatch(upd, env) {
   try {
-    if (update.message)             await handleMessage(update.message, env);
-    else if (update.callback_query) await handleCb(update.callback_query, env);
-  } catch (e) { console.error('handleUpdate:', e.message); }
+    if (upd.message)             await onMessage(upd.message, env);
+    else if (upd.callback_query) await onCb(upd.callback_query, env);
+  } catch(e) { console.error('dispatch:', e.message); }
 }
 
-async function handleMessage(msg, env) {
-  const chatId = msg.chat.id;
-  const text   = (msg.text||'').trim();
-  const user   = await getUser(chatId, env);
+// ─── MESSAGE HANDLER ──────────────────────────────────────────────────────────
 
-  if (text.startsWith('/start')) {
-    return send(chatId,
-      `👋 FTT Signal Bot v3.0\n\nSignals + Watchlist + Auto W/L Tracking + Grade Filter + Daily Summary\n\nPair: EUR/USD  5min  Auto OFF`,
-      env, { reply_markup: mainKb(user) });
-  }
-  if (text.startsWith('/signal'))    return doSignal(chatId, env);
-  if (text.startsWith('/scan'))      return doScanAll(chatId, env);
-  if (text.startsWith('/auto'))      return doToggle(chatId, env);
-  if (text.startsWith('/status'))    return doStatus(chatId, env);
-  if (text.startsWith('/history'))   return doHistory(chatId, env, null, 0);
-  if (text.startsWith('/stats'))     return doStats(chatId, env);
-  if (text.startsWith('/watchlist')) return doWatchlist(chatId, env);
+async function onMessage(msg, env) {
+  const cid  = msg.chat.id;
+  const text = (msg.text||'').trim();
+  const u    = await getUser(cid, env);
+  const R    = (t, kb) => sendMsg(cid, t, env, { reply_markup: kb });
 
+  if (text.startsWith('/start'))    return R(`👋 FTT Signal Bot v3.1\n\nSignals + Auto W/L Tracking\n\nPair: ${disp(u.pair)}  ${u.interval}min  Auto ${u.autoEnabled?'ON':'OFF'}`, mainKb(u));
+  if (text.startsWith('/signal'))   return doSignal(cid, null, env);
+  if (text.startsWith('/scan'))     return doScanAll(cid, null, env);
+  if (text.startsWith('/auto'))     return doToggle(cid, null, env);
+  if (text.startsWith('/status'))   return doStatus(cid, null, env);
+  if (text.startsWith('/history'))  return doHist(cid, null, 0, env);
+  if (text.startsWith('/stats'))    return doStats(cid, null, env);
+  if (text.startsWith('/watchlist'))return doWatchlist(cid, null, env);
+  if (text.startsWith('/today'))    return doToday(cid, null, env);
+  if (text.startsWith('/summary'))  return doSummary(cid, null, env);
   if (text.startsWith('/pair ')) {
-    const raw = text.slice(6).trim().toUpperCase().replace(/[\s/]/g,'');
-    user.pair = raw; await saveUser(chatId, user, env);
-    return send(chatId, `✅ Pair → ${disp(raw)}`, env, { reply_markup: mainKb(user) });
+    const raw=text.slice(6).trim().toUpperCase().replace(/[\s/]/g,'');
+    u.pair=raw; await saveUser(cid,u,env);
+    return R(`✅ Pair set to ${disp(raw)}`, mainKb(u));
   }
   if (text.startsWith('/interval ')) {
-    const m = parseInt(text.slice(10).trim(), 10);
-    if (VALID_INTERVALS.includes(m)) {
-      user.interval = m; await saveUser(chatId, user, env);
-      return send(chatId, `✅ Interval → ${m} min`, env, { reply_markup: mainKb(user) });
-    }
-    return send(chatId, `❌ Valid: 1, 5, 15`, env);
+    const m=parseInt(text.slice(10).trim(),10);
+    if ([1,5,15].includes(m)) { u.interval=m; await saveUser(cid,u,env); return R(`✅ Interval: ${m}min`, mainKb(u)); }
+    return R('❌ Use: 1, 5, or 15', mainKb(u));
   }
-  if (text.startsWith('/today'))   return doToday(chatId, env);
-  if (text.startsWith('/summary')) return doManualSummary(chatId, env);
-  if (text.startsWith('/help')) {
-    return send(chatId,
-      `FTT Signal Bot v3.0\n\n/signal — Signal for default pair\n/scan — Scan all pairs now\n/auto — Toggle auto scan\n/watchlist — Manage pairs\n/history — Signal history\n/stats — Win/Loss stats\n/status — Settings\n/pair EURUSD — Set pair\n/interval 5 — Set interval`,
-      env, { reply_markup: mainKb(user) });
-  }
-  return send(chatId, `Use the buttons below 👇`, env, { reply_markup: mainKb(user) });
+  if (text.startsWith('/help'))
+    return R(`FTT Signal Bot v3.1\n\n/signal /scan /auto /watchlist\n/history /stats /today /summary\n/status /pair EURUSD /interval 5`, mainKb(u));
+  return R('Use the buttons below 👇', mainKb(u));
 }
 
-async function handleCb(cb, env) {
-  const chatId = cb.message.chat.id;
-  const msgId  = cb.message.message_id;
-  const data   = cb.data;
+// ─── CALLBACK HANDLER ─────────────────────────────────────────────────────────
 
-  // MUST answer within 10s — do this FIRST before any KV calls
-  await answerCb(cb.id, '', env);
+async function onCb(cb, env) {
+  const cid  = cb.message.chat.id;
+  const mid  = cb.message.message_id;
+  const data = cb.data;
 
-  const user = await getUser(chatId, env);
+  // Answer FIRST — before any KV calls
+  await answerCb(cb.id, env, '');
 
+  const u = await getUser(cid, env);
+  const R = (text, kboard) => reply(cid, mid, text, env, kboard);
+
+  // ── Main menu ──
   if (data === 'cmd:main') {
-    const h    = await getHistory(chatId, env);
-    const res  = h.filter(x => x.result==='WIN'||x.result==='LOSS');
-    const wr   = res.length > 0 ? Math.round(res.filter(x=>x.result==='WIN').length/res.length*100) : 0;
-    const cnt  = (await kvGet(`cnt:${chatId}`, env)) || 0;
-    return edit(chatId, msgId,
-      `FTT Signal Bot v3.0\n\n${disp(user.pair)}  ${user.interval}min  ${user.autoEnabled?'Auto ON':'Auto OFF'}\nWatchlist: ${user.watchlist.length} pairs  |  Grade: ${user.gradeFilter||'ALL'}\n\nTotal Signals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`,
-      env, { reply_markup: mainKb(user) });
+    const h   = await getHist(cid, env);
+    const res = h.filter(x=>x.result==='WIN'||x.result==='LOSS');
+    const wr  = res.length>0?Math.round(res.filter(x=>x.result==='WIN').length/res.length*100):0;
+    const cnt = await getCounter(cid, env);
+    return R(`FTT Signal Bot v3.1\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled?'Auto ON':'Auto OFF'}\nWatchlist: ${u.watchlist.length} pairs  Grade: ${u.gradeFilter||'ALL'}\n\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`, mainKb(u));
   }
 
-  if (data === 'cmd:signal')       return doSignal(chatId, env, msgId);
-  if (data === 'cmd:toggle_auto')  return doToggle(chatId, env, msgId);
-  if (data === 'cmd:status')       return doStatus(chatId, env, msgId);
-  if (data === 'cmd:stats')        return doStats(chatId, env, msgId);
-  if (data === 'cmd:watchlist')    return doWatchlist(chatId, env, msgId);
-  if (data === 'cmd:scanall')      return doScanAll(chatId, env, msgId);
-  if (data === 'cmd:settings')     return doSettings(chatId, env, msgId);
-  if (data === 'cmd:gradefilter') {
-    return edit(chatId, msgId, `🎯 Grade Filter\n\nOnly send signals above selected grade:`, env, { reply_markup: gradeFilterKb() });
-  }
+  // ── Actions ──
+  if (data === 'cmd:signal')      return doSignal(cid, mid, env);
+  if (data === 'cmd:toggle_auto') return doToggle(cid, mid, env);
+  if (data === 'cmd:scanall')     return doScanAll(cid, mid, env);
+  if (data === 'cmd:status')      return doStatus(cid, mid, env);
+  if (data === 'cmd:stats')       return doStats(cid, mid, env);
+  if (data === 'cmd:watchlist')   return doWatchlist(cid, mid, env);
+  if (data === 'cmd:today')       return doToday(cid, mid, env);
+  if (data === 'cmd:summary')     return doSummary(cid, mid, env);
+  if (data === 'cmd:settings')    return doSettings(cid, mid, env);
+
+  if (data.startsWith('cmd:history:')) return doHist(cid, mid, parseInt(data.split(':')[2])||0, env);
+
+  // ── Settings ──
+  if (data === 'cmd:intervals')      return R('⏱ Select Interval:', intervalKb());
+  if (data === 'cmd:gradefilter')    return R('🎯 Grade Filter:', gradeKb());
+  if (data === 'cmd:conffilter')     return R('📊 Min Confidence:', confKb());
+  if (data === 'cmd:summarytime')    return R('🕐 Daily Summary Time (UTC):', summTimeKb());
   if (data === 'cmd:togglesummary') {
-    user.dailySummary = !user.dailySummary;
-    await saveUser(chatId, user, env);
-    if (user.dailySummary) await addSummaryUser(chatId, env);
-    else                   await removeSummaryUser(chatId, env);
-    return doSettings(chatId, env, msgId);
-  }
-  if (data.startsWith('sumhour:')) {
-    user.summaryHour = parseInt(data.split(':')[1], 10);
-    await saveUser(chatId, user, env);
-    return doSettings(chatId, env, msgId);
-  }
-  if (data === 'cmd:summarytime') {
-    return edit(chatId, msgId, `🕐 Select Daily Summary Time (UTC):`, env, { reply_markup: summaryTimeKb() });
-  }
-  if (data === 'cmd:conffilter') {
-    return edit(chatId, msgId, `📊 Minimum Confidence Filter:
-
-Only send signals at or above this confidence level.`, env, { reply_markup: confFilterKb() });
-  }
-  if (data.startsWith('cf:')) {
-    user.minConfidence = parseInt(data.split(':')[1], 10);
-    await saveUser(chatId, user, env);
-    return doSettings(chatId, env, msgId);
-  }
-  if (data === 'cmd:today') return doToday(chatId, env, msgId);
-  if (data === 'cmd:summary') return doManualSummary(chatId, env, msgId);
-  if (data === 'cmd:intervals') {
-    return edit(chatId, msgId, `⏱ Select Interval:`, env, { reply_markup: intervalKb() });
-  }
-  if (data.startsWith('cmd:history:')) {
-    const page = parseInt(data.split(':')[2], 10) || 0;
-    return doHistory(chatId, env, msgId, page);
-  }
-
-  if (data.startsWith('pairpage:')) {
-    const page = parseInt(data.split(':')[1], 10);
-    return edit(chatId, msgId, `💱 Select default pair:`, env, { reply_markup: pairsKb(page) });
-  }
-  if (data.startsWith('pair:')) {
-    user.pair = norm(data.slice(5)); await saveUser(chatId, user, env);
-    return doSettings(chatId, env, msgId);
+    u.dailySummary = !u.dailySummary;
+    await saveUser(cid, u, env);
+    if (u.dailySummary) await addSummaryUser(cid, env);
+    else                await removeSummaryUser(cid, env);
+    return doSettings(cid, mid, env);
   }
   if (data.startsWith('interval:')) {
-    user.interval = parseInt(data.split(':')[1], 10);
-    await saveUser(chatId, user, env);
-    return doSettings(chatId, env, msgId);
+    u.interval = parseInt(data.split(':')[1], 10);
+    await saveUser(cid, u, env);
+    return doSettings(cid, mid, env);
+  }
+  if (data.startsWith('sumhour:')) {
+    u.summaryHour = parseInt(data.split(':')[1], 10);
+    await saveUser(cid, u, env);
+    return doSettings(cid, mid, env);
   }
   if (data.startsWith('gf:')) {
-    user.gradeFilter = data.slice(3); await saveUser(chatId, user, env);
-    return doSettings(chatId, env, msgId);
+    u.gradeFilter = data.slice(3);
+    await saveUser(cid, u, env);
+    return doSettings(cid, mid, env);
   }
+  if (data.startsWith('cf:')) {
+    u.minConfidence = parseInt(data.split(':')[1], 10);
+    await saveUser(cid, u, env);
+    return doSettings(cid, mid, env);
+  }
+
+  // ── Pair selection ──
+  if (data.startsWith('pairpage:')) {
+    const page = parseInt(data.split(':')[1], 10);
+    return R('💱 Select default pair:', pairsKb(page));
+  }
+  if (data.startsWith('pair:')) {
+    u.pair = norm(data.slice(5));
+    await saveUser(cid, u, env);
+    return doSettings(cid, mid, env);
+  }
+
+  // ── Watchlist ──
   if (data.startsWith('wlpage:')) {
     const page = parseInt(data.split(':')[1], 10);
-    return edit(chatId, msgId, `👁 Add to Watchlist (${user.watchlist.length}/${MAX_WATCHLIST}):`, env,
-      { reply_markup: wlAddKb(page, user.watchlist) });
+    return R(`👁 Add to Watchlist (${u.watchlist.length}/${MAX_WL}):`, wlAddKb(page, u.watchlist));
   }
-  // Watchlist remove (from main watchlist view)
   if (data.startsWith('wl:rm:')) {
     const pair = data.slice(6);
-    user.watchlist = user.watchlist.filter(p => p !== pair);
-    await saveUser(chatId, user, env);
-    return doWatchlist(chatId, env, msgId);
+    u.watchlist = u.watchlist.filter(p => p !== pair);
+    await saveUser(cid, u, env);
+    return doWatchlist(cid, mid, env);
   }
-  // Watchlist add/remove from add-page (page-aware)
   if (data.startsWith('wl:addpage:')) {
-    const parts = data.split(':');
-    const pair = parts[2], page = parseInt(parts[3]||'0', 10);
-    if (!user.watchlist.includes(pair) && user.watchlist.length < MAX_WATCHLIST) {
-      user.watchlist = [...user.watchlist, pair];
-      await saveUser(chatId, user, env);
+    const [,,pair,pg] = data.split(':');
+    const page = parseInt(pg||'0', 10);
+    if (!u.watchlist.includes(pair) && u.watchlist.length < MAX_WL) {
+      u.watchlist = [...u.watchlist, pair];
+      await saveUser(cid, u, env);
     }
-    return edit(chatId, msgId,
-      `👁 Add to Watchlist (${user.watchlist.length}/${MAX_WATCHLIST}):`,
-      env, { reply_markup: wlAddKb(page, user.watchlist) });
+    return R(`👁 Add to Watchlist (${u.watchlist.length}/${MAX_WL}):`, wlAddKb(page, u.watchlist));
   }
   if (data.startsWith('wl:rmpage:')) {
-    const parts = data.split(':');
-    const pair = parts[2], page = parseInt(parts[3]||'0', 10);
-    user.watchlist = user.watchlist.filter(p => p !== pair);
-    await saveUser(chatId, user, env);
-    return edit(chatId, msgId,
-      `👁 Add to Watchlist (${user.watchlist.length}/${MAX_WATCHLIST}):`,
-      env, { reply_markup: wlAddKb(page, user.watchlist) });
+    const [,,pair,pg] = data.split(':');
+    const page = parseInt(pg||'0', 10);
+    u.watchlist = u.watchlist.filter(p => p !== pair);
+    await saveUser(cid, u, env);
+    return R(`👁 Add to Watchlist (${u.watchlist.length}/${MAX_WL}):`, wlAddKb(page, u.watchlist));
   }
-  // Quick signal for watchlist pair
-  if (data.startsWith('qs:')) {
-    const pair = data.slice(3);
-    return doQuickSignal(chatId, pair, env, msgId);
-  }
+
+  // ── Quick signal ──
+  if (data.startsWith('qs:')) return doQuickSignal(cid, mid, data.slice(3), env);
 }
 
-// ─── ACTIONS ──────────────────────────────────────────────────────────────────
+// ─── ACTION FUNCTIONS ─────────────────────────────────────────────────────────
 
-async function doSignal(chatId, env, msgId = null) {
-  const user = await getUser(chatId, env);
-  if (msgId) await edit(chatId, msgId, `⏳ Fetching ${disp(user.pair)}...`, env);
-  else       await send(chatId, `⏳ Fetching ${disp(user.pair)}...`, env);
+async function doSignal(cid, mid, env) {
+  const u = await getUser(cid, env);
+  await reply(cid, mid, `⏳ Fetching ${disp(u.pair)}...`, env, null);
   try {
-    const data = await fetchSignal(user.pair, env);
+    const data = await fetchSig(u.pair, env);
     const sig  = data.signal;
     const dir  = sig?.finalSignal;
-    let signalNo = null;
-    if (dir==='BUY'||dir==='SELL') signalNo = await logAndSchedule(chatId, user.pair, sig, env);
-    const text = fmtSignal(data, user.pair, user.interval, signalNo);
-    const kb   = afterKb();
-    if (msgId) await edit(chatId, msgId, text, env, { reply_markup: kb });
-    else       await send(chatId, text, env, { reply_markup: kb });
-  } catch (e) {
-    const err = `❌ Signal fetch failed\n${e.message.slice(0,200)}`;
-    if (msgId) await edit(chatId, msgId, err, env, { reply_markup: mainKb(user) });
-    else       await send(chatId, err, env, { reply_markup: mainKb(user) });
+    let no = null;
+    if (dir==='BUY'||dir==='SELL') no = await logAndSchedule(cid, u.pair, sig, env);
+    await sendMsg(cid, fmtSignal(data, u.pair, u.interval, no), env, { reply_markup: afterKb() });
+  } catch(e) {
+    await sendMsg(cid, `❌ Signal fetch failed\n${e.message.slice(0,200)}`, env, { reply_markup: mainKb(u) });
   }
 }
 
-async function doQuickSignal(chatId, pair, env, msgId = null) {
-  const user = await getUser(chatId, env);
-  if (msgId) await edit(chatId, msgId, `⏳ Fetching ${disp(pair)}...`, env);
-  else       await send(chatId, `⏳ Fetching ${disp(pair)}...`, env);
+async function doQuickSignal(cid, mid, pair, env) {
+  const u = await getUser(cid, env);
+  await reply(cid, mid, `⏳ Fetching ${disp(pair)}...`, env, null);
   try {
-    const data = await fetchSignal(pair, env);
+    const data = await fetchSig(pair, env);
     const sig  = data.signal;
     const dir  = sig?.finalSignal;
-    let signalNo = null;
-    if (dir==='BUY'||dir==='SELL') signalNo = await logAndSchedule(chatId, pair, sig, env);
-    const text = fmtSignal(data, pair, user.interval, signalNo);
-    if (msgId) await edit(chatId, msgId, text, env, { reply_markup: afterKb() });
-    else       await send(chatId, text, env, { reply_markup: afterKb() });
-  } catch (e) {
-    const err = `❌ Failed: ${e.message.slice(0,150)}`;
-    if (msgId) await edit(chatId, msgId, err, env, { reply_markup: mainKb(user) });
-    else       await send(chatId, err, env, { reply_markup: mainKb(user) });
+    let no = null;
+    if (dir==='BUY'||dir==='SELL') no = await logAndSchedule(cid, pair, sig, env);
+    await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: afterKb() });
+  } catch(e) {
+    await sendMsg(cid, `❌ Failed: ${e.message.slice(0,150)}`, env, { reply_markup: mainKb(u) });
   }
 }
 
-async function doScanAll(chatId, env, msgId = null) {
-  const user     = await getUser(chatId, env);
-  const scanList = [user.pair, ...user.watchlist].filter((p,i,a)=>a.indexOf(p)===i);
-  if (msgId) await edit(chatId, msgId, `🔍 Scanning ${scanList.length} pairs...`, env);
-  else       await send(chatId, `🔍 Scanning ${scanList.length} pairs...`, env);
-
+async function doScanAll(cid, mid, env) {
+  const u    = await getUser(cid, env);
+  const list = [u.pair, ...u.watchlist].filter((p,i,a)=>a.indexOf(p)===i);
+  await reply(cid, mid, `🔍 Scanning ${list.length} pairs...`, env, null);
   let found = 0;
-  for (const pair of scanList) {
+  for (const pair of list) {
     try {
-      const data = await fetchSignal(pair, env);
+      const data = await fetchSig(pair, env);
       const sig  = data.signal;
       const dir  = sig?.finalSignal;
-      if (dir==='BUY'||dir==='SELL') {
-        if (!passesGradeFilter(sig, user.gradeFilter||'ALL')) continue;
-        const signalNo = await logAndSchedule(chatId, pair, sig, env);
-        await send(chatId, fmtSignal(data, pair, user.interval, signalNo), env, { reply_markup: afterKb() });
+      if ((dir==='BUY'||dir==='SELL') && passGrade(sig, u.gradeFilter) && passConf(sig, u.minConfidence)) {
+        const no = await logAndSchedule(cid, pair, sig, env);
+        await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: afterKb() });
         found++;
       }
-    } catch (e) { console.error(`scanAll ${pair}:`, e.message); }
+    } catch(e) { console.error(`scan ${pair}:`, e.message); }
   }
-
-  const summary = found > 0
-    ? `✅ Scan complete — ${found} signal(s) found across ${scanList.length} pairs`
-    : `⚪ Scan complete — No actionable signals across ${scanList.length} pairs`;
-  await send(chatId, summary, env, { reply_markup: mainKb(user) });
+  await sendMsg(cid, found>0 ? `✅ ${found} signal(s) found across ${list.length} pairs` : `⚪ No signals across ${list.length} pairs`, env, { reply_markup: mainKb(u) });
 }
 
-async function doToggle(chatId, env, msgId = null) {
-  const user       = await getUser(chatId, env);
-  user.autoEnabled = !user.autoEnabled;
-  user.noTradeStreak = 0;
-  await saveUser(chatId, user, env);
-  if (user.autoEnabled) await addAutoUser(chatId, env);
-  else                  await removeAutoUser(chatId, env);
-
-  const wl  = user.watchlist.map(disp).join(', ');
-  const txt = user.autoEnabled
-    ? `🔄 Auto Scan ON\n\n${disp(user.pair)}${wl?'\nWatchlist: '+wl:''}\nInterval: ${user.interval} min  Grade: ${user.gradeFilter||'ALL'}\n\nSignals logged + results auto-tracked.`
+async function doToggle(cid, mid, env) {
+  const u = await getUser(cid, env);
+  u.autoEnabled = !u.autoEnabled;
+  u.noTradeStreak = 0;
+  await saveUser(cid, u, env);
+  if (u.autoEnabled) await addAutoUser(cid, env);
+  else               await removeAutoUser(cid, env);
+  const wl = u.watchlist.map(disp).join(', ');
+  const t  = u.autoEnabled
+    ? `🔄 Auto Scan ON\n\n${disp(u.pair)}${wl?'\nWatchlist: '+wl:''}\nInterval: ${u.interval}min  Grade: ${u.gradeFilter||'ALL'}`
     : `🔕 Auto Scan OFF`;
-  if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: mainKb(user) });
-  else       await send(chatId, txt, env, { reply_markup: mainKb(user) });
+  return reply(cid, mid, t, env, mainKb(u));
 }
 
-async function doSettings(chatId, env, msgId = null) {
-  const user = await getUser(chatId, env);
-  const txt  = `⚙️ Settings\n\nPair: ${disp(user.pair)}\nInterval: ${user.interval} min\nGrade Filter: ${user.gradeFilter||'ALL'}\nDaily Summary: ${user.dailySummary?`ON (${user.summaryHour}:00 UTC)`:'OFF'}`;
-  if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: settingsKb(user) });
-  else       await send(chatId, txt, env, { reply_markup: settingsKb(user) });
+async function doSettings(cid, mid, env) {
+  const u = await getUser(cid, env);
+  const t = `⚙️ Settings\n\nPair: ${disp(u.pair)}\nInterval: ${u.interval}min\nGrade: ${u.gradeFilter||'ALL'}\nMin Conf: ${u.minConfidence||0}%\nDaily Summary: ${u.dailySummary?`ON (${u.summaryHour??20}:00 UTC)`:'OFF'}`;
+  return reply(cid, mid, t, env, settingsKb(u));
 }
 
-async function doStatus(chatId, env, msgId = null) {
-  const user = await getUser(chatId, env);
-  const cnt  = (await kvGet(`cnt:${chatId}`, env)) || 0;
-  const txt  = `📋 Status\n\nPair: ${disp(user.pair)}\nWatchlist: ${user.watchlist.map(disp).join(', ')||'None'}\nInterval: ${user.interval} min\nAuto: ${user.autoEnabled?'ON':'OFF'}\nGrade Filter: ${user.gradeFilter||'ALL'}\nDaily Summary: ${user.dailySummary?'ON':'OFF'}\nTotal Signals: ${cnt}`;
-  const kb   = { inline_keyboard: [[
-    { text: '⚙️ Settings',  callback_data: 'cmd:settings'  },
-    { text: '🔙 Back',      callback_data: 'cmd:main'       },
-  ]]};
-  if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: kb });
-  else       await send(chatId, txt, env, { reply_markup: kb });
+async function doStatus(cid, mid, env) {
+  const u   = await getUser(cid, env);
+  const cnt = await getCounter(cid, env);
+  const t   = `📋 Status\n\nPair: ${disp(u.pair)}\nWatchlist: ${u.watchlist.map(disp).join(', ')||'None'}\nInterval: ${u.interval}min\nAuto: ${u.autoEnabled?'ON':'OFF'}\nGrade: ${u.gradeFilter||'ALL'}\nMin Conf: ${u.minConfidence||0}%\nSummary: ${u.dailySummary?'ON':'OFF'}\nTotal Signals: ${cnt}`;
+  return reply(cid, mid, t, env, kb([[btn('⚙️ Settings','cmd:settings'), btn('🔙 Back','cmd:main')]]));
 }
 
-async function doHistory(chatId, env, msgId = null, page = 0) {
-  const h   = await getHistory(chatId, env);
-  const txt = fmtHistory(h, page);
-  const kb  = historyNavKb(page, h.length);
-  if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: kb });
-  else       await send(chatId, txt, env, { reply_markup: kb });
+async function doHist(cid, mid, page, env) {
+  const h = await getHist(cid, env);
+  return reply(cid, mid, fmtHist(h, page), env, histNavKb(page, h.length));
 }
 
-async function doStats(chatId, env, msgId = null) {
-  const h   = await getHistory(chatId, env);
-  const txt = fmtStats(h);
-  const kb  = { inline_keyboard: [[
-    { text: '📈 History', callback_data: 'cmd:history:0' },
-    { text: '🔙 Back',    callback_data: 'cmd:main'       },
-  ]]};
-  if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: kb });
-  else       await send(chatId, txt, env, { reply_markup: kb });
+async function doStats(cid, mid, env) {
+  const h = await getHist(cid, env);
+  return reply(cid, mid, fmtStats(h), env, kb([[btn('📈 History','cmd:history:0'), btn('🔙 Back','cmd:main')]]));
 }
 
-async function doWatchlist(chatId, env, msgId = null) {
-  const user = await getUser(chatId, env);
-  const wl   = user.watchlist;
-  const txt  = `👁 Watchlist (${wl.length}/${MAX_WATCHLIST})\n\n${wl.length>0?wl.map(disp).join(', '):'Empty'}\n\nTap pair name to get quick signal.\nTap ❌ pair to remove.`;
-  if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: wlKb(wl) });
-  else       await send(chatId, txt, env, { reply_markup: wlKb(wl) });
+async function doWatchlist(cid, mid, env) {
+  const u  = await getUser(cid, env);
+  const wl = u.watchlist;
+  const t  = `👁 Watchlist (${wl.length}/${MAX_WL})\n\n${wl.length?wl.map(disp).join(', '):'Empty'}\n\n📊 = Quick signal  ❌ = Remove`;
+  return reply(cid, mid, t, env, wlKb(wl));
 }
 
-// ─── TODAY & MANUAL SUMMARY ──────────────────────────────────────────────────
-
-async function doToday(chatId, env, msgId = null) {
-  const history = await getHistory(chatId, env);
-  const today   = new Date().toISOString().slice(0, 10);
-  const todayH  = history.filter(h => h.timestamp?.startsWith(today));
-  if (!todayH.length) {
-    const txt = `📅 Today (${today})
-
-No signals yet today.`;
-    if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: mainKb(await getUser(chatId, env)) });
-    else       await send(chatId, txt, env, { reply_markup: mainKb(await getUser(chatId, env)) });
-    return;
+async function doToday(cid, mid, env) {
+  const h     = await getHist(cid, env);
+  const today = new Date().toISOString().slice(0,10);
+  const th    = h.filter(x => x.timestamp?.startsWith(today));
+  if (!th.length) return reply(cid, mid, `📅 Today (${today})\n\nNo signals yet.`, env, kb([[btn('🔙 Back','cmd:main')]]));
+  const res   = th.filter(x=>x.result==='WIN'||x.result==='LOSS');
+  const wins  = res.filter(x=>x.result==='WIN').length;
+  const wr    = res.length>0?Math.round(wins/res.length*100):0;
+  let t = `📅 Today — ${today}\n━━━━━━━━━━━━━━\n`;
+  t += `📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length-wins}L\n📈 Win Rate: ${wr}%\n\n`;
+  for (const x of th.slice(0,8)) {
+    const dE=x.direction==='BUY'?'🟢':'🔴', rE=x.result==='WIN'?'✅':x.result==='LOSS'?'❌':'⏳';
+    const g=x.grade?` ${x.grade.split(' ')[0]}`:'';
+    t += `${rE} #${x.no} ${dE} ${disp(x.pair)}${g} ${x.confidence}\n`;
   }
-  const resolved = todayH.filter(h => h.result==='WIN'||h.result==='LOSS');
-  const wins  = resolved.filter(h => h.result==='WIN').length;
-  const losses= resolved.filter(h => h.result==='LOSS').length;
-  const wr    = resolved.length > 0 ? Math.round(wins/resolved.length*100) : 0;
-  const pending = todayH.filter(h => !h.result || h.result==='SKIP').length;
-
-  let txt = `📅 Today — ${today}
-━━━━━━━━━━━━━━
-`;
-  txt += `📊 Signals: ${todayH.length}
-`;
-  txt += `✅ ${wins}W  ❌ ${losses}L  ⏳ ${pending} pending
-`;
-  txt += `📈 Win Rate: ${wr}%
-
-Recent:
-`;
-  for (const h of todayH.slice(0, 8)) {
-    const dE = h.direction==='BUY'?'🟢':'🔴';
-    const rE = h.result==='WIN'?'✅':h.result==='LOSS'?'❌':'⏳';
-    const g  = h.grade ? ` ${h.grade.split(' ')[0]}` : '';
-    txt += `${rE} #${h.no} ${dE} ${disp(h.pair)}${g} ${h.confidence}
-`;
-  }
-  const kb = { inline_keyboard: [[
-    { text: '📈 Full History', callback_data: 'cmd:history:0' },
-    { text: '🔙 Menu',         callback_data: 'cmd:main'       },
-  ]]};
-  if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: kb });
-  else       await send(chatId, txt, env, { reply_markup: kb });
+  return reply(cid, mid, t, env, kb([[btn('📈 History','cmd:history:0'), btn('🔙 Back','cmd:main')]]));
 }
 
-async function doManualSummary(chatId, env, msgId = null) {
-  const user    = await getUser(chatId, env);
-  const history = await getHistory(chatId, env);
-  const today   = new Date().toISOString().slice(0, 10);
-  const todayH  = history.filter(h => h.timestamp?.startsWith(today));
-  if (!todayH.length) {
-    const t = `No signals today yet.`;
-    if (msgId) await edit(chatId, msgId, t, env, { reply_markup: mainKb(user) });
-    else       await send(chatId, t, env, { reply_markup: mainKb(user) });
-    return;
-  }
-  const resolved = todayH.filter(h => h.result==='WIN'||h.result==='LOSS');
-  const wins  = resolved.filter(h => h.result==='WIN').length;
-  const losses= resolved.filter(h => h.result==='LOSS').length;
-  const wr    = resolved.length > 0 ? Math.round(wins/resolved.length*100) : 0;
-
-  const gm = {};
-  for (const h of resolved) {
-    const g = (h.grade||'?').split(' ')[0];
-    if (!gm[g]) gm[g]={w:0,l:0};
-    h.result==='WIN'?gm[g].w++:gm[g].l++;
-  }
-
-  const allResolved = history.filter(h => h.result==='WIN'||h.result==='LOSS');
-  const allWins     = allResolved.filter(h => h.result==='WIN').length;
-  const allWR       = allResolved.length > 0 ? Math.round(allWins/allResolved.length*100) : 0;
-  const trend = wr > allWR ? '📈 Above average' : wr < allWR ? '📉 Below average' : '➡️ On average';
-
-  let txt = `📅 Daily Summary — ${today}
-━━━━━━━━━━━━━━
-`;
-  txt += `📊 Signals: ${todayH.length}  Resolved: ${resolved.length}
-`;
-  txt += `✅ Wins: ${wins}  ❌ Losses: ${losses}
-`;
-  txt += `📈 Win Rate: ${wr}%
-`;
-  if (Object.keys(gm).length > 0) {
-    txt += `
-Grades:
-`;
-    for (const [g,s] of Object.entries(gm)) {
-      const t=s.w+s.l;
-      txt += `  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)
-`;
-    }
-  }
-  txt += `
-${trend} (all-time: ${allWR}%)`;
-
-  const kb = { inline_keyboard: [[
-    { text: '📈 History', callback_data: 'cmd:history:0' },
-    { text: '🏆 Stats',   callback_data: 'cmd:stats'     },
-  ]]};
-  if (msgId) await edit(chatId, msgId, txt, env, { reply_markup: kb });
-  else       await send(chatId, txt, env, { reply_markup: kb });
+async function doSummary(cid, mid, env) {
+  const h     = await getHist(cid, env);
+  const today = new Date().toISOString().slice(0,10);
+  const th    = h.filter(x => x.timestamp?.startsWith(today));
+  if (!th.length) return reply(cid, mid, `No signals today yet.`, env, kb([[btn('🔙 Back','cmd:main')]]));
+  const res   = th.filter(x=>x.result==='WIN'||x.result==='LOSS');
+  const wins  = res.filter(x=>x.result==='WIN').length;
+  const wr    = res.length>0?Math.round(wins/res.length*100):0;
+  const allR  = h.filter(x=>x.result==='WIN'||x.result==='LOSS');
+  const allWR = allR.length>0?Math.round(allR.filter(x=>x.result==='WIN').length/allR.length*100):0;
+  const trend = wr>allWR?'📈 Above avg':wr<allWR?'📉 Below avg':'➡️ On avg';
+  const gm={};
+  for (const x of res) { const g=(x.grade||'?').split(' ')[0]; if(!gm[g])gm[g]={w:0,l:0}; x.result==='WIN'?gm[g].w++:gm[g].l++; }
+  let t = `📅 Daily Summary — ${today}\n━━━━━━━━━━━━━━\n`;
+  t += `📊 ${th.length} signals  Resolved: ${res.length}\n✅ ${wins}W  ❌ ${res.length-wins}L\n📈 Win Rate: ${wr}%\n`;
+  if (Object.keys(gm).length) { t+=`\nGrades:\n`; for(const[g,s]of Object.entries(gm)){const tt=s.w+s.l;t+=`  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w/tt*100)}%)\n`;} }
+  t += `\n${trend} (all-time: ${allWR}%)`;
+  return reply(cid, mid, t, env, kb([[btn('📈 History','cmd:history:0'), btn('🏆 Stats','cmd:stats')]]));
 }
 
-// ─── AUTO SCAN ────────────────────────────────────────────────────────────────
+// ─── SIGNAL FETCH ─────────────────────────────────────────────────────────────
 
-async function runAutoScan(env, log, force = false) {
-  const autoUsers = await getAutoUsers(env);
-  log(`AutoScan: ${autoUsers.length} users`);
+async function fetchSig(pair, env) {
+  const req = new Request(`https://signal/api/signal?pair=${pair}`, { headers: { Accept:'application/json' } });
+  const res = env.SIGNAL_WORKER
+    ? await env.SIGNAL_WORKER.fetch(req)
+    : await fetch(`https://my-worker-601.umuhammadiswa.workers.dev/api/signal?pair=${pair}`,
+        { headers:{Accept:'application/json'}, signal:AbortSignal.timeout(20000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text().catch(()=>'')).slice(0,150)}`);
+  return res.json();
+}
 
-  for (const chatId of autoUsers) {
+async function fetchPrice(pair, env) {
+  try {
+    const d = await fetchSig(pair, env);
+    return d?.signal?.recommendations?.['1min']?.entry?.price
+        || d?.signal?.recommendations?.['5min']?.entry?.price
+        || d?.signal?.recommendations?.['15min']?.entry?.price || null;
+  } catch { return null; }
+}
+
+// ─── CRON ─────────────────────────────────────────────────────────────────────
+
+async function cron(env, logs=[], force=false) {
+  const log = m => { console.log(m); logs.push(String(m)); };
+  log(`Cron ${new Date().toISOString()}`);
+  if (!env?.BOT_TOKEN) { log('ERROR: BOT_TOKEN missing'); return; }
+  if (!env?.BOT_KV)    { log('ERROR: BOT_KV missing');    return; }
+  await autoScan(env, log).catch(e => log('ScanErr: '+e.message));
+  await resultCheck(env, log).catch(e => log('ResultErr: '+e.message));
+  await dailySummary(env, log).catch(e => log('SummaryErr: '+e.message));
+  log('Done');
+}
+
+async function autoScan(env, log) {
+  const users = await getAutoUsers(env);
+  log(`Scan: ${users.length} users`);
+  for (const cid of users) {
     try {
-      const user = await getUser(chatId, env);
-      if (!user.autoEnabled) continue;
-
-      const scanList = [user.pair, ...(user.watchlist||[])].filter((p,i,a)=>a.indexOf(p)===i);
-
-      for (const pair of scanList) {
+      const u = await getUser(cid, env);
+      if (!u.autoEnabled) continue;
+      const list = [u.pair, ...u.watchlist].filter((p,i,a)=>a.indexOf(p)===i);
+      for (const pair of list) {
         try {
-          const data = await fetchSignal(pair, env);
+          const data = await fetchSig(pair, env);
           const sig  = data.signal;
           const dir  = sig?.finalSignal;
-
           if (dir==='BUY'||dir==='SELL') {
-            // Grade + Confidence filter
-            if (!passesGradeFilter(sig, user.gradeFilter||'ALL') || !passesConfFilter(sig, user.minConfidence||0)) {
-              log(`Filtered ${pair} ${dir} grade ${sig.grade?.grade}`);
-              continue;
-            }
-            // Duplicate lock
-            const lock = await getActiveLock(chatId, pair, env);
-            if (lock && lock.direction===dir && lock.expiryAt>Date.now()) {
-              log(`Locked ${pair} ${dir}`);
-              continue;
-            }
-
-            const signalNo = await logAndSchedule(chatId, pair, sig, env);
-            const text     = fmtSignal(data, pair, user.interval, signalNo);
-            await send(chatId, text, env, { reply_markup: afterKb() });
-            log(`Sent #${signalNo} ${pair} ${dir}`);
-            user.noTradeStreak = 0;
-
+            if (!passGrade(sig, u.gradeFilter) || !passConf(sig, u.minConfidence)) { log(`Filtered ${pair}`); continue; }
+            const lock = await getLock(cid, pair, env);
+            if (lock?.direction===dir && lock?.expiryAt>Date.now()) { log(`Locked ${pair}`); continue; }
+            const no   = await logAndSchedule(cid, pair, sig, env);
+            await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: afterKb() });
+            log(`Sent #${no} ${pair} ${dir}`);
+            u.noTradeStreak = 0;
           } else {
-            user.noTradeStreak = (user.noTradeStreak||0) + 1;
-            if (user.noTradeStreak >= 12) {
-              await send(chatId, `⚪ No clear setup for ${user.noTradeStreak} scans across ${scanList.length} pair(s).`, env,
-                { reply_markup: { inline_keyboard: [[{ text: '🔕 Stop Auto', callback_data: 'cmd:toggle_auto' }]]}});
-              user.noTradeStreak = 0;
+            u.noTradeStreak = (u.noTradeStreak||0)+1;
+            if (u.noTradeStreak >= 12) {
+              await sendMsg(cid, `⚪ No setup for ${u.noTradeStreak} scans across ${list.length} pair(s).`, env,
+                { reply_markup: kb([[btn('🔕 Stop Auto','cmd:toggle_auto')]]) });
+              u.noTradeStreak = 0;
             }
           }
-        } catch (e) { log(`ScanPair ${pair} [${chatId}]: ${e.message}`); }
+        } catch(e) { log(`Pair ${pair}: ${e.message}`); }
       }
-
-      await saveUser(chatId, user, env);
-    } catch (e) { log(`ScanUser ${chatId}: ${e.message}`); }
+      await saveUser(cid, u, env);
+    } catch(e) { log(`User ${cid}: ${e.message}`); }
   }
 }
 
-// ─── RESULT CHECK ─────────────────────────────────────────────────────────────
-
-async function runResultCheck(env, log = console.log) {
+async function resultCheck(env, log) {
   const ids = await getPendingIds(env);
   if (!ids.length) return;
-  log(`ResultCheck: ${ids.length} pending`);
-
-  const now = Date.now(), remaining = [];
-
-  for (const tradeId of ids) {
+  log(`Results: ${ids.length} pending`);
+  const now=Date.now(), keep=[];
+  for (const tid of ids) {
     try {
-      const trade = await kvGet(`pt:${tradeId}`, env);
-      if (!trade) continue;
-      if (trade.expiryAt > now) { remaining.push(tradeId); continue; }
-
-      const currentPrice = await fetchCurrentPrice(trade.pair, env);
-      if (currentPrice === null || trade.entryPrice === null) {
-        await setTradeResult(trade.chatId, tradeId, 'SKIP', null, null, env);
-        await clearActiveLock(trade.chatId, trade.pair, env);
-        await send(trade.chatId, `⏭ Tracking No. ${trade.signalNo||tradeId} — could not verify price`, env, { reply_markup: afterKb() });
+      const t = await kget(`pt:${tid}`, env);
+      if (!t) continue;
+      if (t.expiryAt > now) { keep.push(tid); continue; }
+      const cur = await fetchPrice(t.pair, env);
+      if (!cur || !t.entryPrice) {
+        await setResult(t.chatId, tid, 'SKIP', null, null, env);
+        await clearLock(t.chatId, t.pair, env);
+        await sendMsg(t.chatId, `⏭ Tracking No. ${t.signalNo||tid} — price unavailable`, env, { reply_markup: afterKb() });
         continue;
       }
-
-      const entry  = parseFloat(trade.entryPrice);
-      const current = parseFloat(currentPrice);
-      const diff    = current - entry;
-      const result  = trade.direction==='BUY' ? (diff>0?'WIN':'LOSS') : (diff<0?'WIN':'LOSS');
-
-      const crypto = isCrypto(trade.pair);
-      const pips   = crypto ? Math.round(Math.abs(diff)*100)/100 : Math.round(Math.abs(diff)*10000*10)/10;
-      const unit   = crypto ? '$' : ' pips';
-
-      await setTradeResult(trade.chatId, tradeId, result, current, pips, env);
-      await clearActiveLock(trade.chatId, trade.pair, env);
-
-      const lateMin = Math.round((now - trade.expiryAt) / 60000);
-      const lateStr = lateMin > 1 ? ` (+${lateMin}min)` : '';
-      const gradeStr = trade.grade ? `  ${trade.grade}` : '';
-      const dE = trade.direction==='BUY'?'🟢':'🔴';
-      const rE = result==='WIN'?'✅ WIN':'❌ LOSS';
-
-      await send(trade.chatId,
-        `📊 Tracking No. ${trade.signalNo||tradeId}${lateStr}\n━━━━━━━━━━━━━━\n${rE}  ${dE} ${trade.direction} ${disp(trade.pair)}${gradeStr}\n💰 Entry:  ${entry.toFixed(5)}\n🏁 Exit:   ${current.toFixed(5)}\n📏 Move:   ${diff>0?'+':''}${pips}${unit}`,
+      const entry=parseFloat(t.entryPrice), current=parseFloat(cur), diff=current-entry;
+      const result = t.direction==='BUY' ? (diff>0?'WIN':'LOSS') : (diff<0?'WIN':'LOSS');
+      const pips   = isCr(t.pair) ? Math.round(Math.abs(diff)*100)/100 : Math.round(Math.abs(diff)*10000*10)/10;
+      const unit   = isCr(t.pair) ? '$' : ' pips';
+      await setResult(t.chatId, tid, result, current, pips, env);
+      await clearLock(t.chatId, t.pair, env);
+      const late  = Math.round((now-t.expiryAt)/60000);
+      const lateS = late>1 ? ` (+${late}min)` : '';
+      const dE    = t.direction==='BUY'?'🟢':'🔴', rE=result==='WIN'?'✅ WIN':'❌ LOSS';
+      const gS    = t.grade ? `  ${t.grade}` : '';
+      await sendMsg(t.chatId,
+        `📊 Tracking No. ${t.signalNo||tid}${lateS}\n━━━━━━━━━━━━━━\n${rE}  ${dE} ${t.direction} ${disp(t.pair)}${gS}\n💰 Entry:  ${entry.toFixed(5)}\n🏁 Exit:   ${current.toFixed(5)}\n📏 Move:   ${diff>0?'+':''}${pips}${unit}`,
         env, { reply_markup: afterKb() });
-
-      await checkMilestone(trade.chatId, env);
-
-    } catch (e) { log(`ResultCheck ${tradeId}: ${e.message}`); remaining.push(tradeId); }
+      await checkMilestone(t.chatId, env);
+    } catch(e) { log(`Result ${tid}: ${e.message}`); keep.push(tid); }
   }
-
-  await savePendingIds(remaining, env);
+  await savePendingIds(keep, env);
 }
 
-// ─── MILESTONE (every 50 resolved) ───────────────────────────────────────────
-
-async function checkMilestone(chatId, env) {
-  try {
-    // Use persistent resolved counter separate from history
-    const mKey     = `ms:${chatId}`;
-    const ms       = (await kvGet(mKey, env)) || { lastCount: 0 };
-    const history  = await getHistory(chatId, env);
-    const resolved = history.filter(h => h.result==='WIN'||h.result==='LOSS');
-
-    // Total resolved = persistent counter
-    const totalResolved = (await kvGet(`rct:${chatId}`, env)) || resolved.length;
-    await kvPut(`rct:${chatId}`, totalResolved, env);
-
-    const since = totalResolved - ms.lastCount;
-    if (since < MILESTONE_COUNT) return;
-
-    // Build batch from current history (up to 50 newest resolved)
-    const batch = resolved.slice(0, Math.min(since, 50));
-    const wins  = batch.filter(h=>h.result==='WIN').length;
-    const losses= batch.filter(h=>h.result==='LOSS').length;
-    const wr    = Math.round(wins/batch.length*100);
-
-    const gm = {}, pm = {};
-    for (const h of batch) {
-      const g = (h.grade||'?').split(' ')[0];
-      if (!gm[g]) gm[g]={w:0,l:0};
-      h.result==='WIN'?gm[g].w++:gm[g].l++;
-      if (!pm[h.pair]) pm[h.pair]={w:0,l:0};
-      h.result==='WIN'?pm[h.pair].w++:pm[h.pair].l++;
-    }
-
-    let streak=0, sType='';
-    for (const h of resolved) {
-      if (!sType){sType=h.result;streak=1;}
-      else if(h.result===sType)streak++;
-      else break;
-    }
-
-    let msg = `🏁 ${MILESTONE_COUNT}-Signal Report\n(#${batch[batch.length-1]?.no||'?'} to #${batch[0]?.no||'?'})\n━━━━━━━━━━━━━━\n`;
-    msg += `✅ Wins:    ${wins}\n❌ Losses:  ${losses}\n📊 Win Rate: ${wr}%`;
-    if (streak>=3) msg += `\n🔥 Streak: ${streak} ${sType}s`;
-    msg += `\n\nGrade:\n`;
-    for (const [g,s] of Object.entries(gm)) {
-      msg += `  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w/(s.w+s.l)*100)}%)\n`;
-    }
-    msg += `\nTop Pairs:\n`;
-    Object.entries(pm).sort((a,b)=>(b[1].w+b[1].l)-(a[1].w+a[1].l)).slice(0,4)
-      .forEach(([p,s])=>{ msg+=`  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w/(s.w+s.l)*100)}%)\n`; });
-    msg += `\n🔄 Next ${MILESTONE_COUNT} signals tracking starts now.`;
-
-    await send(chatId, msg, env, { reply_markup: { inline_keyboard: [[
-      { text: '📈 History', callback_data: 'cmd:history:0' },
-      { text: '🏆 Stats',   callback_data: 'cmd:stats'     },
-    ]]}});
-
-    await kvPut(mKey, { lastCount: totalResolved }, env);
-  } catch (e) { console.error('milestone:', e.message); }
-}
-
-// ─── DAILY SUMMARY ────────────────────────────────────────────────────────────
-
-async function runDailySummary(env, log = console.log) {
-  const now   = new Date();
-  const hour  = now.getUTCHours();
-  // Use dedicated summary_users list (independent of auto scan)
+async function dailySummary(env, log) {
+  const hour  = new Date().getUTCHours();
   const users = await getSummaryUsers(env);
-  log(`DailySummary: ${users.length} users, hour=${hour} UTC`);
-
-  for (const chatId of users) {
+  log(`Summary: ${users.length} users, hour=${hour}`);
+  for (const cid of users) {
     try {
-      const user = await getUser(chatId, env);
-      if (!user.dailySummary) continue;
-      if (hour !== (user.summaryHour ?? 20)) continue;
-
-      // Avoid sending twice in same hour
-      const lastSent = (await kvGet(`ds:${chatId}`, env)) || 0;
-      if (Date.now() - lastSent < 55 * 60 * 1000) continue;
-
-      const history = await getHistory(chatId, env);
-      const today   = now.toISOString().slice(0, 10);
-      const todayH  = history.filter(h => h.timestamp?.startsWith(today));
-      if (todayH.length === 0) {
-        log(`No signals today for ${chatId}, skipping`);
-        continue;
-      }
-
-      const resolved = todayH.filter(h => h.result==='WIN'||h.result==='LOSS');
-      const wins     = resolved.filter(h => h.result==='WIN').length;
-      const losses   = resolved.filter(h => h.result==='LOSS').length;
-      const wr       = resolved.length > 0 ? Math.round(wins/resolved.length*100) : 0;
-      const pending  = todayH.filter(h => !h.result || h.result==='SKIP').length;
-
-      // Per pair today
-      const pm = {};
-      for (const h of resolved) {
-        if (!pm[h.pair]) pm[h.pair] = {w:0,l:0};
-        h.result==='WIN' ? pm[h.pair].w++ : pm[h.pair].l++;
-      }
-
-      // Best/worst pair
-      let bestPair = '', worstPair = '';
-      let bestWR = -1, worstWR = 101;
-      for (const [p, s] of Object.entries(pm)) {
-        const t = s.w+s.l; if (t < 2) continue;
-        const pwr = s.w/t*100;
-        if (pwr > bestWR)  { bestWR = pwr;  bestPair = p; }
-        if (pwr < worstWR) { worstWR = pwr; worstPair = p; }
-      }
-
-      let msg = `📅 Daily Summary — ${today}
-━━━━━━━━━━━━━━
-`;
-      msg += `📊 Signals: ${todayH.length}  |  Resolved: ${resolved.length}
-`;
-      msg += `✅ Wins: ${wins}  |  ❌ Losses: ${losses}
-`;
-      msg += `📈 Win Rate: ${wr}%
-`;
-      if (pending > 0) msg += `⏳ Pending: ${pending}
-`;
-      if (bestPair)  msg += `
-🏆 Best:  ${disp(bestPair)} (${Math.round(bestWR)}%)
-`;
-      if (worstPair && worstPair !== bestPair) msg += `📉 Worst: ${disp(worstPair)} (${Math.round(worstWR)}%)
-`;
-
-      // Grade breakdown today
-      const gm = {};
-      for (const h of resolved) {
-        const g = (h.grade||'?').split(' ')[0];
-        if (!gm[g]) gm[g]={w:0,l:0};
-        h.result==='WIN'?gm[g].w++:gm[g].l++;
-      }
-      if (Object.keys(gm).length > 0) {
-        msg += `
-Grades:
-`;
-        for (const [g,s] of Object.entries(gm)) {
-          const t=s.w+s.l;
-          msg += `  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)
-`;
-        }
-      }
-
-      // Overall win rate comparison
-      const allResolved = history.filter(h => h.result==='WIN'||h.result==='LOSS');
-      const allWins     = allResolved.filter(h => h.result==='WIN').length;
-      const allWR       = allResolved.length > 0 ? Math.round(allWins/allResolved.length*100) : 0;
-      const trend       = wr > allWR ? '📈 Above average' : wr < allWR ? '📉 Below average' : '➡️ On average';
-      msg += `
-${trend} (all-time: ${allWR}%)`;
-
-      await send(chatId, msg, env, { reply_markup: { inline_keyboard: [[
-        { text: '📈 History', callback_data: 'cmd:history:0' },
-        { text: '🏆 Stats',   callback_data: 'cmd:stats'     },
-      ]]}});
-
-      await kvPut(`ds:${chatId}`, Date.now(), env);
-      log(`Daily summary sent to ${chatId}`);
-    } catch (e) { log(`DailySummary ${chatId}: ${e.message}`); }
+      const u = await getUser(cid, env);
+      if (!u.dailySummary || hour !== (u.summaryHour??20)) continue;
+      const last = (await kget(`ds:${cid}`, env)) || 0;
+      if (Date.now()-last < 55*60*1000) continue;
+      const h     = await getHist(cid, env);
+      const today = new Date().toISOString().slice(0,10);
+      const th    = h.filter(x=>x.timestamp?.startsWith(today));
+      if (!th.length) continue;
+      const res   = th.filter(x=>x.result==='WIN'||x.result==='LOSS');
+      const wins  = res.filter(x=>x.result==='WIN').length;
+      const wr    = res.length>0?Math.round(wins/res.length*100):0;
+      let t = `📅 Daily Summary — ${today}\n━━━━━━━━━━━━━━\n📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length-wins}L\n📈 Win Rate: ${wr}%\n⏳ Pending: ${th.filter(x=>!x.result).length}`;
+      await sendMsg(cid, t, env, { reply_markup: kb([[btn('📈 History','cmd:history:0'), btn('🏆 Stats','cmd:stats')]]) });
+      await kput(`ds:${cid}`, Date.now(), env);
+      log(`Summary sent to ${cid}`);
+    } catch(e) { log(`Summary ${cid}: ${e.message}`); }
   }
+}
+
+async function checkMilestone(cid, env) {
+  try {
+    const mk  = `ms:${cid}`;
+    const ms  = (await kget(mk, env)) || { lastCount: 0 };
+    const h   = await getHist(cid, env);
+    const res = h.filter(x=>x.result==='WIN'||x.result==='LOSS');
+    const cnt = await getCounter(cid, env);
+    const since = res.length - ms.lastCount;
+    if (since < MILESTONE) return;
+    const batch = res.slice(0, since);
+    const wins  = batch.filter(x=>x.result==='WIN').length;
+    const wr    = Math.round(wins/batch.length*100);
+    const gm={}, pm={};
+    for(const x of batch){
+      const g=(x.grade||'?').split(' ')[0]; if(!gm[g])gm[g]={w:0,l:0}; x.result==='WIN'?gm[g].w++:gm[g].l++;
+      if(!pm[x.pair])pm[x.pair]={w:0,l:0}; x.result==='WIN'?pm[x.pair].w++:pm[x.pair].l++;
+    }
+    let t = `🏁 ${MILESTONE}-Signal Report (#${batch[batch.length-1]?.no||'?'} to #${batch[0]?.no||'?'})\n━━━━━━━━━━━━━━\n✅ ${wins}W  ❌ ${batch.length-wins}L\n📊 Win Rate: ${wr}%\n\nGrades:\n`;
+    for(const[g,s]of Object.entries(gm)){const tt=s.w+s.l;t+=`  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w/tt*100)}%)\n`;}
+    t+=`\nTop Pairs:\n`;
+    Object.entries(pm).sort((a,b)=>(b[1].w+b[1].l)-(a[1].w+a[1].l)).slice(0,4)
+      .forEach(([p,s])=>{const tt=s.w+s.l;t+=`  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w/tt*100)}%)\n`;});
+    t+=`\n🔄 Next ${MILESTONE} signals tracking starts now.`;
+    await sendMsg(cid, t, env, { reply_markup: kb([[btn('📈 History','cmd:history:0'), btn('🏆 Stats','cmd:stats')]]) });
+    await kput(mk, { lastCount: res.length }, env);
+  } catch(e) { console.error('milestone:', e.message); }
 }
