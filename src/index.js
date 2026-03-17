@@ -174,14 +174,8 @@ async function tgCall(method, body, env) {
 function send(chatId, text, env, extra = {}) {
   return tgCall('sendMessage', { chat_id: chatId, text: cl(text), disable_web_page_preview: true, ...extra }, env);
 }
-async function edit(chatId, msgId, text, env, extra = {}) {
-  // If edit fails (e.g. message not modified), fall back to new message
-  try {
-    await tgCall('editMessageText', { chat_id: chatId, message_id: msgId, text: cl(text), disable_web_page_preview: true, ...extra }, env);
-  } catch (e) {
-    // ignore "message is not modified" silently
-    console.log('edit failed, sending new:', e?.message?.slice(0,50));
-  }
+function edit(chatId, msgId, text, env, extra = {}) {
+  return tgCall('editMessageText', { chat_id: chatId, message_id: msgId, text: cl(text), disable_web_page_preview: true, ...extra }, env);
 }
 function answerCb(id, text, env) {
   return tgCall('answerCallbackQuery', { callback_query_id: id, text: text || '' }, env);
@@ -679,10 +673,11 @@ async function handleCb(cb, env) {
   const chatId = cb.message.chat.id;
   const msgId  = cb.message.message_id;
   const data   = cb.data;
-  const user = await getUser(chatId, env);
 
-  // Answer callback immediately before any processing
+  // MUST answer within 10s — do this FIRST before any KV calls
   await answerCb(cb.id, '', env);
+
+  const user = await getUser(chatId, env);
 
   if (data === 'cmd:main') {
     const h    = await getHistory(chatId, env);
