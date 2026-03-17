@@ -427,22 +427,13 @@ function wlAddKb(page, wl) {
 }
 
 function wlKb(wl) {
-  const kb = wl.reduce((rows, p, i) => {
-    if (i % 2 === 0) rows.push([]);
-    rows[rows.length-1].push({ text: `❌ ${disp(p)}`, callback_data: `wl:rm:${p}` });
-    return rows;
-  }, []);
-  // Quick signal buttons for each watchlist pair
-  if (wl.length > 0) {
-    const qRows = wl.reduce((rows, p, i) => {
-      if (i % 2 === 0) rows.push([]);
-      rows[rows.length-1].push({ text: `📊 ${disp(p)}`, callback_data: `qs:${p}` });
-      return rows;
-    }, []);
-    kb.push(...qRows);
-  }
+  // Each pair: one row with [📊 Signal] [❌ Remove]
+  const kb = wl.map(p => ([
+    { text: `📊 ${disp(p)}`, callback_data: `qs:${p}` },
+    { text: `❌`,            callback_data: `wl:rm:${p}` },
+  ]));
   kb.push([{ text: '➕ Add Pairs', callback_data: 'wlpage:0' }]);
-  kb.push([{ text: '🔙 Back', callback_data: 'cmd:main' }]);
+  kb.push([{ text: '🔙 Back',      callback_data: 'cmd:main'  }]);
   return { inline_keyboard: kb };
 }
 
@@ -688,8 +679,10 @@ async function handleCb(cb, env) {
   const chatId = cb.message.chat.id;
   const msgId  = cb.message.message_id;
   const data   = cb.data;
-  await answerCb(cb.id, '', env);
   const user = await getUser(chatId, env);
+
+  // Answer callback immediately before any processing
+  await answerCb(cb.id, '', env);
 
   if (data === 'cmd:main') {
     const h    = await getHistory(chatId, env);
@@ -768,33 +761,21 @@ Only send signals at or above this confidence level.`, env, { reply_markup: conf
     return edit(chatId, msgId, `👁 Add to Watchlist (${user.watchlist.length}/${MAX_WATCHLIST}):`, env,
       { reply_markup: wlAddKb(page, user.watchlist) });
   }
-  // Old callbacks (keep for backward compat)
-  if (data.startsWith('wl:add:') && !data.startsWith('wl:addpage:')) {
-    const p = data.slice(7);
-    if (!user.watchlist.includes(p) && user.watchlist.length < MAX_WATCHLIST) {
-      user.watchlist = [...user.watchlist, p]; await saveUser(chatId, user, env);
-    }
-    return doWatchlist(chatId, env, msgId);
-  }
-  if (data.startsWith('wl:rm:') && !data.startsWith('wl:rmpage:')) {
+  // Watchlist remove (from main watchlist view)
+  if (data.startsWith('wl:rm:')) {
     const pair = data.slice(6);
     user.watchlist = user.watchlist.filter(p => p !== pair);
     await saveUser(chatId, user, env);
-    await answerCb(cb.id, `❌ ${disp(pair)} removed`, env);
     return doWatchlist(chatId, env, msgId);
   }
-  // New page-aware callbacks
+  // Watchlist add/remove from add-page (page-aware)
   if (data.startsWith('wl:addpage:')) {
     const parts = data.split(':');
     const pair = parts[2], page = parseInt(parts[3]||'0', 10);
     if (!user.watchlist.includes(pair) && user.watchlist.length < MAX_WATCHLIST) {
       user.watchlist = [...user.watchlist, pair];
       await saveUser(chatId, user, env);
-      await answerCb(cb.id, `✅ ${disp(pair)} added`, env);
-    } else if (user.watchlist.length >= MAX_WATCHLIST) {
-      await answerCb(cb.id, `⚠️ Watchlist full (max ${MAX_WATCHLIST})`, env);
     }
-    // Stay on same add page
     return edit(chatId, msgId,
       `👁 Add to Watchlist (${user.watchlist.length}/${MAX_WATCHLIST}):`,
       env, { reply_markup: wlAddKb(page, user.watchlist) });
@@ -804,8 +785,6 @@ Only send signals at or above this confidence level.`, env, { reply_markup: conf
     const pair = parts[2], page = parseInt(parts[3]||'0', 10);
     user.watchlist = user.watchlist.filter(p => p !== pair);
     await saveUser(chatId, user, env);
-    await answerCb(cb.id, `❌ ${disp(pair)} removed`, env);
-    // Stay on same add page
     return edit(chatId, msgId,
       `👁 Add to Watchlist (${user.watchlist.length}/${MAX_WATCHLIST}):`,
       env, { reply_markup: wlAddKb(page, user.watchlist) });
