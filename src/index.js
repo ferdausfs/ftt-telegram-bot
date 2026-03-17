@@ -161,15 +161,27 @@ async function tgCall(method, body, env) {
     const res = await fetch(`${tgApi(env)}/${method}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     });
-    if (!res.ok) console.error(`tg ${method} ${res.status}:`, (await res.text()).slice(0,200));
+    if (!res.ok) {
+      const t = await res.text();
+      // Ignore "message is not modified" — not a real error
+      if (!t.includes('message is not modified') && !t.includes('query is too old')) {
+        console.error(`tg ${method} ${res.status}:`, t.slice(0,200));
+      }
+    }
   } catch (e) { console.error(`tg ${method}:`, e.message); }
 }
 
 function send(chatId, text, env, extra = {}) {
   return tgCall('sendMessage', { chat_id: chatId, text: cl(text), disable_web_page_preview: true, ...extra }, env);
 }
-function edit(chatId, msgId, text, env, extra = {}) {
-  return tgCall('editMessageText', { chat_id: chatId, message_id: msgId, text: cl(text), disable_web_page_preview: true, ...extra }, env);
+async function edit(chatId, msgId, text, env, extra = {}) {
+  // If edit fails (e.g. message not modified), fall back to new message
+  try {
+    await tgCall('editMessageText', { chat_id: chatId, message_id: msgId, text: cl(text), disable_web_page_preview: true, ...extra }, env);
+  } catch (e) {
+    // ignore "message is not modified" silently
+    console.log('edit failed, sending new:', e?.message?.slice(0,50));
+  }
 }
 function answerCb(id, text, env) {
   return tgCall('answerCallbackQuery', { callback_query_id: id, text: text || '' }, env);
@@ -397,14 +409,20 @@ function wlAddKb(page, wl) {
   const kb = PAIR_PAGES[page].reduce((rows, p, i) => {
     if (i % 2 === 0) rows.push([]);
     const code = norm(p), inWL = wl.includes(code);
-    rows[rows.length-1].push({ text: inWL ? `✅ ${p}` : p, callback_data: inWL ? `wl:rm:${code}` : `wl:add:${code}` });
+    // Include page in callback so we return to same page after add/remove
+    rows[rows.length-1].push({
+      text: inWL ? `✅ ${p}` : p,
+      callback_data: inWL ? `wl:rmpage:${code}:${page}` : `wl:addpage:${code}:${page}`,
+    });
     return rows;
   }, []);
   const nav = [];
   if (page > 0)                     nav.push({ text: '◀ Prev', callback_data: `wlpage:${page-1}` });
   if (page < PAIR_PAGES.length - 1) nav.push({ text: 'Next ▶', callback_data: `wlpage:${page+1}` });
   if (nav.length) kb.push(nav);
-  kb.push([{ text: '🔙 Watchlist', callback_data: 'cmd:watchlist' }]);
+  kb.push([
+    { text: `✅ Done (${wl.length}/${MAX_WATCHLIST})`, callback_data: 'cmd:watchlist' },
+  ]);
   return { inline_keyboard: kb };
 }
 
@@ -750,17 +768,47 @@ Only send signals at or above this confidence level.`, env, { reply_markup: conf
     return edit(chatId, msgId, `👁 Add to Watchlist (${user.watchlist.length}/${MAX_WATCHLIST}):`, env,
       { reply_markup: wlAddKb(page, user.watchlist) });
   }
-  if (data.startsWith('wl:add:')) {
+  // Old callbacks (keep for backward compat)
+  if (data.startsWith('wl:add:') && !data.startsWith('wl:addpage:')) {
     const p = data.slice(7);
     if (!user.watchlist.includes(p) && user.watchlist.length < MAX_WATCHLIST) {
       user.watchlist = [...user.watchlist, p]; await saveUser(chatId, user, env);
     }
     return doWatchlist(chatId, env, msgId);
   }
-  if (data.startsWith('wl:rm:')) {
-    user.watchlist = user.watchlist.filter(p => p !== data.slice(6));
+  if (data.startsWith('wl:rm:') && !data.startsWith('wl:rmpage:')) {
+    const pair = data.slice(6);
+    user.watchlist = user.watchlist.filter(p => p !== pair);
     await saveUser(chatId, user, env);
+    await answerCb(cb.id, `❌ ${disp(pair)} removed`, env);
     return doWatchlist(chatId, env, msgId);
+  }
+  // New page-aware callbacks
+  if (data.startsWith('wl:addpage:')) {
+    const parts = data.split(':');
+    const pair = parts[2], page = parseInt(parts[3]||'0', 10);
+    if (!user.watchlist.includes(pair) && user.watchlist.length < MAX_WATCHLIST) {
+      user.watchlist = [...user.watchlist, pair];
+      await saveUser(chatId, user, env);
+      await answerCb(cb.id, `✅ ${disp(pair)} added`, env);
+    } else if (user.watchlist.length >= MAX_WATCHLIST) {
+      await answerCb(cb.id, `⚠️ Watchlist full (max ${MAX_WATCHLIST})`, env);
+    }
+    // Stay on same add page
+    return edit(chatId, msgId,
+      `👁 Add to Watchlist (${user.watchlist.length}/${MAX_WATCHLIST}):`,
+      env, { reply_markup: wlAddKb(page, user.watchlist) });
+  }
+  if (data.startsWith('wl:rmpage:')) {
+    const parts = data.split(':');
+    const pair = parts[2], page = parseInt(parts[3]||'0', 10);
+    user.watchlist = user.watchlist.filter(p => p !== pair);
+    await saveUser(chatId, user, env);
+    await answerCb(cb.id, `❌ ${disp(pair)} removed`, env);
+    // Stay on same add page
+    return edit(chatId, msgId,
+      `👁 Add to Watchlist (${user.watchlist.length}/${MAX_WATCHLIST}):`,
+      env, { reply_markup: wlAddKb(page, user.watchlist) });
   }
   // Quick signal for watchlist pair
   if (data.startsWith('qs:')) {
