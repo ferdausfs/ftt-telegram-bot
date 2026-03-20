@@ -86,7 +86,9 @@ export default {
 const TG  = env => `https://api.telegram.org/bot${env.BOT_TOKEN}`;
 const post = body => ({ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
 const json = () => ({ headers: { 'Content-Type': 'application/json' } });
-const safe = t  => String(t||'').replace(/[*_`\[\]]/g,'');
+
+// FIX 1: safe() regex — correctly escapes *, _, `, [, ]
+const safe = t => String(t||'').replace(/[*_`\[\]]/g, '');
 
 async function tg(method, body, env) {
   if (!env?.BOT_TOKEN) return null;
@@ -213,7 +215,7 @@ async function logAndSchedule(cid, pair, sig, env) {
   const no = await addHist(cid, {
     id:tid, pair, direction:dir, confidence:sig.confidence||'0%', grade,
     entryPrice:entry, expiryMinutes:expMins,
-    expiryAt:new Date(expAt).toISOString(),
+    expiryAt:expAt,                              // FIX 4: store as number (ms), consistent with pending
     timestamp:new Date().toISOString(), result:null,
   }, env);
 
@@ -553,9 +555,11 @@ async function onCb(cb, env) {
     await saveUser(cid, u, env);
     return doWatchlist(cid, mid, env);
   }
+  // FIX 3: use parts[] instead of destructuring to avoid colon-in-pair issues
   if (data.startsWith('wl:addpage:')) {
-    const [,,pair,pg] = data.split(':');
-    const page = parseInt(pg||'0', 10);
+    const parts = data.split(':');
+    const pair  = parts[2];
+    const page  = parseInt(parts[3] || '0', 10);
     if (!u.watchlist.includes(pair) && u.watchlist.length < MAX_WL) {
       u.watchlist = [...u.watchlist, pair];
       await saveUser(cid, u, env);
@@ -563,8 +567,9 @@ async function onCb(cb, env) {
     return R(`👁 Add to Watchlist (${u.watchlist.length}/${MAX_WL}):`, wlAddKb(page, u.watchlist));
   }
   if (data.startsWith('wl:rmpage:')) {
-    const [,,pair,pg] = data.split(':');
-    const page = parseInt(pg||'0', 10);
+    const parts = data.split(':');
+    const pair  = parts[2];
+    const page  = parseInt(parts[3] || '0', 10);
     u.watchlist = u.watchlist.filter(p => p !== pair);
     await saveUser(cid, u, env);
     return R(`👁 Add to Watchlist (${u.watchlist.length}/${MAX_WL}):`, wlAddKb(page, u.watchlist));
@@ -576,9 +581,11 @@ async function onCb(cb, env) {
 
 // ─── ACTION FUNCTIONS ─────────────────────────────────────────────────────────
 
+// FIX 2: loading msg edit করো, result আলাদা sendMsg দিয়ে
 async function doSignal(cid, mid, env) {
   const u = await getUser(cid, env);
-  await reply(cid, mid, `⏳ Fetching ${disp(u.pair)}...`, env, null);
+  if (mid) await editMsg(cid, mid, `⏳ Fetching ${disp(u.pair)}...`, env, {});
+  else     await sendMsg(cid, `⏳ Fetching ${disp(u.pair)}...`, env, {});
   try {
     const data = await fetchSig(u.pair, env);
     const sig  = data.signal;
@@ -591,9 +598,11 @@ async function doSignal(cid, mid, env) {
   }
 }
 
+// FIX 5: doQuickSignal একই loading fix
 async function doQuickSignal(cid, mid, pair, env) {
   const u = await getUser(cid, env);
-  await reply(cid, mid, `⏳ Fetching ${disp(pair)}...`, env, null);
+  if (mid) await editMsg(cid, mid, `⏳ Fetching ${disp(pair)}...`, env, {});
+  else     await sendMsg(cid, `⏳ Fetching ${disp(pair)}...`, env, {});
   try {
     const data = await fetchSig(pair, env);
     const sig  = data.signal;
@@ -742,6 +751,7 @@ async function cron(env, logs=[], force=false) {
   log('Done');
 }
 
+// FIX 7: noTradeStreak — scan শেষে সব pair মিলিয়ে একবার update
 async function autoScan(env, log) {
   const users = await getAutoUsers(env);
   log(`Scan: ${users.length} users`);
@@ -750,6 +760,8 @@ async function autoScan(env, log) {
       const u = await getUser(cid, env);
       if (!u.autoEnabled) continue;
       const list = [u.pair, ...u.watchlist].filter((p,i,a)=>a.indexOf(p)===i);
+      let anySignalSent = false;
+
       for (const pair of list) {
         try {
           const data = await fetchSig(pair, env);
@@ -759,20 +771,26 @@ async function autoScan(env, log) {
             if (!passGrade(sig, u.gradeFilter) || !passConf(sig, u.minConfidence)) { log(`Filtered ${pair}`); continue; }
             const lock = await getLock(cid, pair, env);
             if (lock?.direction===dir && lock?.expiryAt>Date.now()) { log(`Locked ${pair}`); continue; }
-            const no   = await logAndSchedule(cid, pair, sig, env);
+            const no = await logAndSchedule(cid, pair, sig, env);
             await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: afterKb() });
             log(`Sent #${no} ${pair} ${dir}`);
-            u.noTradeStreak = 0;
-          } else {
-            u.noTradeStreak = (u.noTradeStreak||0)+1;
-            if (u.noTradeStreak >= 12) {
-              await sendMsg(cid, `⚪ No setup for ${u.noTradeStreak} scans across ${list.length} pair(s).`, env,
-                { reply_markup: kb([[btn('🔕 Stop Auto','cmd:toggle_auto')]]) });
-              u.noTradeStreak = 0;
-            }
+            anySignalSent = true;
           }
         } catch(e) { log(`Pair ${pair}: ${e.message}`); }
       }
+
+      // streak: সব pair scan শেষে একবার update — একটা pair এর জন্য নয়
+      if (!anySignalSent) {
+        u.noTradeStreak = (u.noTradeStreak||0) + 1;
+        if (u.noTradeStreak >= 12) {
+          await sendMsg(cid, `⚪ No setup for ${u.noTradeStreak} scans across ${list.length} pair(s).`, env,
+            { reply_markup: kb([[btn('🔕 Stop Auto','cmd:toggle_auto')]]) });
+          u.noTradeStreak = 0;
+        }
+      } else {
+        u.noTradeStreak = 0;
+      }
+
       await saveUser(cid, u, env);
     } catch(e) { log(`User ${cid}: ${e.message}`); }
   }
