@@ -1,8 +1,15 @@
 /**
- * FTT Signal Telegram Bot — v3.1 (Clean Rewrite)
+ * FTT Signal Telegram Bot — v3.1 (Fixed)
  * KV Binding     : BOT_KV
  * Service Binding: SIGNAL_WORKER → my-worker-601
  * Secrets        : BOT_TOKEN, SETUP_SECRET
+ *
+ * Fixes applied:
+ *  1. parse_mode:'MarkdownV2' + proper escaping
+ *  2. Crypto price → .toFixed(2), Forex → .toFixed(5)
+ *  3. doScanAll loading — null markup fix
+ *  4. checkMilestone — negative `since` guard
+ *  5. fmtSignal — shows actual bestTimeframe timeframe
  */
 
 const PAIR_PAGES = [
@@ -12,16 +19,16 @@ const PAIR_PAGES = [
   ['BTC/USD','ETH/USD','SOL/USD','BNB/USD'],
   ['XRP/USD','ADA/USD','DOGE/USD','AVAX/USD'],
 ];
-const MAX_WL      = 6;
-const MAX_HIST    = 100;
-const MILESTONE   = 50;
-const CRYPTO      = ['BTC','ETH','BNB','XRP','SOL','ADA','DOGE','AVAX','DOT','LINK'];
+const MAX_WL    = 6;
+const MAX_HIST  = 100;
+const MILESTONE = 50;
+const CRYPTO    = ['BTC','ETH','BNB','XRP','SOL','ADA','DOGE','AVAX','DOT','LINK'];
 
 // ─── EXPORT ───────────────────────────────────────────────────────────────────
 
 export default {
   async fetch(req, env, ctx) {
-    const url = new URL(req.url);
+    const url    = new URL(req.url);
     const secret = () => url.searchParams.get('secret') === env.SETUP_SECRET;
 
     if (req.method === 'POST' && url.pathname === '/webhook') {
@@ -32,7 +39,8 @@ export default {
 
     if (url.pathname === '/setup' && secret()) {
       const hook = `https://${url.hostname}/webhook`;
-      const r = await fetch(`${TG(env)}/setWebhook`, post({ url: hook, allowed_updates: ['message','callback_query'], drop_pending_updates: true }));
+      const r = await fetch(`${TG(env)}/setWebhook`,
+        post({ url: hook, allowed_updates: ['message','callback_query'], drop_pending_updates: true }));
       return new Response(JSON.stringify(await r.json(), null, 2), json());
     }
 
@@ -53,7 +61,8 @@ export default {
       const id = url.searchParams.get('chat');
       if (!id) return new Response('?chat= required', { status: 400 });
       await addAutoUser(id, env);
-      const u = await getUser(id, env); u.autoEnabled = true;
+      const u = await getUser(id, env);
+      u.autoEnabled = true;
       await saveUser(id, u, env);
       return new Response('OK', json());
     }
@@ -63,13 +72,18 @@ export default {
       if (!id) return new Response('?chat= required', { status: 400 });
       const h = await getHist(id, env);
       if (!h.length) return new Response('No data', { status: 404 });
-      const hdr = 'No,Pair,Dir,Grade,Conf,Entry,Exit,Pips,Result,Expiry,Time,ResolvedAt';
-      const rows = h.map(x => [x.no||'',x.pair||'',x.direction||'',x.grade||'',x.confidence||'',
-        x.entryPrice||'',x.exitPrice||'',x.pips||'',x.result||'PENDING',
-        x.expiryMinutes||'',x.timestamp||'',x.resolvedAt||''].join(','));
+      const hdr  = 'No,Pair,Dir,Grade,Conf,Entry,Exit,Pips,Result,Expiry,Time,ResolvedAt';
+      const rows = h.map(x => [
+        x.no||'', x.pair||'', x.direction||'', x.grade||'', x.confidence||'',
+        x.entryPrice||'', x.exitPrice||'', x.pips||'', x.result||'PENDING',
+        x.expiryMinutes||'', x.timestamp||'', x.resolvedAt||''
+      ].join(','));
       const fname = `ftt-${id}-${new Date().toISOString().slice(0,10)}.csv`;
-      return new Response([hdr,...rows].join('\n'), {
-        headers: { 'Content-Type':'text/csv', 'Content-Disposition':`attachment; filename="${fname}"` }
+      return new Response([hdr, ...rows].join('\n'), {
+        headers: {
+          'Content-Type': 'text/csv',
+          'Content-Disposition': `attachment; filename="${fname}"`,
+        },
       });
     }
 
@@ -83,12 +97,12 @@ export default {
 
 // ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
 
-const TG  = env => `https://api.telegram.org/bot${env.BOT_TOKEN}`;
+const TG   = env  => `https://api.telegram.org/bot${env.BOT_TOKEN}`;
 const post = body => ({ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
-const json = () => ({ headers: { 'Content-Type': 'application/json' } });
+const json = ()   => ({ headers: { 'Content-Type': 'application/json' } });
 
-// FIX 1: safe() regex — correctly escapes *, _, `, [, ]
-const safe = t => String(t||'').replace(/[*_`\[\]]/g, '');
+// FIX 1: MarkdownV2 escape — special chars সব escape করো
+const esc = t => String(t || '').replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
 
 async function tg(method, body, env) {
   if (!env?.BOT_TOKEN) return null;
@@ -97,38 +111,51 @@ async function tg(method, body, env) {
     if (!r.ok) {
       const t = await r.text();
       if (!t.includes('not modified') && !t.includes('too old'))
-        console.error(`tg/${method}:`, t.slice(0,150));
+        console.error(`tg/${method}:`, t.slice(0, 150));
     }
     return r;
-  } catch(e) { console.error(`tg/${method}:`, e.message); return null; }
+  } catch (e) { console.error(`tg/${method}:`, e.message); return null; }
 }
 
-const sendMsg = (cid, text, env, extra={}) =>
-  tg('sendMessage', { chat_id:cid, text:safe(text), disable_web_page_preview:true, ...extra }, env);
+// FIX 1: parse_mode:'MarkdownV2' সব sendMessage/editMessageText এ
+const sendMsg = (cid, text, env, extra = {}) =>
+  tg('sendMessage', {
+    chat_id: cid,
+    text: esc(text),
+    parse_mode: 'MarkdownV2',
+    disable_web_page_preview: true,
+    ...extra,
+  }, env);
 
-const editMsg = (cid, mid, text, env, extra={}) =>
-  tg('editMessageText', { chat_id:cid, message_id:mid, text:safe(text), disable_web_page_preview:true, ...extra }, env);
+const editMsg = (cid, mid, text, env, extra = {}) =>
+  tg('editMessageText', {
+    chat_id: cid,
+    message_id: mid,
+    text: esc(text),
+    parse_mode: 'MarkdownV2',
+    disable_web_page_preview: true,
+    ...extra,
+  }, env);
 
-const answerCb = (id, env, text='') =>
-  tg('answerCallbackQuery', { callback_query_id:id, text }, env);
+const answerCb = (id, env, text = '') =>
+  tg('answerCallbackQuery', { callback_query_id: id, text }, env);
 
-// reply helper — edit if msgId given, else send new
 const reply = (cid, mid, text, env, kb) => mid
-  ? editMsg(cid, mid, text, env, { reply_markup: kb })
-  : sendMsg(cid, text, env, { reply_markup: kb });
+  ? editMsg(cid, mid, text, env, kb ? { reply_markup: kb } : {})
+  : sendMsg(cid, text, env, kb ? { reply_markup: kb } : {});
 
 // ─── KV HELPERS ───────────────────────────────────────────────────────────────
 
-const kget = async (k, env) => { try { return await env.BOT_KV.get(k,'json'); } catch { return null; } };
-const kput = async (k, v, env, opts={}) => { try { await env.BOT_KV.put(k, JSON.stringify(v), opts); } catch(e){ console.error('kput',k,e.message); } };
+const kget = async (k, env) => { try { return await env.BOT_KV.get(k, 'json'); } catch { return null; } };
+const kput = async (k, v, env, opts = {}) => { try { await env.BOT_KV.put(k, JSON.stringify(v), opts); } catch (e) { console.error('kput', k, e.message); } };
 const kdel = async (k, env) => { try { await env.BOT_KV.delete(k); } catch {} };
 
 // ─── USER ─────────────────────────────────────────────────────────────────────
 
 const DEF_USER = () => ({
-  pair:'EURUSD', watchlist:[], interval:5, autoEnabled:false,
-  noTradeStreak:0, gradeFilter:'ALL', minConfidence:0,
-  dailySummary:false, summaryHour:20,
+  pair: 'EURUSD', watchlist: [], interval: 5, autoEnabled: false,
+  noTradeStreak: 0, gradeFilter: 'ALL', minConfidence: 0,
+  dailySummary: false, summaryHour: 20,
 });
 
 async function getUser(cid, env) {
@@ -137,7 +164,7 @@ async function getUser(cid, env) {
 }
 const saveUser = (cid, u, env) => kput(`u:${cid}`, u, env);
 
-async function getAutoUsers(env) { return (await kget('auto_users', env)) || []; }
+async function getAutoUsers(env)    { return (await kget('auto_users', env))    || []; }
 async function addAutoUser(cid, env) {
   const list = await getAutoUsers(env);
   if (!list.includes(String(cid))) await kput('auto_users', [...list, String(cid)], env);
@@ -167,7 +194,7 @@ async function addHist(cid, entry, env) {
   await kput(`cnt:${cid}`, cnt, env);
   entry.no = cnt;
   h.unshift(entry);
-  const cutoff = Date.now() - 30*24*60*60*1000;
+  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
   await kput(`h:${cid}`, h.slice(0, MAX_HIST).filter(x => new Date(x.timestamp).getTime() > cutoff), env);
   return cnt;
 }
@@ -194,11 +221,11 @@ const savePendingIds = (ids, env) => kput('pending_ids', ids, env);
 
 // ─── ACTIVE LOCK ──────────────────────────────────────────────────────────────
 
-const getLock   = (cid, pair, env)                 => kget(`lock:${cid}:${pair}`, env);
-const clearLock = (cid, pair, env)                 => kdel(`lock:${cid}:${pair}`, env);
+const getLock   = (cid, pair, env)                    => kget(`lock:${cid}:${pair}`, env);
+const clearLock = (cid, pair, env)                    => kdel(`lock:${cid}:${pair}`, env);
 async function setLock(cid, pair, dir, expiryAt, env) {
   const ttl = Math.max(60, Math.ceil((expiryAt - Date.now()) / 1000) + 120);
-  await kput(`lock:${cid}:${pair}`, { direction:dir, expiryAt }, env, { expirationTtl: ttl });
+  await kput(`lock:${cid}:${pair}`, { direction: dir, expiryAt }, env, { expirationTtl: ttl });
 }
 
 // ─── LOG & SCHEDULE ───────────────────────────────────────────────────────────
@@ -213,13 +240,16 @@ async function logAndSchedule(cid, pair, sig, env) {
   const tid     = uid();
 
   const no = await addHist(cid, {
-    id:tid, pair, direction:dir, confidence:sig.confidence||'0%', grade,
-    entryPrice:entry, expiryMinutes:expMins,
-    expiryAt:expAt,                              // FIX 4: store as number (ms), consistent with pending
-    timestamp:new Date().toISOString(), result:null,
+    id: tid, pair, direction: dir, confidence: sig.confidence || '0%', grade,
+    entryPrice: entry, expiryMinutes: expMins,
+    expiryAt: expAt,
+    timestamp: new Date().toISOString(), result: null,
   }, env);
 
-  await addPending({ chatId:String(cid), tradeId:tid, pair, direction:dir, entryPrice:entry, expiryAt:expAt, signalNo:no, grade }, env);
+  await addPending({
+    chatId: String(cid), tradeId: tid, pair, direction: dir,
+    entryPrice: entry, expiryAt: expAt, signalNo: no, grade,
+  }, env);
   await setLock(cid, pair, dir, expAt, env);
   return no;
 }
@@ -227,13 +257,13 @@ async function logAndSchedule(cid, pair, sig, env) {
 // ─── FILTERS ──────────────────────────────────────────────────────────────────
 
 const passGrade = (sig, f) => {
-  if (!f || f==='ALL') return true;
+  if (!f || f === 'ALL') return true;
   const g = sig.grade?.grade || '';
-  return f==='A' ? g==='A' : f==='AB' ? 'AB'.includes(g) : true;
+  return f === 'A' ? g === 'A' : f === 'AB' ? 'AB'.includes(g) : true;
 };
 const passConf = (sig, min) => {
   if (!min) return true;
-  return parseInt((sig.confidence||'0%').replace('%',''), 10) >= min;
+  return parseInt((sig.confidence || '0%').replace('%', ''), 10) >= min;
 };
 
 // ─── KEYBOARDS ────────────────────────────────────────────────────────────────
@@ -245,25 +275,25 @@ const mainKb = u => kb([
     btn('📊 Signal Now',  'cmd:signal'),
     btn(u.autoEnabled ? '🔕 Stop Auto' : '🔄 Start Auto', 'cmd:toggle_auto'),
   ],
-  [ btn('🔍 Scan All', 'cmd:scanall'),  btn('📅 Today',    'cmd:today')   ],
+  [ btn('🔍 Scan All', 'cmd:scanall'),   btn('📅 Today',    'cmd:today')    ],
   [ btn('👁 Watchlist', 'cmd:watchlist'), btn('📈 History', 'cmd:history:0') ],
-  [ btn('🏆 Stats',    'cmd:stats'),    btn('📋 Summary',  'cmd:summary')  ],
-  [ btn('⚙️ Settings', 'cmd:settings'), btn('📋 Status',   'cmd:status')   ],
+  [ btn('🏆 Stats',    'cmd:stats'),     btn('📋 Summary',  'cmd:summary')  ],
+  [ btn('⚙️ Settings', 'cmd:settings'),  btn('📋 Status',   'cmd:status')   ],
 ]);
 
 const settingsKb = u => kb([
   [ btn(`💱 Pair: ${disp(u.pair)}`, 'pairpage:0'), btn(`⏱ Interval: ${u.interval}min`, 'cmd:intervals') ],
-  [ btn(`🎯 Grade: ${u.gradeFilter||'ALL'}`, 'cmd:gradefilter'), btn(`📊 Conf: ${u.minConfidence||0}%+`, 'cmd:conffilter') ],
-  [ btn(`📅 Summary: ${u.dailySummary?'ON':'OFF'}`, 'cmd:togglesummary'), btn(`🕐 Time: ${u.summaryHour??20}:00 UTC`, 'cmd:summarytime') ],
+  [ btn(`🎯 Grade: ${u.gradeFilter || 'ALL'}`, 'cmd:gradefilter'), btn(`📊 Conf: ${u.minConfidence || 0}%+`, 'cmd:conffilter') ],
+  [ btn(`📅 Summary: ${u.dailySummary ? 'ON' : 'OFF'}`, 'cmd:togglesummary'), btn(`🕐 Time: ${u.summaryHour ?? 20}:00 UTC`, 'cmd:summarytime') ],
   [ btn('🔙 Back', 'cmd:main') ],
 ]);
 
-const pairsKb = (page, backTo='cmd:settings') => {
-  page = Math.max(0, Math.min(page, PAIR_PAGES.length-1));
+const pairsKb = (page, backTo = 'cmd:settings') => {
+  page = Math.max(0, Math.min(page, PAIR_PAGES.length - 1));
   const rows = chunk(PAIR_PAGES[page], 2).map(row => row.map(p => btn(p, `pair:${p}`)));
-  const nav = [];
-  if (page > 0)                     nav.push(btn('◀ Prev', `pairpage:${page-1}`));
-  if (page < PAIR_PAGES.length - 1) nav.push(btn('Next ▶', `pairpage:${page+1}`));
+  const nav  = [];
+  if (page > 0)                     nav.push(btn('◀ Prev', `pairpage:${page - 1}`));
+  if (page < PAIR_PAGES.length - 1) nav.push(btn('Next ▶', `pairpage:${page + 1}`));
   if (nav.length) rows.push(nav);
   rows.push([btn('🔙 Back', backTo)]);
   return kb(rows);
@@ -277,7 +307,7 @@ const wlKb = wl => {
 };
 
 const wlAddKb = (page, wl) => {
-  page = Math.max(0, Math.min(page, PAIR_PAGES.length-1));
+  page = Math.max(0, Math.min(page, PAIR_PAGES.length - 1));
   const rows = chunk(PAIR_PAGES[page], 2).map(row =>
     row.map(p => {
       const code = norm(p), inWL = wl.includes(code);
@@ -285,39 +315,39 @@ const wlAddKb = (page, wl) => {
     })
   );
   const nav = [];
-  if (page > 0)                     nav.push(btn('◀ Prev', `wlpage:${page-1}`));
-  if (page < PAIR_PAGES.length - 1) nav.push(btn('Next ▶', `wlpage:${page+1}`));
+  if (page > 0)                     nav.push(btn('◀ Prev', `wlpage:${page - 1}`));
+  if (page < PAIR_PAGES.length - 1) nav.push(btn('Next ▶', `wlpage:${page + 1}`));
   if (nav.length) rows.push(nav);
   rows.push([btn(`✅ Done (${wl.length}/${MAX_WL})`, 'cmd:watchlist')]);
   return kb(rows);
 };
 
 const intervalKb  = () => kb([
-  [ btn('⚡ 1min','interval:1'), btn('📊 5min','interval:5'), btn('🕐 15min','interval:15') ],
-  [ btn('🔙 Back','cmd:settings') ],
+  [ btn('⚡ 1min', 'interval:1'), btn('📊 5min', 'interval:5'), btn('🕐 15min', 'interval:15') ],
+  [ btn('🔙 Back', 'cmd:settings') ],
 ]);
 const gradeKb     = () => kb([
-  [ btn('🌐 All','gf:ALL'), btn('⭐ A+B','gf:AB'), btn('🏆 A only','gf:A') ],
-  [ btn('🔙 Back','cmd:settings') ],
+  [ btn('🌐 All', 'gf:ALL'), btn('⭐ A+B', 'gf:AB'), btn('🏆 A only', 'gf:A') ],
+  [ btn('🔙 Back', 'cmd:settings') ],
 ]);
 const confKb      = () => kb([
-  [ btn('Any','cf:0'), btn('60%+','cf:60'), btn('70%+','cf:70') ],
-  [ btn('75%+','cf:75'), btn('80%+','cf:80'), btn('85%+','cf:85') ],
-  [ btn('🔙 Back','cmd:settings') ],
+  [ btn('Any', 'cf:0'),    btn('60%+', 'cf:60'), btn('70%+', 'cf:70') ],
+  [ btn('75%+', 'cf:75'),  btn('80%+', 'cf:80'), btn('85%+', 'cf:85') ],
+  [ btn('🔙 Back', 'cmd:settings') ],
 ]);
 const summTimeKb  = () => kb([
-  [ btn('06:00','sumhour:6'), btn('12:00','sumhour:12'), btn('18:00','sumhour:18') ],
-  [ btn('20:00','sumhour:20'), btn('22:00','sumhour:22'), btn('00:00','sumhour:0') ],
-  [ btn('🔙 Back','cmd:settings') ],
+  [ btn('06:00', 'sumhour:6'), btn('12:00', 'sumhour:12'), btn('18:00', 'sumhour:18') ],
+  [ btn('20:00', 'sumhour:20'), btn('22:00', 'sumhour:22'), btn('00:00', 'sumhour:0') ],
+  [ btn('🔙 Back', 'cmd:settings') ],
 ]);
-const afterKb     = () => kb([[btn('🔁 New Signal','cmd:signal'), btn('📈 History','cmd:history:0'), btn('🔙 Menu','cmd:main')]]);
+const afterKb     = () => kb([[btn('🔁 New Signal', 'cmd:signal'), btn('📈 History', 'cmd:history:0'), btn('🔙 Menu', 'cmd:main')]]);
 const histNavKb   = (page, total) => {
   const nav = [];
-  if (page > 0)                          nav.push(btn('◀ Prev', `cmd:history:${page-1}`));
-  if (page < Math.ceil(total/10) - 1)    nav.push(btn('Next ▶', `cmd:history:${page+1}`));
+  if (page > 0)                       nav.push(btn('◀ Prev', `cmd:history:${page - 1}`));
+  if (page < Math.ceil(total/10) - 1) nav.push(btn('Next ▶', `cmd:history:${page + 1}`));
   const rows = [];
   if (nav.length) rows.push(nav);
-  rows.push([btn('🏆 Stats','cmd:stats'), btn('🔙 Back','cmd:main')]);
+  rows.push([btn('🏆 Stats', 'cmd:stats'), btn('🔙 Back', 'cmd:main')]);
   return kb(rows);
 };
 
@@ -325,11 +355,15 @@ const btn = (text, cb) => ({ text, callback_data: cb });
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-const disp = p => (!p.includes('/') && p.length===6) ? p.slice(0,3)+'/'+p.slice(3) : p;
-const norm = p => p.replace('/','');
-const uid  = () => Math.random().toString(36).slice(2,8).toUpperCase();
-const isCr = p => CRYPTO.some(b => p.startsWith(b));
-const chunk = (arr, n) => arr.reduce((r,x,i) => (i%n===0?r.push([x]):r[r.length-1].push(x), r), []);
+const disp = p  => (!p.includes('/') && p.length === 6) ? p.slice(0,3) + '/' + p.slice(3) : p;
+const norm = p  => p.replace('/', '');
+const uid  = () => Math.random().toString(36).slice(2, 8).toUpperCase();
+const isCr = p  => CRYPTO.some(b => p.startsWith(b));
+const chunk = (arr, n) => arr.reduce((r, x, i) => (i % n === 0 ? r.push([x]) : r[r.length-1].push(x), r), []);
+
+// FIX 2: Crypto → .toFixed(2), Forex → .toFixed(5)
+const fmtPrice = (price, pair) =>
+  isCr(pair) ? parseFloat(price).toFixed(2) : parseFloat(price).toFixed(5);
 
 // ─── FORMATTERS ───────────────────────────────────────────────────────────────
 
@@ -340,27 +374,30 @@ function fmtSignal(data, pair, interval, no) {
   const sig = data.signal;
   if (!sig) return `📊 ${disp(pair)} | ${interval}min\n━━━━━━━━━━━━━━\nNo signal data`;
 
-  const dir    = sig.finalSignal  || 'NO_TRADE';
-  const conf   = sig.confidence   || '0%';
+  const dir    = sig.finalSignal   || 'NO_TRADE';
+  const conf   = sig.confidence    || '0%';
   const grade  = sig.grade ? `${sig.grade.grade} ${sig.grade.label}` : '';
-  const htf    = sig.higherTFTrend|| 'NEUTRAL';
-  const reason = sig.entryReason  || '';
+  const htf    = sig.higherTFTrend || 'NEUTRAL';
+  const reason = sig.entryReason   || '';
   const best   = sig.bestTimeframe;
+
+  // FIX 5: actual timeframe from bestTimeframe, fallback to user interval
+  const tf     = best?.timeframe || `${interval}min`;
   const expiry = best?.expiry?.humanReadable || null;
   const cd     = best?.expiry?.countdown?.label || null;
   const price  = sig.recommendations?.['1min']?.entry?.price
               || sig.recommendations?.['5min']?.entry?.price
               || sig.recommendations?.['15min']?.entry?.price || null;
 
-  const dE = dir==='BUY'?'🟢':dir==='SELL'?'🔴':'⚪';
-  const hE = htf==='BUY'?'📈':htf==='SELL'?'📉':'➡️';
+  const dE = dir === 'BUY' ? '🟢' : dir === 'SELL' ? '🔴' : '⚪';
+  const hE = htf === 'BUY' ? '📈' : htf === 'SELL' ? '📉' : '➡️';
 
   let msg = no ? `📌 Signal No. ${no}\n` : '';
-  msg += `📊 ${disp(pair)} | ${interval}min\n━━━━━━━━━━━━━━\n`;
+  msg += `📊 ${disp(pair)} | ${tf}\n━━━━━━━━━━━━━━\n`;
 
-  if (dir==='BUY'||dir==='SELL') {
+  if (dir === 'BUY' || dir === 'SELL') {
     msg += `${dE} ${dir}  ${conf}  ${grade}\n`;
-    if (price)  msg += `💰 Entry: ${parseFloat(price).toFixed(5)}\n`;
+    if (price)  msg += `💰 Entry: ${fmtPrice(price, pair)}\n`;
     if (expiry) msg += `⏰ Expiry: ${expiry}\n`;
     if (cd)     msg += `🕐 Candle closes: ${cd}\n`;
     msg += `${hE} HTF 15min: ${htf}\n`;
@@ -369,56 +406,70 @@ function fmtSignal(data, pair, interval, no) {
   } else {
     const filters = sig.filtersApplied || [];
     msg += `⚪ NO TRADE\n`;
-    msg += filters.length ? `🔕 ${filters.join(' · ')}` : `🔕 ${sig.alignment==='MIXED'?'Timeframes mixed':'Setup not clear'}`;
+    msg += filters.length
+      ? `🔕 ${filters.join(' · ')}`
+      : `🔕 ${sig.alignment === 'MIXED' ? 'Timeframes mixed' : 'Setup not clear'}`;
   }
   return msg;
 }
 
-function fmtHist(hist, page=0) {
-  const per=10, slice=hist.slice(page*per, page*per+per);
+function fmtHist(hist, page = 0) {
+  const per = 10, slice = hist.slice(page * per, page * per + per);
   if (!slice.length) return 'No signals yet.';
-  let msg = `📈 History (${page*per+1}-${page*per+slice.length} of ${hist.length})\n━━━━━━━━━━━━━━\n`;
+  let msg = `📈 History (${page * per + 1}-${page * per + slice.length} of ${hist.length})\n━━━━━━━━━━━━━━\n`;
   for (const h of slice) {
-    const dE=h.direction==='BUY'?'🟢':'🔴';
-    const rE=h.result==='WIN'?'✅':h.result==='LOSS'?'❌':h.result==='SKIP'?'⏭':'⏳';
-    const g=h.grade?` ${h.grade.split(' ')[0]}`:'';
-    const p=h.pips!=null?` ${h.pips>0?'+':''}${h.pips}`:'';
-    const t=new Date(h.timestamp).toUTCString().slice(5,17);
-    msg += `${rE} #${h.no||'?'} ${dE} ${disp(h.pair)}${g} ${h.confidence}${p}  ${t}\n`;
+    const dE = h.direction === 'BUY' ? '🟢' : '🔴';
+    const rE = h.result === 'WIN' ? '✅' : h.result === 'LOSS' ? '❌' : h.result === 'SKIP' ? '⏭' : '⏳';
+    const g  = h.grade  ? ` ${h.grade.split(' ')[0]}` : '';
+    const p  = h.pips != null ? ` ${h.pips > 0 ? '+' : ''}${h.pips}` : '';
+    const t  = new Date(h.timestamp).toUTCString().slice(5, 17);
+    msg += `${rE} #${h.no || '?'} ${dE} ${disp(h.pair)}${g} ${h.confidence}${p}  ${t}\n`;
   }
   return msg;
 }
 
 function fmtStats(hist) {
-  const trades   = hist.filter(h=>h.direction==='BUY'||h.direction==='SELL');
-  const resolved = trades.filter(h=>h.result==='WIN'||h.result==='LOSS');
-  const wins     = resolved.filter(h=>h.result==='WIN').length;
-  const losses   = resolved.filter(h=>h.result==='LOSS').length;
-  const wr       = resolved.length>0 ? Math.round(wins/resolved.length*100) : 0;
-  const pending  = trades.filter(h=>!h.result).length;
-  let streak=0, sT='';
-  for (const h of resolved) { if(!sT){sT=h.result;streak=1;}else if(h.result===sT)streak++;else break; }
-
-  const pm={}, gm={};
+  const trades   = hist.filter(h => h.direction === 'BUY' || h.direction === 'SELL');
+  const resolved = trades.filter(h => h.result === 'WIN' || h.result === 'LOSS');
+  const wins     = resolved.filter(h => h.result === 'WIN').length;
+  const losses   = resolved.filter(h => h.result === 'LOSS').length;
+  const wr       = resolved.length > 0 ? Math.round(wins / resolved.length * 100) : 0;
+  const pending  = trades.filter(h => !h.result).length;
+  let streak = 0, sT = '';
   for (const h of resolved) {
-    if(!pm[h.pair])pm[h.pair]={w:0,l:0}; h.result==='WIN'?pm[h.pair].w++:pm[h.pair].l++;
-    const g=(h.grade||'?').split(' ')[0];
-    if(!gm[g])gm[g]={w:0,l:0}; h.result==='WIN'?gm[g].w++:gm[g].l++;
+    if (!sT)           { sT = h.result; streak = 1; }
+    else if (h.result === sT) streak++;
+    else break;
   }
-
+  const pm = {}, gm = {};
+  for (const h of resolved) {
+    if (!pm[h.pair]) pm[h.pair] = { w:0, l:0 };
+    h.result === 'WIN' ? pm[h.pair].w++ : pm[h.pair].l++;
+    const g = (h.grade || '?').split(' ')[0];
+    if (!gm[g]) gm[g] = { w:0, l:0 };
+    h.result === 'WIN' ? gm[g].w++ : gm[g].l++;
+  }
   let msg = `🏆 Win/Loss Stats\n━━━━━━━━━━━━━━\n`;
   msg += `✅ Wins:     ${wins}\n❌ Losses:   ${losses}\n`;
   msg += `📊 Win Rate: ${wr}% (${resolved.length} trades)\n`;
   msg += `⏳ Pending:  ${pending}`;
-  if (streak>=2) msg += `\n🔥 Streak: ${streak} ${sT}s`;
+  if (streak >= 2) msg += `\n🔥 Streak: ${streak} ${sT}s`;
   if (Object.keys(gm).length) {
     msg += `\n\nGrade:\n`;
-    for (const [g,s] of Object.entries(gm)) { const t=s.w+s.l; msg+=`  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)\n`; }
+    for (const [g, s] of Object.entries(gm)) {
+      const t = s.w + s.l;
+      msg += `  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w / t * 100)}%)\n`;
+    }
   }
   if (Object.keys(pm).length) {
     msg += `\nTop Pairs:\n`;
-    Object.entries(pm).sort((a,b)=>(b[1].w+b[1].l)-(a[1].w+a[1].l)).slice(0,5)
-      .forEach(([p,s])=>{ const t=s.w+s.l; msg+=`  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)\n`; });
+    Object.entries(pm)
+      .sort((a, b) => (b[1].w + b[1].l) - (a[1].w + a[1].l))
+      .slice(0, 5)
+      .forEach(([p, s]) => {
+        const t = s.w + s.l;
+        msg += `  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w / t * 100)}%)\n`;
+      });
   }
   return msg;
 }
@@ -429,35 +480,37 @@ async function dispatch(upd, env) {
   try {
     if (upd.message)             await onMessage(upd.message, env);
     else if (upd.callback_query) await onCb(upd.callback_query, env);
-  } catch(e) { console.error('dispatch:', e.message); }
+  } catch (e) { console.error('dispatch:', e.message); }
 }
 
 // ─── MESSAGE HANDLER ──────────────────────────────────────────────────────────
 
 async function onMessage(msg, env) {
   const cid  = msg.chat.id;
-  const text = (msg.text||'').trim();
+  const text = (msg.text || '').trim();
   const u    = await getUser(cid, env);
-  const R    = (t, kb) => sendMsg(cid, t, env, { reply_markup: kb });
+  const R    = (t, kboard) => sendMsg(cid, t, env, kboard ? { reply_markup: kboard } : {});
 
-  if (text.startsWith('/start'))    return R(`👋 FTT Signal Bot v3.1\n\nSignals + Auto W/L Tracking\n\nPair: ${disp(u.pair)}  ${u.interval}min  Auto ${u.autoEnabled?'ON':'OFF'}`, mainKb(u));
-  if (text.startsWith('/signal'))   return doSignal(cid, null, env);
-  if (text.startsWith('/scan'))     return doScanAll(cid, null, env);
-  if (text.startsWith('/auto'))     return doToggle(cid, null, env);
-  if (text.startsWith('/status'))   return doStatus(cid, null, env);
-  if (text.startsWith('/history'))  return doHist(cid, null, 0, env);
-  if (text.startsWith('/stats'))    return doStats(cid, null, env);
-  if (text.startsWith('/watchlist'))return doWatchlist(cid, null, env);
-  if (text.startsWith('/today'))    return doToday(cid, null, env);
-  if (text.startsWith('/summary'))  return doSummary(cid, null, env);
+  if (text.startsWith('/start'))
+    return R(`👋 FTT Signal Bot v3.1\n\nSignals + Auto W/L Tracking\n\nPair: ${disp(u.pair)}  ${u.interval}min  Auto ${u.autoEnabled ? 'ON' : 'OFF'}`, mainKb(u));
+  if (text.startsWith('/signal'))    return doSignal(cid, null, env);
+  if (text.startsWith('/scan'))      return doScanAll(cid, null, env);
+  if (text.startsWith('/auto'))      return doToggle(cid, null, env);
+  if (text.startsWith('/status'))    return doStatus(cid, null, env);
+  if (text.startsWith('/history'))   return doHist(cid, null, 0, env);
+  if (text.startsWith('/stats'))     return doStats(cid, null, env);
+  if (text.startsWith('/watchlist')) return doWatchlist(cid, null, env);
+  if (text.startsWith('/today'))     return doToday(cid, null, env);
+  if (text.startsWith('/summary'))   return doSummary(cid, null, env);
   if (text.startsWith('/pair ')) {
-    const raw=text.slice(6).trim().toUpperCase().replace(/[\s/]/g,'');
-    u.pair=raw; await saveUser(cid,u,env);
+    const raw = text.slice(6).trim().toUpperCase().replace(/[\s/]/g, '');
+    u.pair = raw;
+    await saveUser(cid, u, env);
     return R(`✅ Pair set to ${disp(raw)}`, mainKb(u));
   }
   if (text.startsWith('/interval ')) {
-    const m=parseInt(text.slice(10).trim(),10);
-    if ([1,5,15].includes(m)) { u.interval=m; await saveUser(cid,u,env); return R(`✅ Interval: ${m}min`, mainKb(u)); }
+    const m = parseInt(text.slice(10).trim(), 10);
+    if ([1, 5, 15].includes(m)) { u.interval = m; await saveUser(cid, u, env); return R(`✅ Interval: ${m}min`, mainKb(u)); }
     return R('❌ Use: 1, 5, or 15', mainKb(u));
   }
   if (text.startsWith('/help'))
@@ -472,22 +525,19 @@ async function onCb(cb, env) {
   const mid  = cb.message.message_id;
   const data = cb.data;
 
-  // Answer FIRST — before any KV calls
   await answerCb(cb.id, env, '');
 
   const u = await getUser(cid, env);
   const R = (text, kboard) => reply(cid, mid, text, env, kboard);
 
-  // ── Main menu ──
   if (data === 'cmd:main') {
     const h   = await getHist(cid, env);
-    const res = h.filter(x=>x.result==='WIN'||x.result==='LOSS');
-    const wr  = res.length>0?Math.round(res.filter(x=>x.result==='WIN').length/res.length*100):0;
+    const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
+    const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
     const cnt = await getCounter(cid, env);
-    return R(`FTT Signal Bot v3.1\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled?'Auto ON':'Auto OFF'}\nWatchlist: ${u.watchlist.length} pairs  Grade: ${u.gradeFilter||'ALL'}\n\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`, mainKb(u));
+    return R(`FTT Signal Bot v3.1\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nWatchlist: ${u.watchlist.length} pairs  Grade: ${u.gradeFilter || 'ALL'}\n\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`, mainKb(u));
   }
 
-  // ── Actions ──
   if (data === 'cmd:signal')      return doSignal(cid, mid, env);
   if (data === 'cmd:toggle_auto') return doToggle(cid, mid, env);
   if (data === 'cmd:scanall')     return doScanAll(cid, mid, env);
@@ -497,14 +547,12 @@ async function onCb(cb, env) {
   if (data === 'cmd:today')       return doToday(cid, mid, env);
   if (data === 'cmd:summary')     return doSummary(cid, mid, env);
   if (data === 'cmd:settings')    return doSettings(cid, mid, env);
+  if (data.startsWith('cmd:history:')) return doHist(cid, mid, parseInt(data.split(':')[2]) || 0, env);
 
-  if (data.startsWith('cmd:history:')) return doHist(cid, mid, parseInt(data.split(':')[2])||0, env);
-
-  // ── Settings ──
-  if (data === 'cmd:intervals')      return R('⏱ Select Interval:', intervalKb());
-  if (data === 'cmd:gradefilter')    return R('🎯 Grade Filter:', gradeKb());
-  if (data === 'cmd:conffilter')     return R('📊 Min Confidence:', confKb());
-  if (data === 'cmd:summarytime')    return R('🕐 Daily Summary Time (UTC):', summTimeKb());
+  if (data === 'cmd:intervals')   return R('⏱ Select Interval:', intervalKb());
+  if (data === 'cmd:gradefilter') return R('🎯 Grade Filter:', gradeKb());
+  if (data === 'cmd:conffilter')  return R('📊 Min Confidence:', confKb());
+  if (data === 'cmd:summarytime') return R('🕐 Daily Summary Time (UTC):', summTimeKb());
   if (data === 'cmd:togglesummary') {
     u.dailySummary = !u.dailySummary;
     await saveUser(cid, u, env);
@@ -533,7 +581,6 @@ async function onCb(cb, env) {
     return doSettings(cid, mid, env);
   }
 
-  // ── Pair selection ──
   if (data.startsWith('pairpage:')) {
     const page = parseInt(data.split(':')[1], 10);
     return R('💱 Select default pair:', pairsKb(page));
@@ -544,7 +591,6 @@ async function onCb(cb, env) {
     return doSettings(cid, mid, env);
   }
 
-  // ── Watchlist ──
   if (data.startsWith('wlpage:')) {
     const page = parseInt(data.split(':')[1], 10);
     return R(`👁 Add to Watchlist (${u.watchlist.length}/${MAX_WL}):`, wlAddKb(page, u.watchlist));
@@ -555,7 +601,6 @@ async function onCb(cb, env) {
     await saveUser(cid, u, env);
     return doWatchlist(cid, mid, env);
   }
-  // FIX 3: use parts[] instead of destructuring to avoid colon-in-pair issues
   if (data.startsWith('wl:addpage:')) {
     const parts = data.split(':');
     const pair  = parts[2];
@@ -575,13 +620,11 @@ async function onCb(cb, env) {
     return R(`👁 Add to Watchlist (${u.watchlist.length}/${MAX_WL}):`, wlAddKb(page, u.watchlist));
   }
 
-  // ── Quick signal ──
   if (data.startsWith('qs:')) return doQuickSignal(cid, mid, data.slice(3), env);
 }
 
 // ─── ACTION FUNCTIONS ─────────────────────────────────────────────────────────
 
-// FIX 2: loading msg edit করো, result আলাদা sendMsg দিয়ে
 async function doSignal(cid, mid, env) {
   const u = await getUser(cid, env);
   if (mid) await editMsg(cid, mid, `⏳ Fetching ${disp(u.pair)}...`, env, {});
@@ -591,14 +634,13 @@ async function doSignal(cid, mid, env) {
     const sig  = data.signal;
     const dir  = sig?.finalSignal;
     let no = null;
-    if (dir==='BUY'||dir==='SELL') no = await logAndSchedule(cid, u.pair, sig, env);
+    if (dir === 'BUY' || dir === 'SELL') no = await logAndSchedule(cid, u.pair, sig, env);
     await sendMsg(cid, fmtSignal(data, u.pair, u.interval, no), env, { reply_markup: afterKb() });
-  } catch(e) {
-    await sendMsg(cid, `❌ Signal fetch failed\n${e.message.slice(0,200)}`, env, { reply_markup: mainKb(u) });
+  } catch (e) {
+    await sendMsg(cid, `❌ Signal fetch failed\n${e.message.slice(0, 200)}`, env, { reply_markup: mainKb(u) });
   }
 }
 
-// FIX 5: doQuickSignal একই loading fix
 async function doQuickSignal(cid, mid, pair, env) {
   const u = await getUser(cid, env);
   if (mid) await editMsg(cid, mid, `⏳ Fetching ${disp(pair)}...`, env, {});
@@ -608,31 +650,37 @@ async function doQuickSignal(cid, mid, pair, env) {
     const sig  = data.signal;
     const dir  = sig?.finalSignal;
     let no = null;
-    if (dir==='BUY'||dir==='SELL') no = await logAndSchedule(cid, pair, sig, env);
+    if (dir === 'BUY' || dir === 'SELL') no = await logAndSchedule(cid, pair, sig, env);
     await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: afterKb() });
-  } catch(e) {
-    await sendMsg(cid, `❌ Failed: ${e.message.slice(0,150)}`, env, { reply_markup: mainKb(u) });
+  } catch (e) {
+    await sendMsg(cid, `❌ Failed: ${e.message.slice(0, 150)}`, env, { reply_markup: mainKb(u) });
   }
 }
 
+// FIX 3: doScanAll loading — null markup fix
 async function doScanAll(cid, mid, env) {
   const u    = await getUser(cid, env);
-  const list = [u.pair, ...u.watchlist].filter((p,i,a)=>a.indexOf(p)===i);
-  await reply(cid, mid, `🔍 Scanning ${list.length} pairs...`, env, null);
+  const list = [u.pair, ...u.watchlist].filter((p, i, a) => a.indexOf(p) === i);
+  if (mid) await editMsg(cid, mid, `🔍 Scanning ${list.length} pairs...`, env, {});
+  else     await sendMsg(cid, `🔍 Scanning ${list.length} pairs...`, env, {});
   let found = 0;
   for (const pair of list) {
     try {
       const data = await fetchSig(pair, env);
       const sig  = data.signal;
       const dir  = sig?.finalSignal;
-      if ((dir==='BUY'||dir==='SELL') && passGrade(sig, u.gradeFilter) && passConf(sig, u.minConfidence)) {
+      if ((dir === 'BUY' || dir === 'SELL') && passGrade(sig, u.gradeFilter) && passConf(sig, u.minConfidence)) {
         const no = await logAndSchedule(cid, pair, sig, env);
         await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: afterKb() });
         found++;
       }
-    } catch(e) { console.error(`scan ${pair}:`, e.message); }
+    } catch (e) { console.error(`scan ${pair}:`, e.message); }
   }
-  await sendMsg(cid, found>0 ? `✅ ${found} signal(s) found across ${list.length} pairs` : `⚪ No signals across ${list.length} pairs`, env, { reply_markup: mainKb(u) });
+  await sendMsg(cid,
+    found > 0
+      ? `✅ ${found} signal(s) found across ${list.length} pairs`
+      : `⚪ No signals across ${list.length} pairs`,
+    env, { reply_markup: mainKb(u) });
 }
 
 async function doToggle(cid, mid, env) {
@@ -644,22 +692,22 @@ async function doToggle(cid, mid, env) {
   else               await removeAutoUser(cid, env);
   const wl = u.watchlist.map(disp).join(', ');
   const t  = u.autoEnabled
-    ? `🔄 Auto Scan ON\n\n${disp(u.pair)}${wl?'\nWatchlist: '+wl:''}\nInterval: ${u.interval}min  Grade: ${u.gradeFilter||'ALL'}`
+    ? `🔄 Auto Scan ON\n\n${disp(u.pair)}${wl ? '\nWatchlist: ' + wl : ''}\nInterval: ${u.interval}min  Grade: ${u.gradeFilter || 'ALL'}`
     : `🔕 Auto Scan OFF`;
   return reply(cid, mid, t, env, mainKb(u));
 }
 
 async function doSettings(cid, mid, env) {
   const u = await getUser(cid, env);
-  const t = `⚙️ Settings\n\nPair: ${disp(u.pair)}\nInterval: ${u.interval}min\nGrade: ${u.gradeFilter||'ALL'}\nMin Conf: ${u.minConfidence||0}%\nDaily Summary: ${u.dailySummary?`ON (${u.summaryHour??20}:00 UTC)`:'OFF'}`;
+  const t = `⚙️ Settings\n\nPair: ${disp(u.pair)}\nInterval: ${u.interval}min\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nDaily Summary: ${u.dailySummary ? `ON (${u.summaryHour ?? 20}:00 UTC)` : 'OFF'}`;
   return reply(cid, mid, t, env, settingsKb(u));
 }
 
 async function doStatus(cid, mid, env) {
   const u   = await getUser(cid, env);
   const cnt = await getCounter(cid, env);
-  const t   = `📋 Status\n\nPair: ${disp(u.pair)}\nWatchlist: ${u.watchlist.map(disp).join(', ')||'None'}\nInterval: ${u.interval}min\nAuto: ${u.autoEnabled?'ON':'OFF'}\nGrade: ${u.gradeFilter||'ALL'}\nMin Conf: ${u.minConfidence||0}%\nSummary: ${u.dailySummary?'ON':'OFF'}\nTotal Signals: ${cnt}`;
-  return reply(cid, mid, t, env, kb([[btn('⚙️ Settings','cmd:settings'), btn('🔙 Back','cmd:main')]]));
+  const t   = `📋 Status\n\nPair: ${disp(u.pair)}\nWatchlist: ${u.watchlist.map(disp).join(', ') || 'None'}\nInterval: ${u.interval}min\nAuto: ${u.autoEnabled ? 'ON' : 'OFF'}\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nSummary: ${u.dailySummary ? 'ON' : 'OFF'}\nTotal Signals: ${cnt}`;
+  return reply(cid, mid, t, env, kb([[btn('⚙️ Settings', 'cmd:settings'), btn('🔙 Back', 'cmd:main')]]));
 }
 
 async function doHist(cid, mid, page, env) {
@@ -669,63 +717,76 @@ async function doHist(cid, mid, page, env) {
 
 async function doStats(cid, mid, env) {
   const h = await getHist(cid, env);
-  return reply(cid, mid, fmtStats(h), env, kb([[btn('📈 History','cmd:history:0'), btn('🔙 Back','cmd:main')]]));
+  return reply(cid, mid, fmtStats(h), env, kb([[btn('📈 History', 'cmd:history:0'), btn('🔙 Back', 'cmd:main')]]));
 }
 
 async function doWatchlist(cid, mid, env) {
   const u  = await getUser(cid, env);
   const wl = u.watchlist;
-  const t  = `👁 Watchlist (${wl.length}/${MAX_WL})\n\n${wl.length?wl.map(disp).join(', '):'Empty'}\n\n📊 = Quick signal  ❌ = Remove`;
+  const t  = `👁 Watchlist (${wl.length}/${MAX_WL})\n\n${wl.length ? wl.map(disp).join(', ') : 'Empty'}\n\n📊 = Quick signal  ❌ = Remove`;
   return reply(cid, mid, t, env, wlKb(wl));
 }
 
 async function doToday(cid, mid, env) {
   const h     = await getHist(cid, env);
-  const today = new Date().toISOString().slice(0,10);
+  const today = new Date().toISOString().slice(0, 10);
   const th    = h.filter(x => x.timestamp?.startsWith(today));
-  if (!th.length) return reply(cid, mid, `📅 Today (${today})\n\nNo signals yet.`, env, kb([[btn('🔙 Back','cmd:main')]]));
-  const res   = th.filter(x=>x.result==='WIN'||x.result==='LOSS');
-  const wins  = res.filter(x=>x.result==='WIN').length;
-  const wr    = res.length>0?Math.round(wins/res.length*100):0;
+  if (!th.length)
+    return reply(cid, mid, `📅 Today (${today})\n\nNo signals yet.`, env, kb([[btn('🔙 Back', 'cmd:main')]]));
+  const res  = th.filter(x => x.result === 'WIN' || x.result === 'LOSS');
+  const wins = res.filter(x => x.result === 'WIN').length;
+  const wr   = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
   let t = `📅 Today — ${today}\n━━━━━━━━━━━━━━\n`;
-  t += `📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length-wins}L\n📈 Win Rate: ${wr}%\n\n`;
-  for (const x of th.slice(0,8)) {
-    const dE=x.direction==='BUY'?'🟢':'🔴', rE=x.result==='WIN'?'✅':x.result==='LOSS'?'❌':'⏳';
-    const g=x.grade?` ${x.grade.split(' ')[0]}`:'';
+  t += `📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n\n`;
+  for (const x of th.slice(0, 8)) {
+    const dE = x.direction === 'BUY' ? '🟢' : '🔴';
+    const rE = x.result === 'WIN' ? '✅' : x.result === 'LOSS' ? '❌' : '⏳';
+    const g  = x.grade ? ` ${x.grade.split(' ')[0]}` : '';
     t += `${rE} #${x.no} ${dE} ${disp(x.pair)}${g} ${x.confidence}\n`;
   }
-  return reply(cid, mid, t, env, kb([[btn('📈 History','cmd:history:0'), btn('🔙 Back','cmd:main')]]));
+  return reply(cid, mid, t, env, kb([[btn('📈 History', 'cmd:history:0'), btn('🔙 Back', 'cmd:main')]]));
 }
 
 async function doSummary(cid, mid, env) {
   const h     = await getHist(cid, env);
-  const today = new Date().toISOString().slice(0,10);
+  const today = new Date().toISOString().slice(0, 10);
   const th    = h.filter(x => x.timestamp?.startsWith(today));
-  if (!th.length) return reply(cid, mid, `No signals today yet.`, env, kb([[btn('🔙 Back','cmd:main')]]));
-  const res   = th.filter(x=>x.result==='WIN'||x.result==='LOSS');
-  const wins  = res.filter(x=>x.result==='WIN').length;
-  const wr    = res.length>0?Math.round(wins/res.length*100):0;
-  const allR  = h.filter(x=>x.result==='WIN'||x.result==='LOSS');
-  const allWR = allR.length>0?Math.round(allR.filter(x=>x.result==='WIN').length/allR.length*100):0;
-  const trend = wr>allWR?'📈 Above avg':wr<allWR?'📉 Below avg':'➡️ On avg';
-  const gm={};
-  for (const x of res) { const g=(x.grade||'?').split(' ')[0]; if(!gm[g])gm[g]={w:0,l:0}; x.result==='WIN'?gm[g].w++:gm[g].l++; }
+  if (!th.length)
+    return reply(cid, mid, `No signals today yet.`, env, kb([[btn('🔙 Back', 'cmd:main')]]));
+  const res   = th.filter(x => x.result === 'WIN' || x.result === 'LOSS');
+  const wins  = res.filter(x => x.result === 'WIN').length;
+  const wr    = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
+  const allR  = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
+  const allWR = allR.length > 0 ? Math.round(allR.filter(x => x.result === 'WIN').length / allR.length * 100) : 0;
+  const trend = wr > allWR ? '📈 Above avg' : wr < allWR ? '📉 Below avg' : '➡️ On avg';
+  const gm = {};
+  for (const x of res) {
+    const g = (x.grade || '?').split(' ')[0];
+    if (!gm[g]) gm[g] = { w:0, l:0 };
+    x.result === 'WIN' ? gm[g].w++ : gm[g].l++;
+  }
   let t = `📅 Daily Summary — ${today}\n━━━━━━━━━━━━━━\n`;
-  t += `📊 ${th.length} signals  Resolved: ${res.length}\n✅ ${wins}W  ❌ ${res.length-wins}L\n📈 Win Rate: ${wr}%\n`;
-  if (Object.keys(gm).length) { t+=`\nGrades:\n`; for(const[g,s]of Object.entries(gm)){const tt=s.w+s.l;t+=`  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w/tt*100)}%)\n`;} }
+  t += `📊 ${th.length} signals  Resolved: ${res.length}\n✅ ${wins}W  ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n`;
+  if (Object.keys(gm).length) {
+    t += `\nGrades:\n`;
+    for (const [g, s] of Object.entries(gm)) {
+      const tt = s.w + s.l;
+      t += `  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w / tt * 100)}%)\n`;
+    }
+  }
   t += `\n${trend} (all-time: ${allWR}%)`;
-  return reply(cid, mid, t, env, kb([[btn('📈 History','cmd:history:0'), btn('🏆 Stats','cmd:stats')]]));
+  return reply(cid, mid, t, env, kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')]]));
 }
 
 // ─── SIGNAL FETCH ─────────────────────────────────────────────────────────────
 
 async function fetchSig(pair, env) {
-  const req = new Request(`https://signal/api/signal?pair=${pair}`, { headers: { Accept:'application/json' } });
+  const req = new Request(`https://signal/api/signal?pair=${pair}`, { headers: { Accept: 'application/json' } });
   const res = env.SIGNAL_WORKER
     ? await env.SIGNAL_WORKER.fetch(req)
     : await fetch(`https://my-worker-601.umuhammadiswa.workers.dev/api/signal?pair=${pair}`,
-        { headers:{Accept:'application/json'}, signal:AbortSignal.timeout(20000) });
-  if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text().catch(()=>'')).slice(0,150)}`);
+        { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text().catch(() => '')).slice(0, 150)}`);
   return res.json();
 }
 
@@ -740,18 +801,17 @@ async function fetchPrice(pair, env) {
 
 // ─── CRON ─────────────────────────────────────────────────────────────────────
 
-async function cron(env, logs=[], force=false) {
+async function cron(env, logs = [], force = false) {
   const log = m => { console.log(m); logs.push(String(m)); };
   log(`Cron ${new Date().toISOString()}`);
   if (!env?.BOT_TOKEN) { log('ERROR: BOT_TOKEN missing'); return; }
   if (!env?.BOT_KV)    { log('ERROR: BOT_KV missing');    return; }
-  await autoScan(env, log).catch(e => log('ScanErr: '+e.message));
-  await resultCheck(env, log).catch(e => log('ResultErr: '+e.message));
-  await dailySummary(env, log).catch(e => log('SummaryErr: '+e.message));
+  await autoScan(env, log).catch(e => log('ScanErr: ' + e.message));
+  await resultCheck(env, log).catch(e => log('ResultErr: ' + e.message));
+  await dailySummary(env, log).catch(e => log('SummaryErr: ' + e.message));
   log('Done');
 }
 
-// FIX 7: noTradeStreak — scan শেষে সব pair মিলিয়ে একবার update
 async function autoScan(env, log) {
   const users = await getAutoUsers(env);
   log(`Scan: ${users.length} users`);
@@ -759,7 +819,7 @@ async function autoScan(env, log) {
     try {
       const u = await getUser(cid, env);
       if (!u.autoEnabled) continue;
-      const list = [u.pair, ...u.watchlist].filter((p,i,a)=>a.indexOf(p)===i);
+      const list = [u.pair, ...u.watchlist].filter((p, i, a) => a.indexOf(p) === i);
       let anySignalSent = false;
 
       for (const pair of list) {
@@ -767,24 +827,23 @@ async function autoScan(env, log) {
           const data = await fetchSig(pair, env);
           const sig  = data.signal;
           const dir  = sig?.finalSignal;
-          if (dir==='BUY'||dir==='SELL') {
+          if (dir === 'BUY' || dir === 'SELL') {
             if (!passGrade(sig, u.gradeFilter) || !passConf(sig, u.minConfidence)) { log(`Filtered ${pair}`); continue; }
             const lock = await getLock(cid, pair, env);
-            if (lock?.direction===dir && lock?.expiryAt>Date.now()) { log(`Locked ${pair}`); continue; }
+            if (lock?.direction === dir && lock?.expiryAt > Date.now()) { log(`Locked ${pair}`); continue; }
             const no = await logAndSchedule(cid, pair, sig, env);
             await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: afterKb() });
             log(`Sent #${no} ${pair} ${dir}`);
             anySignalSent = true;
           }
-        } catch(e) { log(`Pair ${pair}: ${e.message}`); }
+        } catch (e) { log(`Pair ${pair}: ${e.message}`); }
       }
 
-      // streak: সব pair scan শেষে একবার update — একটা pair এর জন্য নয়
       if (!anySignalSent) {
-        u.noTradeStreak = (u.noTradeStreak||0) + 1;
+        u.noTradeStreak = (u.noTradeStreak || 0) + 1;
         if (u.noTradeStreak >= 12) {
           await sendMsg(cid, `⚪ No setup for ${u.noTradeStreak} scans across ${list.length} pair(s).`, env,
-            { reply_markup: kb([[btn('🔕 Stop Auto','cmd:toggle_auto')]]) });
+            { reply_markup: kb([[btn('🔕 Stop Auto', 'cmd:toggle_auto')]]) });
           u.noTradeStreak = 0;
         }
       } else {
@@ -792,7 +851,7 @@ async function autoScan(env, log) {
       }
 
       await saveUser(cid, u, env);
-    } catch(e) { log(`User ${cid}: ${e.message}`); }
+    } catch (e) { log(`User ${cid}: ${e.message}`); }
   }
 }
 
@@ -800,7 +859,7 @@ async function resultCheck(env, log) {
   const ids = await getPendingIds(env);
   if (!ids.length) return;
   log(`Results: ${ids.length} pending`);
-  const now=Date.now(), keep=[];
+  const now = Date.now(), keep = [];
   for (const tid of ids) {
     try {
       const t = await kget(`pt:${tid}`, env);
@@ -810,24 +869,30 @@ async function resultCheck(env, log) {
       if (!cur || !t.entryPrice) {
         await setResult(t.chatId, tid, 'SKIP', null, null, env);
         await clearLock(t.chatId, t.pair, env);
-        await sendMsg(t.chatId, `⏭ Tracking No. ${t.signalNo||tid} — price unavailable`, env, { reply_markup: afterKb() });
+        await sendMsg(t.chatId, `⏭ Tracking No. ${t.signalNo || tid} — price unavailable`, env, { reply_markup: afterKb() });
         continue;
       }
-      const entry=parseFloat(t.entryPrice), current=parseFloat(cur), diff=current-entry;
-      const result = t.direction==='BUY' ? (diff>0?'WIN':'LOSS') : (diff<0?'WIN':'LOSS');
-      const pips   = isCr(t.pair) ? Math.round(Math.abs(diff)*100)/100 : Math.round(Math.abs(diff)*10000*10)/10;
-      const unit   = isCr(t.pair) ? '$' : ' pips';
+      const entry   = parseFloat(t.entryPrice);
+      const current = parseFloat(cur);
+      const diff    = current - entry;
+      const result  = t.direction === 'BUY' ? (diff > 0 ? 'WIN' : 'LOSS') : (diff < 0 ? 'WIN' : 'LOSS');
+      // FIX 2: Crypto .toFixed(2), Forex pips
+      const pips    = isCr(t.pair)
+        ? Math.round(Math.abs(diff) * 100) / 100
+        : Math.round(Math.abs(diff) * 10000 * 10) / 10;
+      const unit    = isCr(t.pair) ? '$' : ' pips';
       await setResult(t.chatId, tid, result, current, pips, env);
       await clearLock(t.chatId, t.pair, env);
-      const late  = Math.round((now-t.expiryAt)/60000);
-      const lateS = late>1 ? ` (+${late}min)` : '';
-      const dE    = t.direction==='BUY'?'🟢':'🔴', rE=result==='WIN'?'✅ WIN':'❌ LOSS';
+      const late  = Math.round((now - t.expiryAt) / 60000);
+      const lateS = late > 1 ? ` (+${late}min)` : '';
+      const dE    = t.direction === 'BUY' ? '🟢' : '🔴';
+      const rE    = result === 'WIN' ? '✅ WIN' : '❌ LOSS';
       const gS    = t.grade ? `  ${t.grade}` : '';
       await sendMsg(t.chatId,
-        `📊 Tracking No. ${t.signalNo||tid}${lateS}\n━━━━━━━━━━━━━━\n${rE}  ${dE} ${t.direction} ${disp(t.pair)}${gS}\n💰 Entry:  ${entry.toFixed(5)}\n🏁 Exit:   ${current.toFixed(5)}\n📏 Move:   ${diff>0?'+':''}${pips}${unit}`,
+        `📊 Tracking No. ${t.signalNo || tid}${lateS}\n━━━━━━━━━━━━━━\n${rE}  ${dE} ${t.direction} ${disp(t.pair)}${gS}\n💰 Entry:  ${fmtPrice(entry, t.pair)}\n🏁 Exit:   ${fmtPrice(current, t.pair)}\n📏 Move:   ${diff > 0 ? '+' : ''}${pips}${unit}`,
         env, { reply_markup: afterKb() });
       await checkMilestone(t.chatId, env);
-    } catch(e) { log(`Result ${tid}: ${e.message}`); keep.push(tid); }
+    } catch (e) { log(`Result ${tid}: ${e.message}`); keep.push(tid); }
   }
   await savePendingIds(keep, env);
 }
@@ -839,21 +904,21 @@ async function dailySummary(env, log) {
   for (const cid of users) {
     try {
       const u = await getUser(cid, env);
-      if (!u.dailySummary || hour !== (u.summaryHour??20)) continue;
+      if (!u.dailySummary || hour !== (u.summaryHour ?? 20)) continue;
       const last = (await kget(`ds:${cid}`, env)) || 0;
-      if (Date.now()-last < 55*60*1000) continue;
+      if (Date.now() - last < 55 * 60 * 1000) continue;
       const h     = await getHist(cid, env);
-      const today = new Date().toISOString().slice(0,10);
-      const th    = h.filter(x=>x.timestamp?.startsWith(today));
+      const today = new Date().toISOString().slice(0, 10);
+      const th    = h.filter(x => x.timestamp?.startsWith(today));
       if (!th.length) continue;
-      const res   = th.filter(x=>x.result==='WIN'||x.result==='LOSS');
-      const wins  = res.filter(x=>x.result==='WIN').length;
-      const wr    = res.length>0?Math.round(wins/res.length*100):0;
-      let t = `📅 Daily Summary — ${today}\n━━━━━━━━━━━━━━\n📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length-wins}L\n📈 Win Rate: ${wr}%\n⏳ Pending: ${th.filter(x=>!x.result).length}`;
-      await sendMsg(cid, t, env, { reply_markup: kb([[btn('📈 History','cmd:history:0'), btn('🏆 Stats','cmd:stats')]]) });
+      const res  = th.filter(x => x.result === 'WIN' || x.result === 'LOSS');
+      const wins = res.filter(x => x.result === 'WIN').length;
+      const wr   = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
+      const t    = `📅 Daily Summary — ${today}\n━━━━━━━━━━━━━━\n📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n⏳ Pending: ${th.filter(x => !x.result).length}`;
+      await sendMsg(cid, t, env, { reply_markup: kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')]]) });
       await kput(`ds:${cid}`, Date.now(), env);
       log(`Summary sent to ${cid}`);
-    } catch(e) { log(`Summary ${cid}: ${e.message}`); }
+    } catch (e) { log(`Summary ${cid}: ${e.message}`); }
   }
 }
 
@@ -862,25 +927,39 @@ async function checkMilestone(cid, env) {
     const mk  = `ms:${cid}`;
     const ms  = (await kget(mk, env)) || { lastCount: 0 };
     const h   = await getHist(cid, env);
-    const res = h.filter(x=>x.result==='WIN'||x.result==='LOSS');
+    const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
     const cnt = await getCounter(cid, env);
-    const since = res.length - ms.lastCount;
+
+    // FIX 4: negative since guard
+    const since = Math.max(0, res.length - ms.lastCount);
     if (since < MILESTONE) return;
+
     const batch = res.slice(0, since);
-    const wins  = batch.filter(x=>x.result==='WIN').length;
-    const wr    = Math.round(wins/batch.length*100);
-    const gm={}, pm={};
-    for(const x of batch){
-      const g=(x.grade||'?').split(' ')[0]; if(!gm[g])gm[g]={w:0,l:0}; x.result==='WIN'?gm[g].w++:gm[g].l++;
-      if(!pm[x.pair])pm[x.pair]={w:0,l:0}; x.result==='WIN'?pm[x.pair].w++:pm[x.pair].l++;
+    const wins  = batch.filter(x => x.result === 'WIN').length;
+    const wr    = Math.round(wins / batch.length * 100);
+    const gm = {}, pm = {};
+    for (const x of batch) {
+      const g = (x.grade || '?').split(' ')[0];
+      if (!gm[g]) gm[g] = { w:0, l:0 };
+      x.result === 'WIN' ? gm[g].w++ : gm[g].l++;
+      if (!pm[x.pair]) pm[x.pair] = { w:0, l:0 };
+      x.result === 'WIN' ? pm[x.pair].w++ : pm[x.pair].l++;
     }
-    let t = `🏁 ${MILESTONE}-Signal Report (#${batch[batch.length-1]?.no||'?'} to #${batch[0]?.no||'?'})\n━━━━━━━━━━━━━━\n✅ ${wins}W  ❌ ${batch.length-wins}L\n📊 Win Rate: ${wr}%\n\nGrades:\n`;
-    for(const[g,s]of Object.entries(gm)){const tt=s.w+s.l;t+=`  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w/tt*100)}%)\n`;}
-    t+=`\nTop Pairs:\n`;
-    Object.entries(pm).sort((a,b)=>(b[1].w+b[1].l)-(a[1].w+a[1].l)).slice(0,4)
-      .forEach(([p,s])=>{const tt=s.w+s.l;t+=`  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w/tt*100)}%)\n`;});
-    t+=`\n🔄 Next ${MILESTONE} signals tracking starts now.`;
-    await sendMsg(cid, t, env, { reply_markup: kb([[btn('📈 History','cmd:history:0'), btn('🏆 Stats','cmd:stats')]]) });
+    let t = `🏁 ${MILESTONE}-Signal Report (#${batch[batch.length-1]?.no || '?'} to #${batch[0]?.no || '?'})\n━━━━━━━━━━━━━━\n✅ ${wins}W  ❌ ${batch.length - wins}L\n📊 Win Rate: ${wr}%\n\nGrades:\n`;
+    for (const [g, s] of Object.entries(gm)) {
+      const tt = s.w + s.l;
+      t += `  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w / tt * 100)}%)\n`;
+    }
+    t += `\nTop Pairs:\n`;
+    Object.entries(pm)
+      .sort((a, b) => (b[1].w + b[1].l) - (a[1].w + a[1].l))
+      .slice(0, 4)
+      .forEach(([p, s]) => {
+        const tt = s.w + s.l;
+        t += `  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w / tt * 100)}%)\n`;
+      });
+    t += `\n🔄 Next ${MILESTONE} signals tracking starts now.`;
+    await sendMsg(cid, t, env, { reply_markup: kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')]]) });
     await kput(mk, { lastCount: res.length }, env);
-  } catch(e) { console.error('milestone:', e.message); }
+  } catch (e) { console.error('milestone:', e.message); }
 }
