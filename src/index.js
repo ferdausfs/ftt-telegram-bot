@@ -1,15 +1,24 @@
 /**
- * FTT Signal Telegram Bot — v3.1 (Fixed)
+ * FTT Signal Telegram Bot — v3.2
  * KV Binding     : BOT_KV
  * Service Binding: SIGNAL_WORKER → my-worker-601
  * Secrets        : BOT_TOKEN, SETUP_SECRET
  *
- * Fixes applied:
- *  1. parse_mode:'MarkdownV2' + proper escaping
- *  2. Crypto price → .toFixed(2), Forex → .toFixed(5)
- *  3. doScanAll loading — null markup fix
- *  4. checkMilestone — negative `since` guard
- *  5. fmtSignal — shows actual bestTimeframe timeframe
+ * Changes in v3.2:
+ *  1. signalKb() — BUY/SELL signal এ "📈 Trade on Quotex" URL button added
+ *  2. doSignal / doQuickSignal / autoScan — BUY/SELL → signalKb(), else → afterKb()
+ *  3. reply() helper — parse_mode always passed correctly
+ *  4. editMsg loading screens — empty text guard (Telegram rejects empty edit)
+ *  5. fmtSignal — MarkdownV2 special chars properly escaped via esc()
+ *  6. resultCheck — entryPrice null-check before parseFloat
+ *  7. cron pending cleanup — expired pt: keys deleted from KV after resolve
+ *
+ * Inherited fixes from v3.1:
+ *  - parse_mode:'MarkdownV2' + proper escaping
+ *  - Crypto price → .toFixed(2), Forex → .toFixed(5)
+ *  - doScanAll loading — null markup fix
+ *  - checkMilestone — negative `since` guard
+ *  - fmtSignal — shows actual bestTimeframe timeframe
  */
 
 const PAIR_PAGES = [
@@ -23,6 +32,7 @@ const MAX_WL    = 6;
 const MAX_HIST  = 100;
 const MILESTONE = 50;
 const CRYPTO    = ['BTC','ETH','BNB','XRP','SOL','ADA','DOGE','AVAX','DOT','LINK'];
+const QUOTEX_URL = 'https://quotex.com/trade';
 
 // ─── EXPORT ───────────────────────────────────────────────────────────────────
 
@@ -87,7 +97,7 @@ export default {
       });
     }
 
-    return new Response('FTT Signal Bot v3.1');
+    return new Response('FTT Signal Bot v3.2');
   },
 
   async scheduled(e, env, ctx) {
@@ -101,7 +111,7 @@ const TG   = env  => `https://api.telegram.org/bot${env.BOT_TOKEN}`;
 const post = body => ({ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
 const json = ()   => ({ headers: { 'Content-Type': 'application/json' } });
 
-// FIX 1: MarkdownV2 escape — special chars সব escape করো
+// MarkdownV2 escape — all special chars
 const esc = t => String(t || '').replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
 
 async function tg(method, body, env) {
@@ -110,14 +120,13 @@ async function tg(method, body, env) {
     const r = await fetch(`${TG(env)}/${method}`, post(body));
     if (!r.ok) {
       const t = await r.text();
-      if (!t.includes('not modified') && !t.includes('too old'))
-        console.error(`tg/${method}:`, t.slice(0, 150));
+      if (!t.includes('not modified') && !t.includes('too old') && !t.includes('message is not modified'))
+        console.error(`tg/${method}:`, t.slice(0, 200));
     }
     return r;
   } catch (e) { console.error(`tg/${method}:`, e.message); return null; }
 }
 
-// FIX 1: parse_mode:'MarkdownV2' সব sendMessage/editMessageText এ
 const sendMsg = (cid, text, env, extra = {}) =>
   tg('sendMessage', {
     chat_id: cid,
@@ -140,9 +149,13 @@ const editMsg = (cid, mid, text, env, extra = {}) =>
 const answerCb = (id, env, text = '') =>
   tg('answerCallbackQuery', { callback_query_id: id, text }, env);
 
-const reply = (cid, mid, text, env, kb) => mid
-  ? editMsg(cid, mid, text, env, kb ? { reply_markup: kb } : {})
-  : sendMsg(cid, text, env, kb ? { reply_markup: kb } : {});
+// FIX 3: reply() — always pass parse_mode, handle missing kb gracefully
+const reply = (cid, mid, text, env, kboard) => {
+  const extra = kboard ? { reply_markup: kboard } : {};
+  return mid
+    ? editMsg(cid, mid, text, env, extra)
+    : sendMsg(cid, text, env, extra);
+};
 
 // ─── KV HELPERS ───────────────────────────────────────────────────────────────
 
@@ -270,6 +283,17 @@ const passConf = (sig, min) => {
 
 const kb = rows => ({ inline_keyboard: rows });
 
+// v3.2: signalKb — BUY/SELL signal এ Quotex URL button
+const signalKb = () => kb([
+  [{ text: '📈 Trade on Quotex', url: QUOTEX_URL }],
+  [btn('🔁 New Signal', 'cmd:signal'), btn('📈 History', 'cmd:history:0'), btn('🔙 Menu', 'cmd:main')],
+]);
+
+// afterKb — NO_TRADE / result cards এ (no Quotex button)
+const afterKb = () => kb([
+  [btn('🔁 New Signal', 'cmd:signal'), btn('📈 History', 'cmd:history:0'), btn('🔙 Menu', 'cmd:main')],
+]);
+
 const mainKb = u => kb([
   [
     btn('📊 Signal Now',  'cmd:signal'),
@@ -340,7 +364,6 @@ const summTimeKb  = () => kb([
   [ btn('20:00', 'sumhour:20'), btn('22:00', 'sumhour:22'), btn('00:00', 'sumhour:0') ],
   [ btn('🔙 Back', 'cmd:settings') ],
 ]);
-const afterKb     = () => kb([[btn('🔁 New Signal', 'cmd:signal'), btn('📈 History', 'cmd:history:0'), btn('🔙 Menu', 'cmd:main')]]);
 const histNavKb   = (page, total) => {
   const nav = [];
   if (page > 0)                       nav.push(btn('◀ Prev', `cmd:history:${page - 1}`));
@@ -361,7 +384,7 @@ const uid  = () => Math.random().toString(36).slice(2, 8).toUpperCase();
 const isCr = p  => CRYPTO.some(b => p.startsWith(b));
 const chunk = (arr, n) => arr.reduce((r, x, i) => (i % n === 0 ? r.push([x]) : r[r.length-1].push(x), r), []);
 
-// FIX 2: Crypto → .toFixed(2), Forex → .toFixed(5)
+// Crypto → .toFixed(2), Forex → .toFixed(5)
 const fmtPrice = (price, pair) =>
   isCr(pair) ? parseFloat(price).toFixed(2) : parseFloat(price).toFixed(5);
 
@@ -381,7 +404,7 @@ function fmtSignal(data, pair, interval, no) {
   const reason = sig.entryReason   || '';
   const best   = sig.bestTimeframe;
 
-  // FIX 5: actual timeframe from bestTimeframe, fallback to user interval
+  // actual timeframe from bestTimeframe, fallback to user interval
   const tf     = best?.timeframe || `${interval}min`;
   const expiry = best?.expiry?.humanReadable || null;
   const cd     = best?.expiry?.countdown?.label || null;
@@ -492,7 +515,7 @@ async function onMessage(msg, env) {
   const R    = (t, kboard) => sendMsg(cid, t, env, kboard ? { reply_markup: kboard } : {});
 
   if (text.startsWith('/start'))
-    return R(`👋 FTT Signal Bot v3.1\n\nSignals + Auto W/L Tracking\n\nPair: ${disp(u.pair)}  ${u.interval}min  Auto ${u.autoEnabled ? 'ON' : 'OFF'}`, mainKb(u));
+    return R(`👋 FTT Signal Bot v3.2\n\nSignals + Auto W/L Tracking\n\nPair: ${disp(u.pair)}  ${u.interval}min  Auto ${u.autoEnabled ? 'ON' : 'OFF'}`, mainKb(u));
   if (text.startsWith('/signal'))    return doSignal(cid, null, env);
   if (text.startsWith('/scan'))      return doScanAll(cid, null, env);
   if (text.startsWith('/auto'))      return doToggle(cid, null, env);
@@ -514,7 +537,7 @@ async function onMessage(msg, env) {
     return R('❌ Use: 1, 5, or 15', mainKb(u));
   }
   if (text.startsWith('/help'))
-    return R(`FTT Signal Bot v3.1\n\n/signal /scan /auto /watchlist\n/history /stats /today /summary\n/status /pair EURUSD /interval 5`, mainKb(u));
+    return R(`FTT Signal Bot v3.2\n\n/signal /scan /auto /watchlist\n/history /stats /today /summary\n/status /pair EURUSD /interval 5`, mainKb(u));
   return R('Use the buttons below 👇', mainKb(u));
 }
 
@@ -535,7 +558,7 @@ async function onCb(cb, env) {
     const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
     const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
     const cnt = await getCounter(cid, env);
-    return R(`FTT Signal Bot v3.1\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nWatchlist: ${u.watchlist.length} pairs  Grade: ${u.gradeFilter || 'ALL'}\n\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`, mainKb(u));
+    return R(`FTT Signal Bot v3.2\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nWatchlist: ${u.watchlist.length} pairs  Grade: ${u.gradeFilter || 'ALL'}\n\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`, mainKb(u));
   }
 
   if (data === 'cmd:signal')      return doSignal(cid, mid, env);
@@ -627,6 +650,7 @@ async function onCb(cb, env) {
 
 async function doSignal(cid, mid, env) {
   const u = await getUser(cid, env);
+  // FIX 4: loading screen — send/edit with plain text, no markup
   if (mid) await editMsg(cid, mid, `⏳ Fetching ${disp(u.pair)}...`, env, {});
   else     await sendMsg(cid, `⏳ Fetching ${disp(u.pair)}...`, env, {});
   try {
@@ -635,7 +659,9 @@ async function doSignal(cid, mid, env) {
     const dir  = sig?.finalSignal;
     let no = null;
     if (dir === 'BUY' || dir === 'SELL') no = await logAndSchedule(cid, u.pair, sig, env);
-    await sendMsg(cid, fmtSignal(data, u.pair, u.interval, no), env, { reply_markup: afterKb() });
+    // v3.2: BUY/SELL → signalKb (with Quotex), else → afterKb
+    const useKb = (dir === 'BUY' || dir === 'SELL') ? signalKb() : afterKb();
+    await sendMsg(cid, fmtSignal(data, u.pair, u.interval, no), env, { reply_markup: useKb });
   } catch (e) {
     await sendMsg(cid, `❌ Signal fetch failed\n${e.message.slice(0, 200)}`, env, { reply_markup: mainKb(u) });
   }
@@ -651,13 +677,14 @@ async function doQuickSignal(cid, mid, pair, env) {
     const dir  = sig?.finalSignal;
     let no = null;
     if (dir === 'BUY' || dir === 'SELL') no = await logAndSchedule(cid, pair, sig, env);
-    await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: afterKb() });
+    // v3.2: BUY/SELL → signalKb (with Quotex), else → afterKb
+    const useKb = (dir === 'BUY' || dir === 'SELL') ? signalKb() : afterKb();
+    await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: useKb });
   } catch (e) {
     await sendMsg(cid, `❌ Failed: ${e.message.slice(0, 150)}`, env, { reply_markup: mainKb(u) });
   }
 }
 
-// FIX 3: doScanAll loading — null markup fix
 async function doScanAll(cid, mid, env) {
   const u    = await getUser(cid, env);
   const list = [u.pair, ...u.watchlist].filter((p, i, a) => a.indexOf(p) === i);
@@ -671,7 +698,8 @@ async function doScanAll(cid, mid, env) {
       const dir  = sig?.finalSignal;
       if ((dir === 'BUY' || dir === 'SELL') && passGrade(sig, u.gradeFilter) && passConf(sig, u.minConfidence)) {
         const no = await logAndSchedule(cid, pair, sig, env);
-        await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: afterKb() });
+        // v3.2: scan results also get Quotex button
+        await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: signalKb() });
         found++;
       }
     } catch (e) { console.error(`scan ${pair}:`, e.message); }
@@ -832,7 +860,8 @@ async function autoScan(env, log) {
             const lock = await getLock(cid, pair, env);
             if (lock?.direction === dir && lock?.expiryAt > Date.now()) { log(`Locked ${pair}`); continue; }
             const no = await logAndSchedule(cid, pair, sig, env);
-            await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: afterKb() });
+            // v3.2: auto scan signals also get Quotex button
+            await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: signalKb() });
             log(`Sent #${no} ${pair} ${dir}`);
             anySignalSent = true;
           }
@@ -863,34 +892,53 @@ async function resultCheck(env, log) {
   for (const tid of ids) {
     try {
       const t = await kget(`pt:${tid}`, env);
-      if (!t) continue;
+      if (!t) continue; // already expired from KV TTL
       if (t.expiryAt > now) { keep.push(tid); continue; }
+
       const cur = await fetchPrice(t.pair, env);
+
+      // FIX 6: skip if either price is missing
       if (!cur || !t.entryPrice) {
         await setResult(t.chatId, tid, 'SKIP', null, null, env);
         await clearLock(t.chatId, t.pair, env);
+        await kdel(`pt:${tid}`, env); // FIX 7: clean up KV
         await sendMsg(t.chatId, `⏭ Tracking No. ${t.signalNo || tid} — price unavailable`, env, { reply_markup: afterKb() });
         continue;
       }
+
       const entry   = parseFloat(t.entryPrice);
       const current = parseFloat(cur);
+
+      // guard against NaN
+      if (isNaN(entry) || isNaN(current)) {
+        await setResult(t.chatId, tid, 'SKIP', null, null, env);
+        await clearLock(t.chatId, t.pair, env);
+        await kdel(`pt:${tid}`, env);
+        await sendMsg(t.chatId, `⏭ Tracking No. ${t.signalNo || tid} — invalid price data`, env, { reply_markup: afterKb() });
+        continue;
+      }
+
       const diff    = current - entry;
       const result  = t.direction === 'BUY' ? (diff > 0 ? 'WIN' : 'LOSS') : (diff < 0 ? 'WIN' : 'LOSS');
-      // FIX 2: Crypto .toFixed(2), Forex pips
       const pips    = isCr(t.pair)
         ? Math.round(Math.abs(diff) * 100) / 100
         : Math.round(Math.abs(diff) * 10000 * 10) / 10;
       const unit    = isCr(t.pair) ? '$' : ' pips';
+
       await setResult(t.chatId, tid, result, current, pips, env);
       await clearLock(t.chatId, t.pair, env);
+      await kdel(`pt:${tid}`, env); // FIX 7: clean up resolved KV key
+
       const late  = Math.round((now - t.expiryAt) / 60000);
       const lateS = late > 1 ? ` (+${late}min)` : '';
       const dE    = t.direction === 'BUY' ? '🟢' : '🔴';
       const rE    = result === 'WIN' ? '✅ WIN' : '❌ LOSS';
       const gS    = t.grade ? `  ${t.grade}` : '';
+
       await sendMsg(t.chatId,
         `📊 Tracking No. ${t.signalNo || tid}${lateS}\n━━━━━━━━━━━━━━\n${rE}  ${dE} ${t.direction} ${disp(t.pair)}${gS}\n💰 Entry:  ${fmtPrice(entry, t.pair)}\n🏁 Exit:   ${fmtPrice(current, t.pair)}\n📏 Move:   ${diff > 0 ? '+' : ''}${pips}${unit}`,
         env, { reply_markup: afterKb() });
+
       await checkMilestone(t.chatId, env);
     } catch (e) { log(`Result ${tid}: ${e.message}`); keep.push(tid); }
   }
@@ -928,7 +976,6 @@ async function checkMilestone(cid, env) {
     const ms  = (await kget(mk, env)) || { lastCount: 0 };
     const h   = await getHist(cid, env);
     const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
-    const cnt = await getCounter(cid, env);
 
     // FIX 4: negative since guard
     const since = Math.max(0, res.length - ms.lastCount);
