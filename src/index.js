@@ -1,24 +1,23 @@
 /**
- * FTT Signal Telegram Bot — v3.2
+ * FTT Signal Telegram Bot — v3.3
  * KV Binding     : BOT_KV
  * Service Binding: SIGNAL_WORKER → my-worker-601
  * Secrets        : BOT_TOKEN, SETUP_SECRET
  *
- * Changes in v3.2:
- *  1. signalKb() — BUY/SELL signal এ "📈 Trade on Quotex" URL button added
- *  2. doSignal / doQuickSignal / autoScan — BUY/SELL → signalKb(), else → afterKb()
- *  3. reply() helper — parse_mode always passed correctly
- *  4. editMsg loading screens — empty text guard (Telegram rejects empty edit)
- *  5. fmtSignal — MarkdownV2 special chars properly escaped via esc()
- *  6. resultCheck — entryPrice null-check before parseFloat
- *  7. cron pending cleanup — expired pt: keys deleted from KV after resolve
+ * Changes in v3.3:
+ *  1. Candle-close scan  — autoScan fires only on new candle open (clock-aligned)
+ *                          wrangler.toml cron MUST be "* * * * *"
+ *  2. Manual WIN/LOSS    — /win <no> / /loss <no> + ✅/❌ buttons on every signal card
+ *  3. Next candle timer  — shown in /status and auto ON confirmation
+ *  4. Same-candle dedup  — same pair skipped if already sent a signal this candle
+ *  5. /cancelall         — cancels all pending trades at once
+ *  6. Error auto-pause   — 3 consecutive full-scan worker errors → auto OFF + notify
  *
- * Inherited fixes from v3.1:
- *  - parse_mode:'MarkdownV2' + proper escaping
- *  - Crypto price → .toFixed(2), Forex → .toFixed(5)
- *  - doScanAll loading — null markup fix
- *  - checkMilestone — negative `since` guard
- *  - fmtSignal — shows actual bestTimeframe timeframe
+ * Inherited fixes from v3.2:
+ *  - signalKb() Quotex URL button
+ *  - MarkdownV2 escaping via esc()
+ *  - entryPrice null-check in resultCheck
+ *  - pt: KV keys deleted after resolve
  */
 
 const PAIR_PAGES = [
@@ -28,10 +27,11 @@ const PAIR_PAGES = [
   ['BTC/USD','ETH/USD','SOL/USD','BNB/USD'],
   ['XRP/USD','ADA/USD','DOGE/USD','AVAX/USD'],
 ];
-const MAX_WL    = 6;
-const MAX_HIST  = 100;
-const MILESTONE = 50;
-const CRYPTO    = ['BTC','ETH','BNB','XRP','SOL','ADA','DOGE','AVAX','DOT','LINK'];
+const MAX_WL     = 6;
+const MAX_HIST   = 100;
+const MILESTONE  = 50;
+const MAX_ERRORS = 3;   // consecutive full-scan failures before auto-pause
+const CRYPTO     = ['BTC','ETH','BNB','XRP','SOL','ADA','DOGE','AVAX','DOT','LINK'];
 const QUOTEX_URL = 'https://quotex.com/trade';
 
 // ─── EXPORT ───────────────────────────────────────────────────────────────────
@@ -97,7 +97,7 @@ export default {
       });
     }
 
-    return new Response('FTT Signal Bot v3.2');
+    return new Response('FTT Signal Bot v3.3');
   },
 
   async scheduled(e, env, ctx) {
@@ -111,7 +111,6 @@ const TG   = env  => `https://api.telegram.org/bot${env.BOT_TOKEN}`;
 const post = body => ({ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
 const json = ()   => ({ headers: { 'Content-Type': 'application/json' } });
 
-// MarkdownV2 escape — all special chars
 const esc = t => String(t || '').replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
 
 async function tg(method, body, env) {
@@ -149,7 +148,6 @@ const editMsg = (cid, mid, text, env, extra = {}) =>
 const answerCb = (id, env, text = '') =>
   tg('answerCallbackQuery', { callback_query_id: id, text }, env);
 
-// FIX 3: reply() — always pass parse_mode, handle missing kb gracefully
 const reply = (cid, mid, text, env, kboard) => {
   const extra = kboard ? { reply_markup: kboard } : {};
   return mid
@@ -279,17 +277,39 @@ const passConf = (sig, min) => {
   return parseInt((sig.confidence || '0%').replace('%', ''), 10) >= min;
 };
 
+// ─── CANDLE HELPERS ───────────────────────────────────────────────────────────
+
+// Clock-aligned floor timestamp of current candle
+const candleFloor = (intervalMin) => {
+  const ms = intervalMin * 60 * 1000;
+  return Math.floor(Date.now() / ms) * ms;
+};
+
+// "4m 30s" until next candle close
+function nextCandleIn(intervalMin) {
+  const ms   = intervalMin * 60 * 1000;
+  const next = (Math.floor(Date.now() / ms) + 1) * ms;
+  const diff = next - Date.now();
+  const m    = Math.floor(diff / 60000);
+  const s    = Math.floor((diff % 60000) / 1000);
+  return `${m}m ${s}s`;
+}
+
 // ─── KEYBOARDS ────────────────────────────────────────────────────────────────
 
-const kb = rows => ({ inline_keyboard: rows });
+const kb  = rows => ({ inline_keyboard: rows });
+const btn = (text, cb) => ({ text, callback_data: cb });
 
-// v3.2: signalKb — BUY/SELL signal এ Quotex URL button
-const signalKb = () => kb([
-  [{ text: '📈 Trade on Quotex', url: QUOTEX_URL }],
-  [btn('🔁 New Signal', 'cmd:signal'), btn('📈 History', 'cmd:history:0'), btn('🔙 Menu', 'cmd:main')],
-]);
+// v3.3: signalKb(no) — includes ✅ WIN / ❌ LOSS override buttons when no is provided
+const signalKb = (no = null) => {
+  const rows = [
+    [{ text: '📈 Trade on Quotex', url: QUOTEX_URL }],
+  ];
+  if (no) rows.push([btn(`✅ WIN #${no}`, `res:win:${no}`), btn(`❌ LOSS #${no}`, `res:loss:${no}`)]);
+  rows.push([btn('🔁 New Signal', 'cmd:signal'), btn('📈 History', 'cmd:history:0'), btn('🔙 Menu', 'cmd:main')]);
+  return kb(rows);
+};
 
-// afterKb — NO_TRADE / result cards এ (no Quotex button)
 const afterKb = () => kb([
   [btn('🔁 New Signal', 'cmd:signal'), btn('📈 History', 'cmd:history:0'), btn('🔙 Menu', 'cmd:main')],
 ]);
@@ -374,17 +394,14 @@ const histNavKb   = (page, total) => {
   return kb(rows);
 };
 
-const btn = (text, cb) => ({ text, callback_data: cb });
-
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-const disp = p  => (!p.includes('/') && p.length === 6) ? p.slice(0,3) + '/' + p.slice(3) : p;
-const norm = p  => p.replace('/', '');
-const uid  = () => Math.random().toString(36).slice(2, 8).toUpperCase();
-const isCr = p  => CRYPTO.some(b => p.startsWith(b));
+const disp  = p  => (!p.includes('/') && p.length === 6) ? p.slice(0,3) + '/' + p.slice(3) : p;
+const norm  = p  => p.replace('/', '');
+const uid   = () => Math.random().toString(36).slice(2, 8).toUpperCase();
+const isCr  = p  => CRYPTO.some(b => p.startsWith(b));
 const chunk = (arr, n) => arr.reduce((r, x, i) => (i % n === 0 ? r.push([x]) : r[r.length-1].push(x), r), []);
 
-// Crypto → .toFixed(2), Forex → .toFixed(5)
 const fmtPrice = (price, pair) =>
   isCr(pair) ? parseFloat(price).toFixed(2) : parseFloat(price).toFixed(5);
 
@@ -404,7 +421,6 @@ function fmtSignal(data, pair, interval, no) {
   const reason = sig.entryReason   || '';
   const best   = sig.bestTimeframe;
 
-  // actual timeframe from bestTimeframe, fallback to user interval
   const tf     = best?.timeframe || `${interval}min`;
   const expiry = best?.expiry?.humanReadable || null;
   const cd     = best?.expiry?.countdown?.label || null;
@@ -442,7 +458,7 @@ function fmtHist(hist, page = 0) {
   let msg = `📈 History (${page * per + 1}-${page * per + slice.length} of ${hist.length})\n━━━━━━━━━━━━━━\n`;
   for (const h of slice) {
     const dE = h.direction === 'BUY' ? '🟢' : '🔴';
-    const rE = h.result === 'WIN' ? '✅' : h.result === 'LOSS' ? '❌' : h.result === 'SKIP' ? '⏭' : '⏳';
+    const rE = h.result === 'WIN' ? '✅' : h.result === 'LOSS' ? '❌' : h.result === 'SKIP' ? '⏭' : h.result === 'CANCEL' ? '🗑' : '⏳';
     const g  = h.grade  ? ` ${h.grade.split(' ')[0]}` : '';
     const p  = h.pips != null ? ` ${h.pips > 0 ? '+' : ''}${h.pips}` : '';
     const t  = new Date(h.timestamp).toUTCString().slice(5, 17);
@@ -515,7 +531,7 @@ async function onMessage(msg, env) {
   const R    = (t, kboard) => sendMsg(cid, t, env, kboard ? { reply_markup: kboard } : {});
 
   if (text.startsWith('/start'))
-    return R(`👋 FTT Signal Bot v3.2\n\nSignals + Auto W/L Tracking\n\nPair: ${disp(u.pair)}  ${u.interval}min  Auto ${u.autoEnabled ? 'ON' : 'OFF'}`, mainKb(u));
+    return R(`👋 FTT Signal Bot v3.3\n\nSignals + Auto W/L Tracking\n\nPair: ${disp(u.pair)}  ${u.interval}min  Auto ${u.autoEnabled ? 'ON' : 'OFF'}`, mainKb(u));
   if (text.startsWith('/signal'))    return doSignal(cid, null, env);
   if (text.startsWith('/scan'))      return doScanAll(cid, null, env);
   if (text.startsWith('/auto'))      return doToggle(cid, null, env);
@@ -525,6 +541,17 @@ async function onMessage(msg, env) {
   if (text.startsWith('/watchlist')) return doWatchlist(cid, null, env);
   if (text.startsWith('/today'))     return doToday(cid, null, env);
   if (text.startsWith('/summary'))   return doSummary(cid, null, env);
+  if (text.startsWith('/cancelall')) return doCancelAll(cid, null, env);
+
+  // v3.3: Manual WIN/LOSS — /win 5  or  /loss 5
+  if (text.startsWith('/win ') || text.startsWith('/loss ')) {
+    const parts  = text.split(' ');
+    const result = text.startsWith('/win') ? 'WIN' : 'LOSS';
+    const no     = parseInt(parts[1], 10);
+    if (isNaN(no)) return R(`❌ Usage: /win 5  or  /loss 5`, mainKb(u));
+    return doManualResult(cid, null, no, result, env);
+  }
+
   if (text.startsWith('/pair ')) {
     const raw = text.slice(6).trim().toUpperCase().replace(/[\s/]/g, '');
     u.pair = raw;
@@ -537,7 +564,7 @@ async function onMessage(msg, env) {
     return R('❌ Use: 1, 5, or 15', mainKb(u));
   }
   if (text.startsWith('/help'))
-    return R(`FTT Signal Bot v3.2\n\n/signal /scan /auto /watchlist\n/history /stats /today /summary\n/status /pair EURUSD /interval 5`, mainKb(u));
+    return R(`FTT Signal Bot v3.3\n\n/signal — get signal now\n/scan — scan all pairs\n/auto — toggle auto scan\n/watchlist /history /stats\n/today /summary /status\n/cancelall — cancel all pending\n/win <no> /loss <no> — manual override\n/pair EURUSD /interval 5`, mainKb(u));
   return R('Use the buttons below 👇', mainKb(u));
 }
 
@@ -558,7 +585,7 @@ async function onCb(cb, env) {
     const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
     const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
     const cnt = await getCounter(cid, env);
-    return R(`FTT Signal Bot v3.2\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nWatchlist: ${u.watchlist.length} pairs  Grade: ${u.gradeFilter || 'ALL'}\n\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`, mainKb(u));
+    return R(`FTT Signal Bot v3.3\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nWatchlist: ${u.watchlist.length} pairs  Grade: ${u.gradeFilter || 'ALL'}\n\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`, mainKb(u));
   }
 
   if (data === 'cmd:signal')      return doSignal(cid, mid, env);
@@ -644,13 +671,18 @@ async function onCb(cb, env) {
   }
 
   if (data.startsWith('qs:')) return doQuickSignal(cid, mid, data.slice(3), env);
+
+  // v3.3: Manual result override buttons on signal card
+  if (data.startsWith('res:win:'))
+    return doManualResult(cid, mid, parseInt(data.split(':')[2], 10), 'WIN', env);
+  if (data.startsWith('res:loss:'))
+    return doManualResult(cid, mid, parseInt(data.split(':')[2], 10), 'LOSS', env);
 }
 
 // ─── ACTION FUNCTIONS ─────────────────────────────────────────────────────────
 
 async function doSignal(cid, mid, env) {
   const u = await getUser(cid, env);
-  // FIX 4: loading screen — send/edit with plain text, no markup
   if (mid) await editMsg(cid, mid, `⏳ Fetching ${disp(u.pair)}...`, env, {});
   else     await sendMsg(cid, `⏳ Fetching ${disp(u.pair)}...`, env, {});
   try {
@@ -659,8 +691,8 @@ async function doSignal(cid, mid, env) {
     const dir  = sig?.finalSignal;
     let no = null;
     if (dir === 'BUY' || dir === 'SELL') no = await logAndSchedule(cid, u.pair, sig, env);
-    // v3.2: BUY/SELL → signalKb (with Quotex), else → afterKb
-    const useKb = (dir === 'BUY' || dir === 'SELL') ? signalKb() : afterKb();
+    // v3.3: pass no to signalKb for WIN/LOSS buttons
+    const useKb = (dir === 'BUY' || dir === 'SELL') ? signalKb(no) : afterKb();
     await sendMsg(cid, fmtSignal(data, u.pair, u.interval, no), env, { reply_markup: useKb });
   } catch (e) {
     await sendMsg(cid, `❌ Signal fetch failed\n${e.message.slice(0, 200)}`, env, { reply_markup: mainKb(u) });
@@ -677,8 +709,7 @@ async function doQuickSignal(cid, mid, pair, env) {
     const dir  = sig?.finalSignal;
     let no = null;
     if (dir === 'BUY' || dir === 'SELL') no = await logAndSchedule(cid, pair, sig, env);
-    // v3.2: BUY/SELL → signalKb (with Quotex), else → afterKb
-    const useKb = (dir === 'BUY' || dir === 'SELL') ? signalKb() : afterKb();
+    const useKb = (dir === 'BUY' || dir === 'SELL') ? signalKb(no) : afterKb();
     await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: useKb });
   } catch (e) {
     await sendMsg(cid, `❌ Failed: ${e.message.slice(0, 150)}`, env, { reply_markup: mainKb(u) });
@@ -698,8 +729,7 @@ async function doScanAll(cid, mid, env) {
       const dir  = sig?.finalSignal;
       if ((dir === 'BUY' || dir === 'SELL') && passGrade(sig, u.gradeFilter) && passConf(sig, u.minConfidence)) {
         const no = await logAndSchedule(cid, pair, sig, env);
-        // v3.2: scan results also get Quotex button
-        await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: signalKb() });
+        await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: signalKb(no) });
         found++;
       }
     } catch (e) { console.error(`scan ${pair}:`, e.message); }
@@ -716,11 +746,17 @@ async function doToggle(cid, mid, env) {
   u.autoEnabled = !u.autoEnabled;
   u.noTradeStreak = 0;
   await saveUser(cid, u, env);
-  if (u.autoEnabled) await addAutoUser(cid, env);
-  else               await removeAutoUser(cid, env);
+  if (u.autoEnabled) {
+    await addAutoUser(cid, env);
+  } else {
+    await removeAutoUser(cid, env);
+    // v3.3: clean up candle-close key and error count on OFF
+    await kdel(`lc:${cid}`, env);
+    await kput(`errcnt:${cid}`, 0, env);
+  }
   const wl = u.watchlist.map(disp).join(', ');
   const t  = u.autoEnabled
-    ? `🔄 Auto Scan ON\n\n${disp(u.pair)}${wl ? '\nWatchlist: ' + wl : ''}\nInterval: ${u.interval}min  Grade: ${u.gradeFilter || 'ALL'}`
+    ? `🔄 Auto Scan ON\n\n${disp(u.pair)}${wl ? '\nWatchlist: ' + wl : ''}\nInterval: ${u.interval}min  Grade: ${u.gradeFilter || 'ALL'}\n⏰ Next scan: ${nextCandleIn(u.interval)}`
     : `🔕 Auto Scan OFF`;
   return reply(cid, mid, t, env, mainKb(u));
 }
@@ -734,7 +770,11 @@ async function doSettings(cid, mid, env) {
 async function doStatus(cid, mid, env) {
   const u   = await getUser(cid, env);
   const cnt = await getCounter(cid, env);
-  const t   = `📋 Status\n\nPair: ${disp(u.pair)}\nWatchlist: ${u.watchlist.map(disp).join(', ') || 'None'}\nInterval: ${u.interval}min\nAuto: ${u.autoEnabled ? 'ON' : 'OFF'}\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nSummary: ${u.dailySummary ? 'ON' : 'OFF'}\nTotal Signals: ${cnt}`;
+  const h   = await getHist(cid, env);
+  const pen = h.filter(x => !x.result && x.direction).length;
+  // v3.3: next candle countdown shown when auto is ON
+  const nextScan = u.autoEnabled ? `\n⏰ Next scan: ${nextCandleIn(u.interval)}` : '';
+  const t = `📋 Status\n\nPair: ${disp(u.pair)}\nWatchlist: ${u.watchlist.map(disp).join(', ') || 'None'}\nInterval: ${u.interval}min\nAuto: ${u.autoEnabled ? 'ON' : 'OFF'}${nextScan}\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nSummary: ${u.dailySummary ? 'ON' : 'OFF'}\nTotal Signals: ${cnt}  Pending: ${pen}`;
   return reply(cid, mid, t, env, kb([[btn('⚙️ Settings', 'cmd:settings'), btn('🔙 Back', 'cmd:main')]]));
 }
 
@@ -768,7 +808,7 @@ async function doToday(cid, mid, env) {
   t += `📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n\n`;
   for (const x of th.slice(0, 8)) {
     const dE = x.direction === 'BUY' ? '🟢' : '🔴';
-    const rE = x.result === 'WIN' ? '✅' : x.result === 'LOSS' ? '❌' : '⏳';
+    const rE = x.result === 'WIN' ? '✅' : x.result === 'LOSS' ? '❌' : x.result === 'CANCEL' ? '🗑' : '⏳';
     const g  = x.grade ? ` ${x.grade.split(' ')[0]}` : '';
     t += `${rE} #${x.no} ${dE} ${disp(x.pair)}${g} ${x.confidence}\n`;
   }
@@ -804,6 +844,51 @@ async function doSummary(cid, mid, env) {
   }
   t += `\n${trend} (all-time: ${allWR}%)`;
   return reply(cid, mid, t, env, kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')]]));
+}
+
+// v3.3: Cancel all pending trades
+async function doCancelAll(cid, mid, env) {
+  const u    = await getUser(cid, env);
+  const h    = await getHist(cid, env);
+  const pend = h.filter(x => !x.result && x.direction);
+  if (!pend.length)
+    return reply(cid, mid, `ℹ️ No pending trades to cancel.`, env, mainKb(u));
+
+  const allIds = await getPendingIds(env);
+  const myTids = pend.map(x => x.id);
+
+  for (const trade of pend) {
+    await setResult(cid, trade.id, 'CANCEL', null, null, env);
+    await clearLock(cid, trade.pair, env);
+    await kdel(`pt:${trade.id}`, env);
+  }
+  await savePendingIds(allIds.filter(id => !myTids.includes(id)), env);
+
+  return reply(cid, mid, `🗑 Cancelled ${pend.length} pending trade(s).`, env, mainKb(u));
+}
+
+// v3.3: Manual WIN/LOSS result override
+async function doManualResult(cid, mid, no, result, env) {
+  const u     = await getUser(cid, env);
+  const h     = await getHist(cid, env);
+  const trade = h.find(x => x.no === no);
+
+  if (!trade)
+    return reply(cid, mid, `❌ Signal #${no} not found.`, env, mainKb(u));
+  if (trade.result === 'WIN' || trade.result === 'LOSS')
+    return reply(cid, mid, `ℹ️ Signal #${no} already resolved as ${trade.result}.`, env, mainKb(u));
+
+  await setResult(cid, trade.id, result, null, null, env);
+  await clearLock(cid, trade.pair, env);
+  await kdel(`pt:${trade.id}`, env);
+
+  const ids = await getPendingIds(env);
+  await savePendingIds(ids.filter(id => id !== trade.id), env);
+
+  const dE = trade.direction === 'BUY' ? '🟢' : '🔴';
+  const rE = result === 'WIN' ? '✅ WIN' : '❌ LOSS';
+  const t  = `${rE} manually set\n\n#${no} ${dE} ${trade.direction} ${disp(trade.pair)}\n${trade.grade || ''}`;
+  return reply(cid, mid, t, env, afterKb());
 }
 
 // ─── SIGNAL FETCH ─────────────────────────────────────────────────────────────
@@ -843,30 +928,87 @@ async function cron(env, logs = [], force = false) {
 async function autoScan(env, log) {
   const users = await getAutoUsers(env);
   log(`Scan: ${users.length} users`);
+  const now = Date.now();
+
   for (const cid of users) {
     try {
       const u = await getUser(cid, env);
       if (!u.autoEnabled) continue;
+
+      // ── v3.3 Feature 1: Candle-close gate ─────────────────
+      // Scan fires only when a new candle has opened (clock-aligned).
+      // wrangler.toml cron must be "* * * * *" for this to work correctly.
+      const intervalMin   = u.interval || 5;
+      const intervalMs    = intervalMin * 60 * 1000;
+      const currentCandle = Math.floor(now / intervalMs) * intervalMs;
+      const lastCandle    = (await kget(`lc:${cid}`, env)) || 0;
+      if (currentCandle <= lastCandle) {
+        log(`Skip ${cid} — waiting for next candle close`);
+        continue;
+      }
+      await kput(`lc:${cid}`, currentCandle, env, { expirationTtl: intervalMin * 60 * 2 });
+      // ──────────────────────────────────────────────────────
+
       const list = [u.pair, ...u.watchlist].filter((p, i, a) => a.indexOf(p) === i);
       let anySignalSent = false;
+      let pairErrors    = 0;
 
       for (const pair of list) {
         try {
+          // ── v3.3 Feature 4: Same-candle dedup ───────────────
+          const scKey          = `sc:${cid}:${norm(pair)}`;
+          const lastPairCandle = (await kget(scKey, env)) || 0;
+          if (lastPairCandle >= currentCandle) {
+            log(`Dedup ${pair} — already sent this candle`);
+            continue;
+          }
+          // ────────────────────────────────────────────────────
+
           const data = await fetchSig(pair, env);
           const sig  = data.signal;
           const dir  = sig?.finalSignal;
+
           if (dir === 'BUY' || dir === 'SELL') {
             if (!passGrade(sig, u.gradeFilter) || !passConf(sig, u.minConfidence)) { log(`Filtered ${pair}`); continue; }
             const lock = await getLock(cid, pair, env);
-            if (lock?.direction === dir && lock?.expiryAt > Date.now()) { log(`Locked ${pair}`); continue; }
+            if (lock?.direction === dir && lock?.expiryAt > now) { log(`Locked ${pair}`); continue; }
             const no = await logAndSchedule(cid, pair, sig, env);
-            // v3.2: auto scan signals also get Quotex button
-            await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: signalKb() });
+            await sendMsg(cid, fmtSignal(data, pair, intervalMin, no), env, { reply_markup: signalKb(no) });
+            // Mark this pair as sent for this candle
+            await kput(scKey, currentCandle, env, { expirationTtl: intervalMin * 60 + 60 });
             log(`Sent #${no} ${pair} ${dir}`);
             anySignalSent = true;
           }
-        } catch (e) { log(`Pair ${pair}: ${e.message}`); }
+        } catch (e) {
+          log(`Pair ${pair}: ${e.message}`);
+          pairErrors++;
+        }
       }
+
+      // ── v3.3 Feature 6: Worker error auto-pause ───────────
+      // If ALL pairs failed this scan, count it as a consecutive error.
+      // After MAX_ERRORS consecutive full failures → auto OFF + notify.
+      if (list.length > 0 && pairErrors === list.length) {
+        const errKey = `errcnt:${cid}`;
+        const errs   = ((await kget(errKey, env)) || 0) + 1;
+        await kput(errKey, errs, env, { expirationTtl: 3600 });
+        log(`Worker errors for ${cid}: ${errs}/${MAX_ERRORS}`);
+        if (errs >= MAX_ERRORS) {
+          u.autoEnabled = false;
+          await saveUser(cid, u, env);
+          await removeAutoUser(cid, env);
+          await kdel(`lc:${cid}`, env);
+          await kput(errKey, 0, env);
+          await sendMsg(cid,
+            `⚠️ Auto Scan paused\n\nSignal worker unreachable — ${MAX_ERRORS} consecutive scan failures.\nFix the worker then tap 🔄 Start Auto to resume.`,
+            env, { reply_markup: mainKb(u) });
+          log(`Auto paused for ${cid} after ${MAX_ERRORS} errors`);
+        }
+      } else if (pairErrors === 0 && list.length > 0) {
+        // Full success — reset error counter
+        await kput(`errcnt:${cid}`, 0, env);
+      }
+      // ──────────────────────────────────────────────────────
 
       if (!anySignalSent) {
         u.noTradeStreak = (u.noTradeStreak || 0) + 1;
@@ -892,16 +1034,15 @@ async function resultCheck(env, log) {
   for (const tid of ids) {
     try {
       const t = await kget(`pt:${tid}`, env);
-      if (!t) continue; // already expired from KV TTL
+      if (!t) continue;
       if (t.expiryAt > now) { keep.push(tid); continue; }
 
       const cur = await fetchPrice(t.pair, env);
 
-      // FIX 6: skip if either price is missing
       if (!cur || !t.entryPrice) {
         await setResult(t.chatId, tid, 'SKIP', null, null, env);
         await clearLock(t.chatId, t.pair, env);
-        await kdel(`pt:${tid}`, env); // FIX 7: clean up KV
+        await kdel(`pt:${tid}`, env);
         await sendMsg(t.chatId, `⏭ Tracking No. ${t.signalNo || tid} — price unavailable`, env, { reply_markup: afterKb() });
         continue;
       }
@@ -909,7 +1050,6 @@ async function resultCheck(env, log) {
       const entry   = parseFloat(t.entryPrice);
       const current = parseFloat(cur);
 
-      // guard against NaN
       if (isNaN(entry) || isNaN(current)) {
         await setResult(t.chatId, tid, 'SKIP', null, null, env);
         await clearLock(t.chatId, t.pair, env);
@@ -918,16 +1058,16 @@ async function resultCheck(env, log) {
         continue;
       }
 
-      const diff    = current - entry;
-      const result  = t.direction === 'BUY' ? (diff > 0 ? 'WIN' : 'LOSS') : (diff < 0 ? 'WIN' : 'LOSS');
-      const pips    = isCr(t.pair)
+      const diff   = current - entry;
+      const result = t.direction === 'BUY' ? (diff > 0 ? 'WIN' : 'LOSS') : (diff < 0 ? 'WIN' : 'LOSS');
+      const pips   = isCr(t.pair)
         ? Math.round(Math.abs(diff) * 100) / 100
         : Math.round(Math.abs(diff) * 10000 * 10) / 10;
-      const unit    = isCr(t.pair) ? '$' : ' pips';
+      const unit   = isCr(t.pair) ? '$' : ' pips';
 
       await setResult(t.chatId, tid, result, current, pips, env);
       await clearLock(t.chatId, t.pair, env);
-      await kdel(`pt:${tid}`, env); // FIX 7: clean up resolved KV key
+      await kdel(`pt:${tid}`, env);
 
       const late  = Math.round((now - t.expiryAt) / 60000);
       const lateS = late > 1 ? ` (+${late}min)` : '';
@@ -977,7 +1117,6 @@ async function checkMilestone(cid, env) {
     const h   = await getHist(cid, env);
     const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
 
-    // FIX 4: negative since guard
     const since = Math.max(0, res.length - ms.lastCount);
     if (since < MILESTONE) return;
 
