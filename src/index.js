@@ -4,6 +4,8 @@
  * Service Binding: SIGNAL_WORKER → my-worker-601
  * Secrets        : BOT_TOKEN, SETUP_SECRET
  *
+ *  8. Pair auto-detect    — message এ যেকোনো format এ pair লিখলে (eurusd / EUR/USD / eur usd) auto scan
+ *
  * Changes in v3.3:
  *  1. Candle-close scan  — autoScan fires only on new candle open (clock-aligned)
  *                          wrangler.toml cron MUST be "* * * * *"
@@ -564,7 +566,22 @@ async function onMessage(msg, env) {
     return R('❌ Use: 1, 5, or 15', mainKb(u));
   }
   if (text.startsWith('/help'))
-    return R(`FTT Signal Bot v3.3\n\n/signal — get signal now\n/scan — scan all pairs\n/auto — toggle auto scan\n/watchlist /history /stats\n/today /summary /status\n/cancelall — cancel all pending\n/win <no> /loss <no> — manual override\n/pair EURUSD /interval 5`, mainKb(u));
+    return R(`FTT Signal Bot v3.3\n\n/signal — get signal now\n/scan — scan all pairs\n/auto — toggle auto scan\n/watchlist /history /stats\n/today /summary /status\n/cancelall — cancel all pending\n/win <no> /loss <no> — manual override\n/pair EURUSD /interval 5\n\n💡 Tip: just type a pair name (eurusd, btcusd, gbp/jpy...) to scan instantly`, mainKb(u));
+  // ── v3.3 Auto pair detect ─────────────────────────────────────────────────
+  // যেকোনো format এ pair লিখলে — eurusd / EUR/USD / eur usd / btc-usd — scan হবে
+  const rawPair = text.toUpperCase().replace(/[\s\/\-_.]/g, '');
+  if (rawPair.length >= 6) {
+    const allPairs = PAIR_PAGES.flat().map(p => norm(p));
+    const matched  = allPairs.find(p => p === rawPair || rawPair === p);
+    // fuzzy: prefix match for 6-char codes
+    const fuzzy = matched || allPairs.find(p =>
+      rawPair.startsWith(p.slice(0, 3)) && rawPair.endsWith(p.slice(3))
+    );
+    if (fuzzy) {
+      return doQuickSignal(cid, null, fuzzy, env);
+    }
+  }
+  // ─────────────────────────────────────────────────────────────────────────
   return R('Use the buttons below 👇', mainKb(u));
 }
 
