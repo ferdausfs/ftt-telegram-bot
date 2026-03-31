@@ -11,4 +11,4 @@ id = "39653d1f9b5147259cf3791658f131d7"
 
 [[services]]
 binding = "SIGNAL_WORKER"
-service = "my-worker-601"
+service = "asignal"
