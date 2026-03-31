@@ -925,7 +925,7 @@ async function fetchSig(pair, env) {
   const req = new Request(`https://signal/api/signal?pair=${pair}`, { headers: { Accept: 'application/json' } });
   const res = env.SIGNAL_WORKER
     ? await env.SIGNAL_WORKER.fetch(req)
-    : await fetch(`https://my-worker-601.umuhammadiswa.workers.dev/api/signal?pair=${pair}`,
+    : await fetch(`https://asignal.umuhammadiswa.workers.dev/api/signal?pair=${pair}`,
         { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text().catch(() => '')).slice(0, 150)}`);
   return res.json();
