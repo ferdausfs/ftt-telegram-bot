@@ -922,10 +922,11 @@ async function doManualResult(cid, mid, no, result, env) {
 // ─── SIGNAL FETCH ─────────────────────────────────────────────────────────────
 
 async function fetchSig(pair, env) {
-  const req = new Request(`https://signal/api/signal?pair=${pair}`, { headers: { Accept: 'application/json' } });
+  const WORKER_URL = 'https://asignal.umuhammadiswa.workers.dev';
+  const req = new Request(`${WORKER_URL}/api/signal?pair=${pair}`, { headers: { Accept: 'application/json' } });
   const res = env.SIGNAL_WORKER
     ? await env.SIGNAL_WORKER.fetch(req)
-    : await fetch(`https://asignal.umuhammadiswa.workers.dev/api/signal?pair=${pair}`,
+    : await fetch(`${WORKER_URL}/api/signal?pair=${pair}`,
         { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text().catch(() => '')).slice(0, 150)}`);
   return res.json();
