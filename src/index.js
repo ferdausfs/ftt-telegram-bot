@@ -4,8 +4,6 @@
  * Service Binding: SIGNAL_WORKER → my-worker-601
  * Secrets        : BOT_TOKEN, SETUP_SECRET
  *
- *  8. Pair auto-detect    — message এ যেকোনো format এ pair লিখলে (eurusd / EUR/USD / eur usd) auto scan
- *
  * Changes in v3.3:
  *  1. Candle-close scan  — autoScan fires only on new candle open (clock-aligned)
  *                          wrangler.toml cron MUST be "* * * * *"
@@ -14,6 +12,7 @@
  *  4. Same-candle dedup  — same pair skipped if already sent a signal this candle
  *  5. /cancelall         — cancels all pending trades at once
  *  6. Error auto-pause   — 3 consecutive full-scan worker errors → auto OFF + notify
+ *  7. Pair auto-detect   — message এ যেকোনো format এ pair লিখলে (eurusd / EUR/USD / eur usd) auto scan
  *
  * Inherited fixes from v3.2:
  *  - signalKb() Quotex URL button
@@ -281,10 +280,6 @@ const passConf = (sig, min) => {
 
 // ─── CANDLE HELPERS ───────────────────────────────────────────────────────────
 
-// Clock-aligned floor timestamp of current candle
-const candleFloor = (intervalMin) => {
-  const ms = intervalMin * 60 * 1000;
-  return Math.floor(Date.now() / ms) * ms;
 };
 
 // "4m 30s" until next candle close
@@ -572,7 +567,7 @@ async function onMessage(msg, env) {
   const rawPair = text.toUpperCase().replace(/[\s\/\-_.]/g, '');
   if (rawPair.length >= 6) {
     const allPairs = PAIR_PAGES.flat().map(p => norm(p));
-    const matched  = allPairs.find(p => p === rawPair || rawPair === p);
+    const matched  = allPairs.find(p => p === rawPair);
     // fuzzy: prefix match for 6-char codes
     const fuzzy = matched || allPairs.find(p =>
       rawPair.startsWith(p.slice(0, 3)) && rawPair.endsWith(p.slice(3))
