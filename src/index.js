@@ -280,7 +280,6 @@ const passConf = (sig, min) => {
 
 // ─── CANDLE HELPERS ───────────────────────────────────────────────────────────
 
-};
 
 // "4m 30s" until next candle close
 function nextCandleIn(intervalMin) {
@@ -1160,5 +1159,4 @@ async function checkMilestone(cid, env) {
     await sendMsg(cid, t, env, { reply_markup: kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')]]) });
     await kput(mk, { lastCount: res.length }, env);
   } catch (e) { console.error('milestone:', e.message); }
-}  
- 
+}
