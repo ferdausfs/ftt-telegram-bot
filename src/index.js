@@ -1,24 +1,24 @@
 /**
- * FTT Signal Telegram Bot — v3.3
+ * FTT Signal Telegram Bot — v3.4
  * KV Binding     : BOT_KV
  * Service Binding: SIGNAL_WORKER → my-worker-601
  * Secrets        : BOT_TOKEN, SETUP_SECRET
  *
- * Changes in v3.3:
+ * Changes in v3.4:
+ *  8. AI validation display — aiValidation block from worker shown in signal card
+ *     • AI agree → ✅ shown with reason
+ *     • AI disagree → ⚠️ shown with AI's signal + reason
+ *     • AI uncertain (NO_TRADE) → 🤔 shown with concerns
+ *     • AI unavailable/skipped → nothing shown (silent)
+ *
+ * Inherited from v3.3:
  *  1. Candle-close scan  — autoScan fires only on new candle open (clock-aligned)
- *                          wrangler.toml cron MUST be "* * * * *"
  *  2. Manual WIN/LOSS    — /win <no> / /loss <no> + ✅/❌ buttons on every signal card
  *  3. Next candle timer  — shown in /status and auto ON confirmation
  *  4. Same-candle dedup  — same pair skipped if already sent a signal this candle
  *  5. /cancelall         — cancels all pending trades at once
  *  6. Error auto-pause   — 3 consecutive full-scan worker errors → auto OFF + notify
- *  7. Pair auto-detect   — message এ যেকোনো format এ pair লিখলে (eurusd / EUR/USD / eur usd) auto scan
- *
- * Inherited fixes from v3.2:
- *  - signalKb() Quotex URL button
- *  - MarkdownV2 escaping via esc()
- *  - entryPrice null-check in resultCheck
- *  - pt: KV keys deleted after resolve
+ *  7. Pair auto-detect   — message এ যেকোনো format এ pair লিখলে auto scan
  */
 
 const PAIR_PAGES = [
@@ -98,7 +98,7 @@ export default {
       });
     }
 
-    return new Response('FTT Signal Bot v3.3');
+    return new Response('FTT Signal Bot v3.4');
   },
 
   async scheduled(e, env, ctx) {
@@ -437,6 +437,23 @@ function fmtSignal(data, pair, interval, no) {
     if (cd)     msg += `🕐 Candle closes: ${cd}\n`;
     msg += `${hE} HTF 15min: ${htf}\n`;
     if (reason) msg += `\n📝 ${reason}\n`;
+
+    // [v3.4] AI Validation block
+    const ai = sig.aiValidation;
+    if (ai && ai.status === 'OK') {
+      msg += `\n🤖 AI Analysis (Cerebras)\n`;
+      if (ai.agrees === true) {
+        msg += `✅ Agrees: ${ai.signal} ${ai.confidence}%\n`;
+        if (ai.reason) msg += `💬 ${ai.reason}\n`;
+      } else if (ai.agrees === false && ai.signal !== 'NO_TRADE') {
+        msg += `⚠️ Disagrees: AI says ${ai.signal} ${ai.confidence}%\n`;
+        if (ai.reason) msg += `💬 ${ai.reason}\n`;
+      } else {
+        msg += `🤔 Uncertain: NO_TRADE ${ai.confidence}%\n`;
+      }
+      if (ai.concerns) msg += `🔍 ${ai.concerns}\n`;
+    }
+
     msg += `\n⏳ Result will be tracked automatically`;
   } else {
     const filters = sig.filtersApplied || [];
@@ -527,7 +544,7 @@ async function onMessage(msg, env) {
   const R    = (t, kboard) => sendMsg(cid, t, env, kboard ? { reply_markup: kboard } : {});
 
   if (text.startsWith('/start'))
-    return R(`👋 FTT Signal Bot v3.3\n\nSignals + Auto W/L Tracking\n\nPair: ${disp(u.pair)}  ${u.interval}min  Auto ${u.autoEnabled ? 'ON' : 'OFF'}`, mainKb(u));
+    return R(`👋 FTT Signal Bot v3.4\n\nSignals + Auto W/L Tracking\n\nPair: ${disp(u.pair)}  ${u.interval}min  Auto ${u.autoEnabled ? 'ON' : 'OFF'}`, mainKb(u));
   if (text.startsWith('/signal'))    return doSignal(cid, null, env);
   if (text.startsWith('/scan'))      return doScanAll(cid, null, env);
   if (text.startsWith('/auto'))      return doToggle(cid, null, env);
@@ -560,7 +577,7 @@ async function onMessage(msg, env) {
     return R('❌ Use: 1, 5, or 15', mainKb(u));
   }
   if (text.startsWith('/help'))
-    return R(`FTT Signal Bot v3.3\n\n/signal — get signal now\n/scan — scan all pairs\n/auto — toggle auto scan\n/watchlist /history /stats\n/today /summary /status\n/cancelall — cancel all pending\n/win <no> /loss <no> — manual override\n/pair EURUSD /interval 5\n\n💡 Tip: just type a pair name (eurusd, btcusd, gbp/jpy...) to scan instantly`, mainKb(u));
+    return R(`FTT Signal Bot v3.4\n\n/signal — get signal now\n/scan — scan all pairs\n/auto — toggle auto scan\n/watchlist /history /stats\n/today /summary /status\n/cancelall — cancel all pending\n/win <no> /loss <no> — manual override\n/pair EURUSD /interval 5\n\n💡 Tip: just type a pair name (eurusd, btcusd, gbp/jpy...) to scan instantly`, mainKb(u));
   // ── v3.3 Auto pair detect ─────────────────────────────────────────────────
   // যেকোনো format এ pair লিখলে — eurusd / EUR/USD / eur usd / btc-usd — scan হবে
   const rawPair = text.toUpperCase().replace(/[\s\/\-_.]/g, '');
@@ -596,7 +613,7 @@ async function onCb(cb, env) {
     const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
     const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
     const cnt = await getCounter(cid, env);
-    return R(`FTT Signal Bot v3.3\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nWatchlist: ${u.watchlist.length} pairs  Grade: ${u.gradeFilter || 'ALL'}\n\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`, mainKb(u));
+    return R(`FTT Signal Bot v3.4\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nWatchlist: ${u.watchlist.length} pairs  Grade: ${u.gradeFilter || 'ALL'}\n\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`, mainKb(u));
   }
 
   if (data === 'cmd:signal')      return doSignal(cid, mid, env);
