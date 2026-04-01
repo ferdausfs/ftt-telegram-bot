@@ -12,3 +12,8 @@ id = "39653d1f9b5147259cf3791658f131d7"
 [[services]]
 binding = "SIGNAL_WORKER"
 service = "asignal"
+
+regime_stats:${cid}  — TRENDING/RANGING win/loss count
+session_stats:${cid} — London/NY/Asian win/loss
+risk:${cid}          — consecutive loss counter
+weekly_sent:${cid}   — weekly report last sent
