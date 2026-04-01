@@ -1,16 +1,24 @@
 /**
- * FTT Signal Telegram Bot — v3.5
+ * FTT Signal Telegram Bot — v4.0
  * KV Binding     : BOT_KV
  * Service Binding: SIGNAL_WORKER → asignal.umuhammadiswa.workers.dev
  * Secrets        : BOT_TOKEN, SETUP_SECRET
  *
- * Changes in v3.5:
- *  9. Market Regime display — engine v6.6.0 এর marketRegime + regimeAdvice signal card এ দেখায়
- *     • 🔵 TRENDING / 🟡 RANGING / 🟠 BREAKOUT / 🔴 VOLATILE
- *     • Regime-specific trading advice দেখায়
+ * v4.0 — Professional Analytics & Smart Alerts:
+ *  10. Regime-wise win rate stats — TRENDING/RANGING/BREAKOUT/VOLATILE breakdown
+ *  11. Session-wise win rate      — London/NY/Asian/Sydney breakdown
+ *  12. Trade journal (/journal)   — today's detailed breakdown with regime+session
+ *  13. /analyze <pair>            — on-demand full signal analysis
+ *  14. Signal expiry reminder     — 30s before expiry auto notification
+ *  15. Confidence trend alert     — 3 consecutive drops → user notified
+ *  16. Risk management alert      — 3 consecutive LOSS → auto warning + option to pause
+ *  17. Weekly report              — every Monday auto + /weekly manual
+ *  18. logAndSchedule() saves regime + session for analytics
+ *  19. setResult() updates regime/session/pair stats in KV
  *
- * Inherited from v3.4:
- *  8. AI validation display — aiValidation block from worker shown in signal card
+ * Inherited from v3.5:
+ *  9.  Market Regime display
+ *  8.  AI validation display
  *  1-7. All v3.3 features
  */
 
@@ -91,7 +99,7 @@ export default {
       });
     }
 
-    return new Response('FTT Signal Bot v3.5');
+    return new Response('FTT Signal Bot v4.0');
   },
 
   async scheduled(e, env, ctx) {
@@ -155,6 +163,64 @@ const kget = async (k, env) => { try { return await env.BOT_KV.get(k, 'json'); }
 const kput = async (k, v, env, opts = {}) => { try { await env.BOT_KV.put(k, JSON.stringify(v), opts); } catch (e) { console.error('kput', k, e.message); } };
 const kdel = async (k, env) => { try { await env.BOT_KV.delete(k); } catch {} };
 
+// ─── ANALYTICS KV HELPERS ─────────────────────────────────────────────────────
+
+// regime_stats: { TRENDING:{w,l}, RANGING:{w,l}, BREAKOUT:{w,l}, VOLATILE:{w,l} }
+async function getRegimeStats(cid, env) {
+  const d = await kget(`rs:${cid}`, env);
+  return d || { TRENDING:{w:0,l:0}, RANGING:{w:0,l:0}, BREAKOUT:{w:0,l:0}, VOLATILE:{w:0,l:0} };
+}
+async function updateRegimeStats(cid, regime, result, env) {
+  if (!regime || (result !== 'WIN' && result !== 'LOSS')) return;
+  const s = await getRegimeStats(cid, env);
+  if (!s[regime]) s[regime] = { w:0, l:0 };
+  result === 'WIN' ? s[regime].w++ : s[regime].l++;
+  await kput(`rs:${cid}`, s, env);
+}
+
+// session_stats: { LONDON:{w,l}, NEW_YORK:{w,l}, ASIAN:{w,l}, SYDNEY:{w,l}, OVERLAP_LDN_NY:{w,l} }
+async function getSessionStats(cid, env) {
+  const d = await kget(`ss:${cid}`, env);
+  return d || {};
+}
+async function updateSessionStats(cid, sessionKey, result, env) {
+  if (!sessionKey || (result !== 'WIN' && result !== 'LOSS')) return;
+  const s = await getSessionStats(cid, env);
+  if (!s[sessionKey]) s[sessionKey] = { w:0, l:0 };
+  result === 'WIN' ? s[sessionKey].w++ : s[sessionKey].l++;
+  await kput(`ss:${cid}`, s, env);
+}
+
+// risk: consecutive loss counter
+async function getRisk(cid, env) { return (await kget(`risk:${cid}`, env)) || { streak: 0, type: null }; }
+async function updateRisk(cid, result, env) {
+  const r = await getRisk(cid, env);
+  if (result === 'LOSS') {
+    r.streak = r.type === 'LOSS' ? r.streak + 1 : 1;
+    r.type = 'LOSS';
+  } else if (result === 'WIN') {
+    r.streak = r.type === 'WIN' ? r.streak + 1 : 1;
+    r.type = 'WIN';
+  } else {
+    r.streak = 0; r.type = null;
+  }
+  await kput(`risk:${cid}`, r, env, { expirationTtl: 86400 });
+  return r;
+}
+
+// expiry reminders: pending reminder jobs
+async function getPendingReminders(env) { return (await kget('remind_ids', env)) || []; }
+async function addReminder(rem, env) {
+  await kput(`rem:${rem.tradeId}`, rem, env, { expirationTtl: 3600 });
+  const ids = await getPendingReminders(env);
+  if (!ids.includes(rem.tradeId)) await kput('remind_ids', [...ids, rem.tradeId], env);
+}
+async function delReminder(tid, env) {
+  await kdel(`rem:${tid}`, env);
+  const ids = await getPendingReminders(env);
+  await kput('remind_ids', ids.filter(x => x !== tid), env);
+}
+
 // ─── USER ─────────────────────────────────────────────────────────────────────
 
 const DEF_USER = () => ({
@@ -210,6 +276,12 @@ async function setResult(cid, tid, result, exitPrice, pips, env) {
   if (i !== -1) {
     h[i] = { ...h[i], result, exitPrice, pips, resolvedAt: new Date().toISOString() };
     await kput(`h:${cid}`, h, env);
+    // [v4.0] Update analytics stats
+    if (result === 'WIN' || result === 'LOSS') {
+      const trade = h[i];
+      if (trade.regime)     await updateRegimeStats(cid, trade.regime, result, env);
+      if (trade.sessionKey) await updateSessionStats(cid, trade.sessionKey, result, env);
+    }
   }
 }
 
@@ -243,18 +315,32 @@ async function logAndSchedule(cid, pair, sig, env) {
                || sig.recommendations?.['5min']?.entry?.price || null;
   const grade   = sig.grade ? `${sig.grade.grade} ${sig.grade.label}` : '';
   const tid     = uid();
+  // [v4.0] save regime + session for analytics
+  const regime  = sig.marketRegime || 'UNKNOWN';
+  const session = sig.session || {};
+  const sessionKey = session.overlap && session.overlap !== 'NONE'
+    ? session.overlap
+    : (session.sessions && session.sessions[0]) || 'UNKNOWN';
 
   const no = await addHist(cid, {
     id: tid, pair, direction: dir, confidence: sig.confidence || '0%', grade,
-    entryPrice: entry, expiryMinutes: expMins,
-    expiryAt: expAt,
+    entryPrice: entry, expiryMinutes: expMins, expiryAt: expAt,
     timestamp: new Date().toISOString(), result: null,
+    regime, sessionKey,  // [v4.0]
   }, env);
 
   await addPending({
     chatId: String(cid), tradeId: tid, pair, direction: dir,
     entryPrice: entry, expiryAt: expAt, signalNo: no, grade,
+    regime, sessionKey,  // [v4.0]
   }, env);
+
+  // [v4.0] Schedule expiry reminder (30s before expiry)
+  const remAt = expAt - 30000;
+  if (remAt > Date.now()) {
+    await addReminder({ tradeId: tid, chatId: String(cid), pair, direction: dir, signalNo: no, remAt }, env);
+  }
+
   await setLock(cid, pair, dir, expAt, env);
   return no;
 }
@@ -308,10 +394,11 @@ const mainKb = u => kb([
     btn('📊 Signal Now',  'cmd:signal'),
     btn(u.autoEnabled ? '🔕 Stop Auto' : '🔄 Start Auto', 'cmd:toggle_auto'),
   ],
-  [ btn('🔍 Scan All', 'cmd:scanall'),   btn('📅 Today',    'cmd:today')    ],
-  [ btn('👁 Watchlist', 'cmd:watchlist'), btn('📈 History', 'cmd:history:0') ],
-  [ btn('🏆 Stats',    'cmd:stats'),     btn('📋 Summary',  'cmd:summary')  ],
-  [ btn('⚙️ Settings', 'cmd:settings'),  btn('📋 Status',   'cmd:status')   ],
+  [ btn('🔍 Scan All',   'cmd:scanall'),    btn('📅 Today',     'cmd:today')     ],
+  [ btn('👁 Watchlist',  'cmd:watchlist'),  btn('📈 History',   'cmd:history:0') ],
+  [ btn('🏆 Stats',      'cmd:stats'),      btn('📒 Journal',   'cmd:journal')   ],
+  [ btn('📋 Summary',    'cmd:summary'),    btn('📊 Weekly',    'cmd:weekly')    ],
+  [ btn('⚙️ Settings',  'cmd:settings'),   btn('📋 Status',    'cmd:status')    ],
 ]);
 
 const settingsKb = u => kb([
@@ -486,11 +573,11 @@ function fmtHist(hist, page = 0) {
   return msg;
 }
 
-function fmtStats(hist) {
+function fmtStats(hist, regimeStats, sessionStats) {
   const trades   = hist.filter(h => h.direction === 'BUY' || h.direction === 'SELL');
   const resolved = trades.filter(h => h.result === 'WIN' || h.result === 'LOSS');
   const wins     = resolved.filter(h => h.result === 'WIN').length;
-  const losses   = resolved.filter(h => h.result === 'LOSS').length;
+  const losses   = resolved.length - wins;
   const wr       = resolved.length > 0 ? Math.round(wins / resolved.length * 100) : 0;
   const pending  = trades.filter(h => !h.result).length;
   let streak = 0, sT = '';
@@ -499,6 +586,42 @@ function fmtStats(hist) {
     else if (h.result === sT) streak++;
     else break;
   }
+  let msg = `🏆 Win/Loss Stats\n━━━━━━━━━━━━━━\n`;
+  msg += `✅ Wins: ${wins}  ❌ Losses: ${losses}\n`;
+  msg += `📊 Win Rate: ${wr}% (${resolved.length} trades)\n`;
+  msg += `⏳ Pending: ${pending}`;
+  if (streak >= 2) msg += `\n🔥 Streak: ${streak} ${sT}s`;
+
+  // [v4.0] Regime breakdown
+  if (regimeStats) {
+    const regimes = Object.entries(regimeStats).filter(([, s]) => s.w + s.l > 0);
+    if (regimes.length) {
+      msg += `\n\n📊 By Regime:\n`;
+      const rE = { TRENDING:'🔵', RANGING:'🟡', BREAKOUT:'🟠', VOLATILE:'🔴' };
+      for (const [r, s] of regimes) {
+        const t = s.w + s.l;
+        const pct = Math.round(s.w / t * 100);
+        const bar = pct >= 55 ? '✅' : pct >= 45 ? '⚠️' : '❌';
+        msg += `  ${rE[r]||'⚪'} ${r}: ${s.w}W/${s.l}L (${pct}%) ${bar}\n`;
+      }
+    }
+  }
+
+  // [v4.0] Session breakdown
+  if (sessionStats) {
+    const sessions = Object.entries(sessionStats).filter(([, s]) => s.w + s.l > 0);
+    if (sessions.length) {
+      msg += `\n⏰ By Session:\n`;
+      for (const [s, v] of sessions) {
+        const t = v.w + v.l;
+        const pct = Math.round(v.w / t * 100);
+        const bar = pct >= 55 ? '✅' : pct >= 45 ? '⚠️' : '❌';
+        msg += `  ${s}: ${v.w}W/${v.l}L (${pct}%) ${bar}\n`;
+      }
+    }
+  }
+
+  // Pair breakdown
   const pm = {}, gm = {};
   for (const h of resolved) {
     if (!pm[h.pair]) pm[h.pair] = { w:0, l:0 };
@@ -507,16 +630,11 @@ function fmtStats(hist) {
     if (!gm[g]) gm[g] = { w:0, l:0 };
     h.result === 'WIN' ? gm[g].w++ : gm[g].l++;
   }
-  let msg = `🏆 Win/Loss Stats\n━━━━━━━━━━━━━━\n`;
-  msg += `✅ Wins:     ${wins}\n❌ Losses:   ${losses}\n`;
-  msg += `📊 Win Rate: ${wr}% (${resolved.length} trades)\n`;
-  msg += `⏳ Pending:  ${pending}`;
-  if (streak >= 2) msg += `\n🔥 Streak: ${streak} ${sT}s`;
   if (Object.keys(gm).length) {
-    msg += `\n\nGrade:\n`;
+    msg += `\nGrade:\n`;
     for (const [g, s] of Object.entries(gm)) {
       const t = s.w + s.l;
-      msg += `  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w / t * 100)}%)\n`;
+      msg += `  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)\n`;
     }
   }
   if (Object.keys(pm).length) {
@@ -526,9 +644,113 @@ function fmtStats(hist) {
       .slice(0, 5)
       .forEach(([p, s]) => {
         const t = s.w + s.l;
-        msg += `  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w / t * 100)}%)\n`;
+        msg += `  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)\n`;
       });
   }
+  return msg;
+}
+
+// [v4.0] Trade Journal formatter
+function fmtJournal(hist, date) {
+  const today = date || new Date().toISOString().slice(0, 10);
+  const th = hist.filter(x => x.timestamp?.startsWith(today));
+  if (!th.length) return `📒 Journal — ${today}\n\nNo signals today.`;
+
+  const res  = th.filter(x => x.result === 'WIN' || x.result === 'LOSS');
+  const wins = res.filter(x => x.result === 'WIN').length;
+  const wr   = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
+
+  let msg = `📒 Trade Journal — ${today}\n━━━━━━━━━━━━━━\n`;
+  msg += `📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L  📈 ${wr}%\n\n`;
+
+  // Per-trade breakdown
+  for (const x of th.slice(0, 10)) {
+    const dE = x.direction === 'BUY' ? '🟢' : '🔴';
+    const rE = x.result === 'WIN' ? '✅' : x.result === 'LOSS' ? '❌' : x.result === 'CANCEL' ? '🗑' : '⏳';
+    const rg = x.regime ? ` [${x.regime.slice(0,3)}]` : '';
+    const sk = x.sessionKey ? ` ${x.sessionKey.replace('_','-')}` : '';
+    msg += `${rE} #${x.no} ${dE} ${disp(x.pair)} ${x.confidence}${rg}${sk}\n`;
+  }
+  if (th.length > 10) msg += `...+${th.length - 10} more\n`;
+
+  // Regime summary for today
+  const regToday = {};
+  for (const x of res) {
+    if (!x.regime) continue;
+    if (!regToday[x.regime]) regToday[x.regime] = { w:0, l:0 };
+    x.result === 'WIN' ? regToday[x.regime].w++ : regToday[x.regime].l++;
+  }
+  if (Object.keys(regToday).length) {
+    msg += `\nToday's Regimes:\n`;
+    const rE = { TRENDING:'🔵', RANGING:'🟡', BREAKOUT:'🟠', VOLATILE:'🔴' };
+    for (const [r, s] of Object.entries(regToday)) {
+      const t = s.w + s.l;
+      msg += `  ${rE[r]||'⚪'} ${r}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)\n`;
+    }
+  }
+  return msg;
+}
+
+// [v4.0] Weekly Report formatter
+function fmtWeekly(hist, weekLabel) {
+  const now  = new Date();
+  const day  = now.getUTCDay();
+  const diff = day === 0 ? 6 : day - 1;
+  const mon  = new Date(now);
+  mon.setUTCDate(now.getUTCDate() - diff);
+  const weekStart = mon.toISOString().slice(0, 10);
+  const label = weekLabel || `Week of ${weekStart}`;
+
+  const wh = hist.filter(x => x.timestamp >= weekStart);
+  const res = wh.filter(x => x.result === 'WIN' || x.result === 'LOSS');
+  const wins = res.filter(x => x.result === 'WIN').length;
+  const wr = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
+
+  let msg = `📅 Weekly Report — ${label}\n━━━━━━━━━━━━━━\n`;
+  msg += `📊 ${wh.length} signals  ✅ ${wins}W ❌ ${res.length-wins}L\n`;
+  msg += `📈 Win Rate: ${wr}%\n`;
+
+  // Best/worst regime this week
+  const rm = {};
+  for (const x of res) {
+    if (!x.regime) continue;
+    if (!rm[x.regime]) rm[x.regime] = { w:0, l:0 };
+    x.result === 'WIN' ? rm[x.regime].w++ : rm[x.regime].l++;
+  }
+  if (Object.keys(rm).length) {
+    const sorted = Object.entries(rm).map(([r, s]) => {
+      const t = s.w + s.l;
+      return { r, w:s.w, l:s.l, pct: t>0 ? Math.round(s.w/t*100) : 0 };
+    }).sort((a,b) => b.pct - a.pct);
+    const rIcon = { TRENDING:'🔵', RANGING:'🟡', BREAKOUT:'🟠', VOLATILE:'🔴' };
+    msg += `\nRegimes this week:\n`;
+    for (const x of sorted) {
+      const t = x.w + x.l;
+      const bar = x.pct >= 55 ? '✅' : x.pct >= 45 ? '⚠️' : '❌';
+      msg += `  ${rIcon[x.r]||'⚪'} ${x.r}: ${x.w}W/${x.l}L (${x.pct}%) ${bar}\n`;
+    }
+    if (sorted.length > 0) {
+      msg += `\n💡 Best: ${sorted[0].r} (${sorted[0].pct}%)\n`;
+      if (sorted[sorted.length-1].pct < 45)
+        msg += `⚠️ Avoid: ${sorted[sorted.length-1].r} (${sorted[sorted.length-1].pct}%)\n`;
+    }
+  }
+
+  // Top pairs
+  const pm = {};
+  for (const x of res) {
+    if (!pm[x.pair]) pm[x.pair] = { w:0, l:0 };
+    x.result === 'WIN' ? pm[x.pair].w++ : pm[x.pair].l++;
+  }
+  const topPairs = Object.entries(pm)
+    .map(([p,s]) => { const t=s.w+s.l; return { p, w:s.w, l:s.l, pct:t>0?Math.round(s.w/t*100):0 }; })
+    .sort((a,b) => b.pct - a.pct).slice(0, 3);
+  if (topPairs.length) {
+    msg += `\nTop Pairs:\n`;
+    for (const x of topPairs) msg += `  ${disp(x.p)}: ${x.w}W/${x.l}L (${x.pct}%)\n`;
+  }
+
+  msg += `\n🔄 Keep trading the best regimes next week!`;
   return msg;
 }
 
@@ -550,7 +772,7 @@ async function onMessage(msg, env) {
   const R    = (t, kboard) => sendMsg(cid, t, env, kboard ? { reply_markup: kboard } : {});
 
   if (text.startsWith('/start'))
-    return R(`👋 FTT Signal Bot v3.5\n\nSignals + Auto W/L Tracking\n\nPair: ${disp(u.pair)}  ${u.interval}min  Auto ${u.autoEnabled ? 'ON' : 'OFF'}`, mainKb(u));
+    return R(`👋 FTT Signal Bot v4.0\n\nSignals + Analytics + Smart Alerts\n\nPair: ${disp(u.pair)}  ${u.interval}min  Auto ${u.autoEnabled ? 'ON' : 'OFF'}`, mainKb(u));
   if (text.startsWith('/signal'))    return doSignal(cid, null, env);
   if (text.startsWith('/scan'))      return doScanAll(cid, null, env);
   if (text.startsWith('/auto'))      return doToggle(cid, null, env);
@@ -561,6 +783,9 @@ async function onMessage(msg, env) {
   if (text.startsWith('/today'))     return doToday(cid, null, env);
   if (text.startsWith('/summary'))   return doSummary(cid, null, env);
   if (text.startsWith('/cancelall')) return doCancelAll(cid, null, env);
+  if (text.startsWith('/journal'))   return doJournal(cid, null, env);
+  if (text.startsWith('/weekly'))    return doWeekly(cid, null, env);
+  if (text.startsWith('/analyze'))   return doAnalyze(cid, null, text.slice(8).trim() || null, env);
 
   // v3.3: Manual WIN/LOSS — /win 5  or  /loss 5
   if (text.startsWith('/win ') || text.startsWith('/loss ')) {
@@ -583,7 +808,7 @@ async function onMessage(msg, env) {
     return R('❌ Use: 1, 5, or 15', mainKb(u));
   }
   if (text.startsWith('/help'))
-    return R(`FTT Signal Bot v3.5\n\n/signal — get signal now\n/scan — scan all pairs\n/auto — toggle auto scan\n/watchlist /history /stats\n/today /summary /status\n/cancelall — cancel all pending\n/win <no> /loss <no> — manual override\n/pair EURUSD /interval 5\n\n💡 Tip: just type a pair name (eurusd, btcusd, gbp/jpy...) to scan instantly`, mainKb(u));
+    return R(`FTT Signal Bot v4.0\n\n/signal — get signal now\n/scan — scan all pairs\n/auto — toggle auto scan\n/watchlist /history /stats\n/today /summary /status\n/cancelall — cancel all pending\n/win <no> /loss <no> — manual override\n/pair EURUSD /interval 5\n\n💡 Tip: just type a pair name (eurusd, btcusd, gbp/jpy...) to scan instantly`, mainKb(u));
   // ── v3.3 Auto pair detect ─────────────────────────────────────────────────
   // যেকোনো format এ pair লিখলে — eurusd / EUR/USD / eur usd / btc-usd — scan হবে
   const rawPair = text.toUpperCase().replace(/[\s\/\-_.]/g, '');
@@ -619,7 +844,7 @@ async function onCb(cb, env) {
     const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
     const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
     const cnt = await getCounter(cid, env);
-    return R(`FTT Signal Bot v3.5\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nWatchlist: ${u.watchlist.length} pairs  Grade: ${u.gradeFilter || 'ALL'}\n\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`, mainKb(u));
+    return R(`FTT Signal Bot v4.0\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nWatchlist: ${u.watchlist.length} pairs  Grade: ${u.gradeFilter || 'ALL'}\n\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`, mainKb(u));
   }
 
   if (data === 'cmd:signal')      return doSignal(cid, mid, env);
@@ -631,6 +856,8 @@ async function onCb(cb, env) {
   if (data === 'cmd:today')       return doToday(cid, mid, env);
   if (data === 'cmd:summary')     return doSummary(cid, mid, env);
   if (data === 'cmd:settings')    return doSettings(cid, mid, env);
+  if (data === 'cmd:journal')     return doJournal(cid, mid, env);
+  if (data === 'cmd:weekly')      return doWeekly(cid, mid, env);
   if (data.startsWith('cmd:history:')) return doHist(cid, mid, parseInt(data.split(':')[2]) || 0, env);
 
   if (data === 'cmd:intervals')   return R('⏱ Select Interval:', intervalKb());
@@ -818,8 +1045,78 @@ async function doHist(cid, mid, page, env) {
 }
 
 async function doStats(cid, mid, env) {
+  const h  = await getHist(cid, env);
+  const rs = await getRegimeStats(cid, env);
+  const ss = await getSessionStats(cid, env);
+  return reply(cid, mid, fmtStats(h, rs, ss), env, kb([[btn('📈 History', 'cmd:history:0'), btn('📒 Journal', 'cmd:journal'), btn('🔙 Back', 'cmd:main')]]));
+}
+
+// [v4.0] Trade Journal
+async function doJournal(cid, mid, env) {
   const h = await getHist(cid, env);
-  return reply(cid, mid, fmtStats(h), env, kb([[btn('📈 History', 'cmd:history:0'), btn('🔙 Back', 'cmd:main')]]));
+  return reply(cid, mid, fmtJournal(h), env, kb([
+    [btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')],
+    [btn('🔙 Back', 'cmd:main')],
+  ]));
+}
+
+// [v4.0] Weekly Report
+async function doWeekly(cid, mid, env) {
+  const h = await getHist(cid, env);
+  return reply(cid, mid, fmtWeekly(h), env, kb([
+    [btn('🏆 Stats', 'cmd:stats'), btn('📒 Journal', 'cmd:journal')],
+    [btn('🔙 Back', 'cmd:main')],
+  ]));
+}
+
+// [v4.0] On-demand analyze
+async function doAnalyze(cid, mid, pairRaw, env) {
+  const u = await getUser(cid, env);
+  const pair = pairRaw ? pairRaw.toUpperCase().replace(/[\s\/\-_.]/g, '') : norm(u.pair);
+  await reply(cid, mid, `🔍 Analyzing ${disp(pair)}...`, env);
+  try {
+    const data = await fetchSig(pair, env);
+    const sig  = data?.signal;
+    if (!sig) return sendMsg(cid, `❌ No data for ${disp(pair)}`, env, { reply_markup: mainKb(u) });
+
+    const dir  = sig.finalSignal || 'NO_TRADE';
+    const conf = sig.confidence  || '0%';
+    const dE   = dir === 'BUY' ? '🟢' : dir === 'SELL' ? '🔴' : '⚪';
+    const rg   = sig.marketRegime || 'UNKNOWN';
+    const rIcon = { TRENDING:'🔵', RANGING:'🟡', BREAKOUT:'🟠', VOLATILE:'🔴' };
+    const best = sig.bestTimeframe;
+
+    let msg = `🔍 Analysis: ${disp(pair)}\n━━━━━━━━━━━━━━\n`;
+    msg += `${dE} ${dir}  ${conf}  ${sig.grade?.grade||''}\n`;
+    msg += `${rIcon[rg]||'⚪'} Regime: ${rg}\n`;
+    msg += `📈 HTF: ${sig.higherTFTrend||'NEUTRAL'}\n`;
+    msg += `🔗 Alignment: ${sig.alignment||'MIXED'}\n\n`;
+
+    // Per-TF mini breakdown
+    const tfs = ['1min','5min','15min'];
+    for (const tf of tfs) {
+      const r = sig.recommendations?.[tf];
+      if (!r) continue;
+      const td = r.direction === 'BUY' ? '🟢' : r.direction === 'SELL' ? '🔴' : '⚪';
+      msg += `${td} ${tf}: ${r.direction} ${r.score?.diff?.toFixed(1)||0} diff (${r.confluence})\n`;
+    }
+
+    if (sig.entryReason) msg += `\n📝 ${sig.entryReason}\n`;
+    if (sig.regimeAdvice) msg += `💡 ${sig.regimeAdvice}\n`;
+
+    const ai = sig.aiValidation;
+    if (ai?.status === 'OK') {
+      msg += `\n🤖 AI: ${ai.signal} ${ai.confidence}%`;
+      if (ai.concerns) msg += ` ⚠️ ${ai.concerns}`;
+      msg += '\n';
+    }
+
+    await sendMsg(cid, msg, env, { reply_markup: kb([
+      [btn('📊 Get Signal', `qs:${norm(pair)}`), btn('🔙 Menu', 'cmd:main')],
+    ]) });
+  } catch (e) {
+    await sendMsg(cid, `❌ Analysis failed: ${e.message}`, env, { reply_markup: mainKb(u) });
+  }
 }
 
 async function doWatchlist(cid, mid, env) {
@@ -956,7 +1253,9 @@ async function cron(env, logs = [], force = false) {
   if (!env?.BOT_KV)    { log('ERROR: BOT_KV missing');    return; }
   await autoScan(env, log).catch(e => log('ScanErr: ' + e.message));
   await resultCheck(env, log).catch(e => log('ResultErr: ' + e.message));
+  await expiryReminder(env, log).catch(e => log('ReminderErr: ' + e.message));
   await dailySummary(env, log).catch(e => log('SummaryErr: ' + e.message));
+  await weeklyReport(env, log).catch(e => log('WeeklyErr: ' + e.message));
   log('Done');
 }
 
@@ -1103,6 +1402,7 @@ async function resultCheck(env, log) {
       await setResult(t.chatId, tid, result, current, pips, env);
       await clearLock(t.chatId, t.pair, env);
       await kdel(`pt:${tid}`, env);
+      await delReminder(tid, env); // [v4.0] clear expiry reminder
 
       const late  = Math.round((now - t.expiryAt) / 60000);
       const lateS = late > 1 ? ` (+${late}min)` : '';
@@ -1113,6 +1413,18 @@ async function resultCheck(env, log) {
       await sendMsg(t.chatId,
         `📊 Tracking No. ${t.signalNo || tid}${lateS}\n━━━━━━━━━━━━━━\n${rE}  ${dE} ${t.direction} ${disp(t.pair)}${gS}\n💰 Entry:  ${fmtPrice(entry, t.pair)}\n🏁 Exit:   ${fmtPrice(current, t.pair)}\n📏 Move:   ${diff > 0 ? '+' : ''}${pips}${unit}`,
         env, { reply_markup: afterKb() });
+
+      // [v4.0] Risk management alert
+      const risk = await updateRisk(t.chatId, result, env);
+      if (risk.type === 'LOSS' && risk.streak >= 3) {
+        const u = await getUser(t.chatId, env);
+        await sendMsg(t.chatId,
+          `⚠️ Risk Alert — ${risk.streak} Consecutive Losses\n\nConsider taking a break or reducing trade size.\n\nAll-time win rate may help you decide.`,
+          env, { reply_markup: kb([
+            [btn('🏆 Check Stats', 'cmd:stats'), btn('🔕 Stop Auto', 'cmd:toggle_auto')],
+            [btn('🔙 Continue', 'cmd:main')],
+          ]) });
+      }
 
       await checkMilestone(t.chatId, env);
     } catch (e) { log(`Result ${tid}: ${e.message}`); keep.push(tid); }
@@ -1142,6 +1454,54 @@ async function dailySummary(env, log) {
       await kput(`ds:${cid}`, Date.now(), env);
       log(`Summary sent to ${cid}`);
     } catch (e) { log(`Summary ${cid}: ${e.message}`); }
+  }
+}
+
+// [v4.0] Expiry Reminder — 30s before expiry
+async function expiryReminder(env, log) {
+  const ids = await getPendingReminders(env);
+  if (!ids.length) return;
+  const now = Date.now();
+  const remaining = [];
+  for (const tid of ids) {
+    try {
+      const r = await kget(`rem:${tid}`, env);
+      if (!r) continue;
+      if (r.remAt > now) { remaining.push(tid); continue; }
+      const dE = r.direction === 'BUY' ? '🟢' : '🔴';
+      await sendMsg(r.chatId,
+        `⏰ Signal #${r.signalNo} expires in ~30s\n${dE} ${r.direction} ${disp(r.pair)}`,
+        env);
+      await kdel(`rem:${tid}`, env);
+      log(`Reminder sent #${r.signalNo}`);
+    } catch (e) { log(`Reminder ${tid}: ${e.message}`); remaining.push(tid); }
+  }
+  await kput('remind_ids', remaining, env);
+}
+
+// [v4.0] Weekly Report — every Monday at 08:00 UTC
+async function weeklyReport(env, log) {
+  const now  = new Date();
+  const day  = now.getUTCDay();
+  const hour = now.getUTCHours();
+  if (day !== 1 || hour !== 8) return; // Monday 08:00 UTC only
+
+  const users = await getAutoUsers(env);
+  log(`Weekly: ${users.length} users`);
+  for (const cid of users) {
+    try {
+      const lastKey = `wr:${cid}`;
+      const last    = (await kget(lastKey, env)) || 0;
+      if (Date.now() - last < 6 * 24 * 60 * 60 * 1000) continue; // prevent double-send
+      const h   = await getHist(cid, env);
+      const msg = fmtWeekly(h);
+      await sendMsg(cid, msg, env, { reply_markup: kb([
+        [btn('🏆 Stats', 'cmd:stats'), btn('📒 Journal', 'cmd:journal')],
+        [btn('🔙 Menu', 'cmd:main')],
+      ]) });
+      await kput(lastKey, Date.now(), env);
+      log(`Weekly sent to ${cid}`);
+    } catch (e) { log(`Weekly ${cid}: ${e.message}`); }
   }
 }
 
