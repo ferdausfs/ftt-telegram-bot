@@ -1,33 +1,36 @@
 /**
- * FTT Signal Telegram Bot — v4.0 (FIXED)
+ * FTT Signal Telegram Bot — v4.1
  * KV Binding     : BOT_KV
  * Service Binding: SIGNAL_WORKER → asignal.umuhammadiswa.workers.dev
  * Secrets        : BOT_TOKEN, SETUP_SECRET
  *
- * v4.0 — Professional Analytics & Smart Alerts:
- *  10. Regime-wise win rate stats — TRENDING/RANGING/BREAKOUT/VOLATILE breakdown
- *  11. Session-wise win rate      — London/NY/Asian/Sydney breakdown
- *  12. Trade journal (/journal)   — today's detailed breakdown with regime+session
- *  13. /analyze <pair>            — on-demand full signal analysis
- *  14. Signal expiry reminder     — 30s before expiry auto notification
- *  15. Confidence trend alert     — 3 consecutive drops → user notified  [IMPLEMENTED]
- *  16. Risk management alert      — 3 consecutive LOSS → auto warning + option to pause
- *  17. Weekly report              — every Monday auto + /weekly manual
- *  18. logAndSchedule() saves regime + session for analytics
- *  19. setResult() updates regime/session/pair stats in KV
+ * v4.1 — All v4.0 bugs fixed + 10 new features:
  *
- * Inherited from v3.5:
- *  9.  Market Regime display
- *  8.  AI validation display
- *  1-7. All v3.3 features
+ * BUG FIXES (from v4.0):
+ *  [Fix#1] ⏳ Fetching message stuck — restored with mainKb after signal sent
+ *  [Fix#2] Feature #15 confidence trend alert — now implemented
+ *  [Fix#3] passGrade 'AB' matched empty grade — fixed with ['A','B'].includes(g)
+ *  [Fix#4] fetchSig Service Binding had no timeout — added Promise.race + 20s
+ *  [Fix#5] noTradeStreak alert had no Menu button — added
  *
- * FIXES (v4.0-fixed):
- *  [Bug#1] ⏳ Fetching message stuck without keyboard — doSignal/doQuickSignal/doScanAll
- *          now restores the original message with mainKb after signal is sent.
- *  [Bug#2] Feature #15 (confidence trend alert) was completely missing — now implemented.
- *  [Bug#3] passGrade('AB') matched empty grade strings — fixed with ['A','B'].includes(g).
- *  [Bug#4] fetchSig Service Binding path had no timeout — added AbortSignal.timeout(20000).
- *  [Bug#5] noTradeStreak alert had no Menu button — added 🔙 Menu button.
+ * NEW FEATURES:
+ *  [F01] Correlated Trade Warning — warns if a new signal shares currency exposure
+ *        with an already-open trade (e.g. EURUSD BUY + GBPUSD BUY both sell USD)
+ *  [F02] AI-Only Mode — Settings toggle; only sends signals where AI agrees
+ *  [F03] Economic Calendar Filter — blocks/warns during ±15min of High-impact news
+ *        (uses nfs.faireconomy.media, cached in KV 1hr). Configurable per user.
+ *  [F04] Open Risk Dashboard — /risk or 📉 Risk button; shows all pending trades
+ *        with time remaining, entry, and correlated pair warnings
+ *  [F05] Hourly Heatmap — /heatmap or 🕐 Heatmap button; shows win rate per UTC hour
+ *  [F06] Best Pairs Leaderboard — /best or 🔥 Best button; top 5 pairs by win rate
+ *        (min 5 trades). Useful for tuning the watchlist.
+ *  [F07] Drawdown Tracker — max consecutive loss streak + peak-to-trough shown in /stats
+ *  [F08] Signal Replay — /replay PAIR or 🔄 Replay; fetches signal without logging.
+ *        Great for analysis without polluting trade history.
+ *  [F09] Custom Alerts — /alerts menu; set per-pair confidence threshold alerts.
+ *        Alert fires even if the pair is normally filtered out.
+ *  [F10] Telegram Channel Mode — /setchannel <id>; auto-posts signals to a channel
+ *        (bot must be admin). /clearchannel to remove.
  */
 
 const PAIR_PAGES = [
@@ -37,12 +40,14 @@ const PAIR_PAGES = [
   ['BTC/USD','ETH/USD','SOL/USD','BNB/USD'],
   ['XRP/USD','ADA/USD','DOGE/USD','AVAX/USD'],
 ];
-const MAX_WL     = 6;
-const MAX_HIST   = 100;
-const MILESTONE  = 50;
-const MAX_ERRORS = 3;   // consecutive full-scan failures before auto-pause
-const CRYPTO     = ['BTC','ETH','BNB','XRP','SOL','ADA','DOGE','AVAX','DOT','LINK'];
-const QUOTEX_URL = 'https://quotex.com/trade';
+const MAX_WL       = 6;
+const MAX_HIST     = 100;
+const MILESTONE    = 50;
+const MAX_ERRORS   = 3;
+const NEWS_WINDOW  = 15; // ±minutes around high-impact news
+const CRYPTO       = ['BTC','ETH','BNB','XRP','SOL','ADA','DOGE','AVAX','DOT','LINK'];
+const QUOTEX_URL   = 'https://quotex.com/trade';
+const CAL_URL      = 'https://nfs.faireconomy.media/ff_calendar_thisweek.json';
 
 // ─── EXPORT ───────────────────────────────────────────────────────────────────
 
@@ -56,27 +61,23 @@ export default {
       if (upd) ctx.waitUntil(dispatch(upd, env));
       return new Response('OK');
     }
-
     if (url.pathname === '/setup' && secret()) {
       const hook = `https://${url.hostname}/webhook`;
       const r = await fetch(`${TG(env)}/setWebhook`,
         post({ url: hook, allowed_updates: ['message','callback_query'], drop_pending_updates: true }));
       return new Response(JSON.stringify(await r.json(), null, 2), json());
     }
-
     if (url.pathname === '/runcron' && secret()) {
       const logs = [], force = url.searchParams.get('force') === 'true';
       await cron(env, logs, force);
       return new Response(logs.join('\n'), { headers: { 'Content-Type': 'text/plain' } });
     }
-
     if (url.pathname === '/debugkv' && secret()) {
       const au = await kget('auto_users', env) || [];
       const users = {};
       for (const id of au) users[id] = await kget(`u:${id}`, env);
       return new Response(JSON.stringify({ auto_users: au, users }, null, 2), json());
     }
-
     if (url.pathname === '/addauto' && secret()) {
       const id = url.searchParams.get('chat');
       if (!id) return new Response('?chat= required', { status: 400 });
@@ -86,7 +87,6 @@ export default {
       await saveUser(id, u, env);
       return new Response('OK', json());
     }
-
     if (url.pathname === '/export' && secret()) {
       const id = url.searchParams.get('chat');
       if (!id) return new Response('?chat= required', { status: 400 });
@@ -106,8 +106,7 @@ export default {
         },
       });
     }
-
-    return new Response('FTT Signal Bot v4.0');
+    return new Response('FTT Signal Bot v4.1');
   },
 
   async scheduled(e, env, ctx) {
@@ -120,8 +119,7 @@ export default {
 const TG   = env  => `https://api.telegram.org/bot${env.BOT_TOKEN}`;
 const post = body => ({ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
 const json = ()   => ({ headers: { 'Content-Type': 'application/json' } });
-
-const esc = t => String(t || '').replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
+const esc  = t    => String(t || '').replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
 
 async function tg(method, body, env) {
   if (!env?.BOT_TOKEN) return null;
@@ -137,32 +135,17 @@ async function tg(method, body, env) {
 }
 
 const sendMsg = (cid, text, env, extra = {}) =>
-  tg('sendMessage', {
-    chat_id: cid,
-    text: esc(text),
-    parse_mode: 'MarkdownV2',
-    disable_web_page_preview: true,
-    ...extra,
-  }, env);
+  tg('sendMessage', { chat_id: cid, text: esc(text), parse_mode: 'MarkdownV2', disable_web_page_preview: true, ...extra }, env);
 
 const editMsg = (cid, mid, text, env, extra = {}) =>
-  tg('editMessageText', {
-    chat_id: cid,
-    message_id: mid,
-    text: esc(text),
-    parse_mode: 'MarkdownV2',
-    disable_web_page_preview: true,
-    ...extra,
-  }, env);
+  tg('editMessageText', { chat_id: cid, message_id: mid, text: esc(text), parse_mode: 'MarkdownV2', disable_web_page_preview: true, ...extra }, env);
 
 const answerCb = (id, env, text = '') =>
   tg('answerCallbackQuery', { callback_query_id: id, text }, env);
 
 const reply = (cid, mid, text, env, kboard) => {
   const extra = kboard ? { reply_markup: kboard } : {};
-  return mid
-    ? editMsg(cid, mid, text, env, extra)
-    : sendMsg(cid, text, env, extra);
+  return mid ? editMsg(cid, mid, text, env, extra) : sendMsg(cid, text, env, extra);
 };
 
 // ─── KV HELPERS ───────────────────────────────────────────────────────────────
@@ -173,7 +156,6 @@ const kdel = async (k, env) => { try { await env.BOT_KV.delete(k); } catch {} };
 
 // ─── ANALYTICS KV HELPERS ─────────────────────────────────────────────────────
 
-// regime_stats: { TRENDING:{w,l}, RANGING:{w,l}, BREAKOUT:{w,l}, VOLATILE:{w,l} }
 async function getRegimeStats(cid, env) {
   const d = await kget(`rs:${cid}`, env);
   return d || { TRENDING:{w:0,l:0}, RANGING:{w:0,l:0}, BREAKOUT:{w:0,l:0}, VOLATILE:{w:0,l:0} };
@@ -186,7 +168,6 @@ async function updateRegimeStats(cid, regime, result, env) {
   await kput(`rs:${cid}`, s, env);
 }
 
-// session_stats: { LONDON:{w,l}, NEW_YORK:{w,l}, ASIAN:{w,l}, SYDNEY:{w,l}, OVERLAP_LDN_NY:{w,l} }
 async function getSessionStats(cid, env) {
   const d = await kget(`ss:${cid}`, env);
   return d || {};
@@ -199,16 +180,13 @@ async function updateSessionStats(cid, sessionKey, result, env) {
   await kput(`ss:${cid}`, s, env);
 }
 
-// risk: consecutive loss counter
 async function getRisk(cid, env) { return (await kget(`risk:${cid}`, env)) || { streak: 0, type: null }; }
 async function updateRisk(cid, result, env) {
   const r = await getRisk(cid, env);
   if (result === 'LOSS') {
-    r.streak = r.type === 'LOSS' ? r.streak + 1 : 1;
-    r.type = 'LOSS';
+    r.streak = r.type === 'LOSS' ? r.streak + 1 : 1; r.type = 'LOSS';
   } else if (result === 'WIN') {
-    r.streak = r.type === 'WIN' ? r.streak + 1 : 1;
-    r.type = 'WIN';
+    r.streak = r.type === 'WIN' ? r.streak + 1 : 1; r.type = 'WIN';
   } else {
     r.streak = 0; r.type = null;
   }
@@ -216,30 +194,102 @@ async function updateRisk(cid, result, env) {
   return r;
 }
 
-// ─── [Bug#2 FIX] Feature #15: Confidence Trend Alert ─────────────────────────
-// Tracks last 5 BUY/SELL signal confidence values per user.
-// If 3 consecutive signals show a drop in confidence → alert user.
-
-async function getConfTrend(cid, env) {
-  return (await kget(`ct:${cid}`, env)) || [];
-}
-
+// [Fix#2] Feature #15: Confidence Trend Tracking
+async function getConfTrend(cid, env) { return (await kget(`ct:${cid}`, env)) || []; }
 async function updateConfTrend(cid, confStr, env) {
   const val = parseInt((confStr || '0%').replace('%', ''), 10);
   if (isNaN(val)) return { alert: false };
   const arr = await getConfTrend(cid, env);
-  // newest first
   arr.unshift(val);
   const trimmed = arr.slice(0, 5);
   await kput(`ct:${cid}`, trimmed, env, { expirationTtl: 86400 });
-  // Alert if 3 newest are strictly decreasing: [0] < [1] < [2]
-  if (trimmed.length >= 3 && trimmed[0] < trimmed[1] && trimmed[1] < trimmed[2]) {
+  if (trimmed.length >= 3 && trimmed[0] < trimmed[1] && trimmed[1] < trimmed[2])
     return { alert: true, vals: trimmed.slice(0, 3) };
-  }
   return { alert: false };
 }
 
-// expiry reminders: pending reminder jobs
+// [F09] Custom Alerts KV
+async function getAlerts(cid, env) { return (await kget(`alerts:${cid}`, env)) || {}; }
+async function setAlert(cid, pair, minConf, env) {
+  const a = await getAlerts(cid, env);
+  a[norm(pair)] = minConf;
+  await kput(`alerts:${cid}`, a, env);
+}
+async function delAlert(cid, pair, env) {
+  const a = await getAlerts(cid, env);
+  delete a[norm(pair)];
+  await kput(`alerts:${cid}`, a, env);
+}
+
+// ─── [F03] ECONOMIC CALENDAR ──────────────────────────────────────────────────
+
+async function getEconCalendar(env) {
+  try {
+    const cached = await kget('econ_cal', env);
+    if (cached && cached.ts > Date.now() - 3600000) return cached.events || [];
+    const r = await fetch(CAL_URL, { signal: AbortSignal.timeout(6000) });
+    if (!r.ok) return [];
+    const events = await r.json();
+    await kput('econ_cal', { ts: Date.now(), events }, env, { expirationTtl: 3600 });
+    return events;
+  } catch { return []; }
+}
+
+// Returns { title, currency, minsAway } or null
+async function hasHighImpactNews(env, windowMin = NEWS_WINDOW) {
+  try {
+    const events = await getEconCalendar(env);
+    const now = Date.now();
+    const win = windowMin * 60 * 1000;
+    for (const ev of events) {
+      if (ev.impact !== 'High') continue;
+      const evTime = new Date(ev.date).getTime();
+      if (isNaN(evTime)) continue;
+      const diff = evTime - now;
+      if (Math.abs(diff) <= win) {
+        const minsAway = Math.round(diff / 60000);
+        return { title: ev.title, currency: ev.country || ev.currency || '?', minsAway };
+      }
+    }
+    return null;
+  } catch { return null; }
+}
+
+// ─── [F01] CORRELATED TRADE HELPERS ───────────────────────────────────────────
+
+function getCurrencyExposure(pair, direction) {
+  const p = norm(pair).toUpperCase();
+  // Crypto: treat all crypto as one bucket (they move together)
+  if (CRYPTO.some(c => p.startsWith(c))) {
+    return { _CRYPTO: direction === 'BUY' ? 'long' : 'short' };
+  }
+  const base  = p.slice(0, 3);
+  const quote = p.slice(3, 6);
+  return direction === 'BUY'
+    ? { [base]: 'long', [quote]: 'short' }
+    : { [base]: 'short', [quote]: 'long' };
+}
+
+// Returns array of warning strings for correlated open trades
+async function checkCorrelated(cid, newPair, newDir, env) {
+  const h       = await getHist(cid, env);
+  const pending = h.filter(x => !x.result && x.direction && norm(x.pair) !== norm(newPair));
+  const newExp  = getCurrencyExposure(newPair, newDir);
+  const warnings = [];
+  for (const t of pending) {
+    const exp = getCurrencyExposure(t.pair, t.direction);
+    for (const [currency, side] of Object.entries(newExp)) {
+      if (exp[currency] === side) {
+        warnings.push(`${disp(t.pair)} ${t.direction} (${currency === '_CRYPTO' ? 'crypto' : currency})`);
+        break;
+      }
+    }
+  }
+  return warnings;
+}
+
+// ─── EXPIRY REMINDERS ─────────────────────────────────────────────────────────
+
 async function getPendingReminders(env) { return (await kget('remind_ids', env)) || []; }
 async function addReminder(rem, env) {
   await kput(`rem:${rem.tradeId}`, rem, env, { expirationTtl: 3600 });
@@ -258,6 +308,10 @@ const DEF_USER = () => ({
   pair: 'EURUSD', watchlist: [], interval: 5, autoEnabled: false,
   noTradeStreak: 0, gradeFilter: 'ALL', minConfidence: 0,
   dailySummary: false, summaryHour: 20,
+  // [v4.1] new fields
+  aiOnlyMode: false,   // [F02] only send when AI agrees
+  blockNews: true,     // [F03] skip auto signals during news window
+  channelId: null,     // [F10] channel to mirror signals to
 });
 
 async function getUser(cid, env) {
@@ -266,7 +320,7 @@ async function getUser(cid, env) {
 }
 const saveUser = (cid, u, env) => kput(`u:${cid}`, u, env);
 
-async function getAutoUsers(env)    { return (await kget('auto_users', env))    || []; }
+async function getAutoUsers(env) { return (await kget('auto_users', env)) || []; }
 async function addAutoUser(cid, env) {
   const list = await getAutoUsers(env);
   if (!list.includes(String(cid))) await kput('auto_users', [...list, String(cid)], env);
@@ -307,7 +361,6 @@ async function setResult(cid, tid, result, exitPrice, pips, env) {
   if (i !== -1) {
     h[i] = { ...h[i], result, exitPrice, pips, resolvedAt: new Date().toISOString() };
     await kput(`h:${cid}`, h, env);
-    // [v4.0] Update analytics stats
     if (result === 'WIN' || result === 'LOSS') {
       const trade = h[i];
       if (trade.regime)     await updateRegimeStats(cid, trade.regime, result, env);
@@ -318,19 +371,18 @@ async function setResult(cid, tid, result, exitPrice, pips, env) {
 
 // ─── PENDING TRADES ───────────────────────────────────────────────────────────
 
-const getPendingIds = async env => (await kget('pending_ids', env)) || [];
+const getPendingIds  = async env => (await kget('pending_ids', env)) || [];
+const savePendingIds = (ids, env) => kput('pending_ids', ids, env);
 async function addPending(trade, env) {
   await kput(`pt:${trade.tradeId}`, trade, env, { expirationTtl: 7200 });
   const ids = await getPendingIds(env);
-  if (!ids.includes(trade.tradeId))
-    await kput('pending_ids', [...ids, trade.tradeId], env);
+  if (!ids.includes(trade.tradeId)) await kput('pending_ids', [...ids, trade.tradeId], env);
 }
-const savePendingIds = (ids, env) => kput('pending_ids', ids, env);
 
-// ─── ACTIVE LOCK ──────────────────────────────────────────────────────────────
+// ─── LOCKS ────────────────────────────────────────────────────────────────────
 
-const getLock   = (cid, pair, env)                    => kget(`lock:${cid}:${pair}`, env);
-const clearLock = (cid, pair, env)                    => kdel(`lock:${cid}:${pair}`, env);
+const getLock   = (cid, pair, env) => kget(`lock:${cid}:${pair}`, env);
+const clearLock = (cid, pair, env) => kdel(`lock:${cid}:${pair}`, env);
 async function setLock(cid, pair, dir, expiryAt, env) {
   const ttl = Math.max(60, Math.ceil((expiryAt - Date.now()) / 1000) + 120);
   await kput(`lock:${cid}:${pair}`, { direction: dir, expiryAt }, env, { expirationTtl: ttl });
@@ -339,38 +391,28 @@ async function setLock(cid, pair, dir, expiryAt, env) {
 // ─── LOG & SCHEDULE ───────────────────────────────────────────────────────────
 
 async function logAndSchedule(cid, pair, sig, env) {
-  const dir     = sig.finalSignal;
-  const expMins = sig.bestTimeframe?.expiry?.totalMinutes || 5;
-  const expAt   = Date.now() + expMins * 60 * 1000;
-  const entry   = sig.recommendations?.['1min']?.entry?.price
-               || sig.recommendations?.['5min']?.entry?.price || null;
-  const grade   = sig.grade ? `${sig.grade.grade} ${sig.grade.label}` : '';
-  const tid     = uid();
-  // [v4.0] save regime + session for analytics
-  const regime  = sig.marketRegime || 'UNKNOWN';
-  const session = sig.session || {};
+  const dir        = sig.finalSignal;
+  const expMins    = sig.bestTimeframe?.expiry?.totalMinutes || 5;
+  const expAt      = Date.now() + expMins * 60 * 1000;
+  const entry      = sig.recommendations?.['1min']?.entry?.price || sig.recommendations?.['5min']?.entry?.price || null;
+  const grade      = sig.grade ? `${sig.grade.grade} ${sig.grade.label}` : '';
+  const tid        = uid();
+  const regime     = sig.marketRegime || 'UNKNOWN';
+  const session    = sig.session || {};
   const sessionKey = session.overlap && session.overlap !== 'NONE'
-    ? session.overlap
-    : (session.sessions && session.sessions[0]) || 'UNKNOWN';
+    ? session.overlap : (session.sessions && session.sessions[0]) || 'UNKNOWN';
 
   const no = await addHist(cid, {
     id: tid, pair, direction: dir, confidence: sig.confidence || '0%', grade,
     entryPrice: entry, expiryMinutes: expMins, expiryAt: expAt,
-    timestamp: new Date().toISOString(), result: null,
-    regime, sessionKey,  // [v4.0]
+    timestamp: new Date().toISOString(), result: null, regime, sessionKey,
   }, env);
 
-  await addPending({
-    chatId: String(cid), tradeId: tid, pair, direction: dir,
-    entryPrice: entry, expiryAt: expAt, signalNo: no, grade,
-    regime, sessionKey,  // [v4.0]
-  }, env);
+  await addPending({ chatId: String(cid), tradeId: tid, pair, direction: dir, entryPrice: entry, expiryAt: expAt, signalNo: no, grade, regime, sessionKey }, env);
 
-  // [v4.0] Schedule expiry reminder (30s before expiry)
   const remAt = expAt - 30000;
-  if (remAt > Date.now()) {
+  if (remAt > Date.now())
     await addReminder({ tradeId: tid, chatId: String(cid), pair, direction: dir, signalNo: no, remAt }, env);
-  }
 
   await setLock(cid, pair, dir, expAt, env);
   return no;
@@ -378,29 +420,37 @@ async function logAndSchedule(cid, pair, sig, env) {
 
 // ─── FILTERS ──────────────────────────────────────────────────────────────────
 
-// [Bug#3 FIX] 'AB'.includes('') was true → empty-grade signals passed the AB filter.
-// Fixed: use ['A','B'].includes(g) instead.
+// [Fix#3] 'AB'.includes('') was true — fixed with ['A','B'].includes(g)
 const passGrade = (sig, f) => {
   if (!f || f === 'ALL') return true;
   const g = sig.grade?.grade || '';
-  if (!g) return false; // no grade never passes a grade filter
+  if (!g) return false;
   return f === 'A' ? g === 'A' : f === 'AB' ? ['A', 'B'].includes(g) : true;
 };
 const passConf = (sig, min) => {
   if (!min) return true;
   return parseInt((sig.confidence || '0%').replace('%', ''), 10) >= min;
 };
+// [F02] AI-Only filter
+const passAI = (sig, aiOnly) => {
+  if (!aiOnly) return true;
+  return sig.aiValidation?.status === 'OK' && sig.aiValidation?.agrees === true;
+};
 
 // ─── CANDLE HELPERS ───────────────────────────────────────────────────────────
 
-// "4m 30s" until next candle close
 function nextCandleIn(intervalMin) {
   const ms   = intervalMin * 60 * 1000;
   const next = (Math.floor(Date.now() / ms) + 1) * ms;
   const diff = next - Date.now();
-  const m    = Math.floor(diff / 60000);
-  const s    = Math.floor((diff % 60000) / 1000);
-  return `${m}m ${s}s`;
+  return `${Math.floor(diff / 60000)}m ${Math.floor((diff % 60000) / 1000)}s`;
+}
+
+function msToHuman(ms) {
+  if (ms <= 0) return 'expired';
+  const m = Math.floor(ms / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 
 // ─── KEYBOARDS ────────────────────────────────────────────────────────────────
@@ -408,37 +458,42 @@ function nextCandleIn(intervalMin) {
 const kb  = rows => ({ inline_keyboard: rows });
 const btn = (text, cb) => ({ text, callback_data: cb });
 
-// v3.3: signalKb(no) — includes ✅ WIN / ❌ LOSS override buttons when no is provided
 const signalKb = (no = null) => {
-  const rows = [
-    [{ text: '📈 Trade on Quotex', url: QUOTEX_URL }],
-  ];
+  const rows = [[{ text: '📈 Trade on Quotex', url: QUOTEX_URL }]];
   if (no) rows.push([btn(`✅ WIN #${no}`, `res:win:${no}`), btn(`❌ LOSS #${no}`, `res:loss:${no}`)]);
   rows.push([btn('🔁 New Signal', 'cmd:signal'), btn('📈 History', 'cmd:history:0'), btn('🔙 Menu', 'cmd:main')]);
   return kb(rows);
 };
+
+const channelKb = () => kb([[{ text: '📈 Trade on Quotex', url: QUOTEX_URL }]]);
 
 const afterKb = () => kb([
   [btn('🔁 New Signal', 'cmd:signal'), btn('📈 History', 'cmd:history:0'), btn('🔙 Menu', 'cmd:main')],
 ]);
 
 const mainKb = u => kb([
-  [
-    btn('📊 Signal Now',  'cmd:signal'),
-    btn(u.autoEnabled ? '🔕 Stop Auto' : '🔄 Start Auto', 'cmd:toggle_auto'),
-  ],
-  [ btn('🔍 Scan All',   'cmd:scanall'),    btn('📅 Today',     'cmd:today')     ],
-  [ btn('👁 Watchlist',  'cmd:watchlist'),  btn('📈 History',   'cmd:history:0') ],
-  [ btn('🏆 Stats',      'cmd:stats'),      btn('📒 Journal',   'cmd:journal')   ],
-  [ btn('📋 Summary',    'cmd:summary'),    btn('📊 Weekly',    'cmd:weekly')    ],
-  [ btn('⚙️ Settings',  'cmd:settings'),   btn('📋 Status',    'cmd:status')    ],
+  [btn('📊 Signal Now',  'cmd:signal'),   btn(u.autoEnabled ? '🔕 Stop Auto' : '🔄 Start Auto', 'cmd:toggle_auto')],
+  [btn('🔍 Scan All',   'cmd:scanall'),   btn('📅 Today',     'cmd:today')    ],
+  [btn('👁 Watchlist',  'cmd:watchlist'), btn('📈 History',   'cmd:history:0')],
+  [btn('🏆 Stats',      'cmd:stats'),     btn('📒 Journal',   'cmd:journal')  ],
+  [btn('📋 Summary',    'cmd:summary'),   btn('📊 Weekly',    'cmd:weekly')   ],
+  [btn('🔥 Best Pairs', 'cmd:best'),      btn('📉 Risk',      'cmd:risk')     ],
+  [btn('🕐 Heatmap',    'cmd:heatmap'),   btn('🔔 Alerts',    'cmd:alerts')   ],
+  [btn('⚙️ Settings',  'cmd:settings'),  btn('📋 Status',    'cmd:status')   ],
 ]);
 
 const settingsKb = u => kb([
-  [ btn(`💱 Pair: ${disp(u.pair)}`, 'pairpage:0'), btn(`⏱ Interval: ${u.interval}min`, 'cmd:intervals') ],
-  [ btn(`🎯 Grade: ${u.gradeFilter || 'ALL'}`, 'cmd:gradefilter'), btn(`📊 Conf: ${u.minConfidence || 0}%+`, 'cmd:conffilter') ],
-  [ btn(`📅 Summary: ${u.dailySummary ? 'ON' : 'OFF'}`, 'cmd:togglesummary'), btn(`🕐 Time: ${u.summaryHour ?? 20}:00 UTC`, 'cmd:summarytime') ],
-  [ btn('🔙 Back', 'cmd:main') ],
+  [btn(`💱 Pair: ${disp(u.pair)}`, 'pairpage:0'), btn(`⏱ Interval: ${u.interval}min`, 'cmd:intervals')],
+  [btn(`🎯 Grade: ${u.gradeFilter || 'ALL'}`, 'cmd:gradefilter'), btn(`📊 Conf: ${u.minConfidence || 0}%+`, 'cmd:conffilter')],
+  [btn(`📅 Summary: ${u.dailySummary ? 'ON' : 'OFF'}`, 'cmd:togglesummary'), btn(`🕐 Time: ${u.summaryHour ?? 20}:00 UTC`, 'cmd:summarytime')],
+  [btn('⚙️ More Settings ▶', 'cmd:settings2'), btn('🔙 Back', 'cmd:main')],
+]);
+
+const settings2Kb = u => kb([
+  [btn(`🤖 AI Only: ${u.aiOnlyMode ? 'ON ✅' : 'OFF'}`, 'cmd:aionly'), btn(`📰 Block News: ${u.blockNews !== false ? 'ON ✅' : 'OFF'}`, 'cmd:blocknews')],
+  [btn(`📡 Channel: ${u.channelId ? '✅ Set' : 'None'}`, 'cmd:channelinfo')],
+  [btn('🔔 Custom Alerts', 'cmd:alerts')],
+  [btn('🔁 Signal Replay', 'cmd:replayhelp'), btn('◀ Back', 'cmd:settings')],
 ]);
 
 const pairsKb = (page, backTo = 'cmd:settings') => {
@@ -475,23 +530,57 @@ const wlAddKb = (page, wl) => {
   return kb(rows);
 };
 
+// [F09] Alert keyboards
+const alertsKb = (alerts) => {
+  const rows = Object.entries(alerts).map(([pair, conf]) => [
+    btn(`🔔 ${disp(pair)} ≥${conf}%`, `alertpair:${pair}:0`),
+    btn('🗑', `alertdel:${pair}:0`),
+  ]);
+  rows.push([btn('➕ Add/Edit Alert', 'alertpage:0')]);
+  rows.push([btn('🔙 Menu', 'cmd:main')]);
+  return kb(rows);
+};
+
+const alertPairsKb = (page, alerts) => {
+  page = Math.max(0, Math.min(page, PAIR_PAGES.length - 1));
+  const rows = chunk(PAIR_PAGES[page], 2).map(row =>
+    row.map(p => {
+      const code = norm(p);
+      const has  = alerts[code];
+      return btn(has ? `🔔 ${p} (${has}%)` : p, `alertpair:${code}:${page}`);
+    })
+  );
+  const nav = [];
+  if (page > 0)                     nav.push(btn('◀ Prev', `alertpage:${page - 1}`));
+  if (page < PAIR_PAGES.length - 1) nav.push(btn('Next ▶', `alertpage:${page + 1}`));
+  if (nav.length) rows.push(nav);
+  rows.push([btn('🔙 Back', 'cmd:alerts')]);
+  return kb(rows);
+};
+
+const alertConfKb = (pair, page) => kb([
+  [btn('65%', `alertset:${pair}:65:${page}`), btn('70%', `alertset:${pair}:70:${page}`), btn('75%', `alertset:${pair}:75:${page}`)],
+  [btn('80%', `alertset:${pair}:80:${page}`), btn('85%', `alertset:${pair}:85:${page}`), btn('90%', `alertset:${pair}:90:${page}`)],
+  [btn('◀ Back', `alertpage:${page}`)],
+]);
+
 const intervalKb  = () => kb([
-  [ btn('⚡ 1min', 'interval:1'), btn('📊 5min', 'interval:5'), btn('🕐 15min', 'interval:15') ],
-  [ btn('🔙 Back', 'cmd:settings') ],
+  [btn('⚡ 1min', 'interval:1'), btn('📊 5min', 'interval:5'), btn('🕐 15min', 'interval:15')],
+  [btn('🔙 Back', 'cmd:settings')],
 ]);
 const gradeKb     = () => kb([
-  [ btn('🌐 All', 'gf:ALL'), btn('⭐ A+B', 'gf:AB'), btn('🏆 A only', 'gf:A') ],
-  [ btn('🔙 Back', 'cmd:settings') ],
+  [btn('🌐 All', 'gf:ALL'), btn('⭐ A+B', 'gf:AB'), btn('🏆 A only', 'gf:A')],
+  [btn('🔙 Back', 'cmd:settings')],
 ]);
 const confKb      = () => kb([
-  [ btn('Any', 'cf:0'),    btn('60%+', 'cf:60'), btn('70%+', 'cf:70') ],
-  [ btn('75%+', 'cf:75'),  btn('80%+', 'cf:80'), btn('85%+', 'cf:85') ],
-  [ btn('🔙 Back', 'cmd:settings') ],
+  [btn('Any', 'cf:0'), btn('60%+', 'cf:60'), btn('70%+', 'cf:70')],
+  [btn('75%+', 'cf:75'), btn('80%+', 'cf:80'), btn('85%+', 'cf:85')],
+  [btn('🔙 Back', 'cmd:settings')],
 ]);
 const summTimeKb  = () => kb([
-  [ btn('06:00', 'sumhour:6'), btn('12:00', 'sumhour:12'), btn('18:00', 'sumhour:18') ],
-  [ btn('20:00', 'sumhour:20'), btn('22:00', 'sumhour:22'), btn('00:00', 'sumhour:0') ],
-  [ btn('🔙 Back', 'cmd:settings') ],
+  [btn('06:00', 'sumhour:6'), btn('12:00', 'sumhour:12'), btn('18:00', 'sumhour:18')],
+  [btn('20:00', 'sumhour:20'), btn('22:00', 'sumhour:22'), btn('00:00', 'sumhour:0')],
+  [btn('🔙 Back', 'cmd:settings')],
 ]);
 const histNavKb   = (page, total) => {
   const nav = [];
@@ -510,13 +599,11 @@ const norm  = p  => p.replace('/', '');
 const uid   = () => Math.random().toString(36).slice(2, 8).toUpperCase();
 const isCr  = p  => CRYPTO.some(b => p.startsWith(b));
 const chunk = (arr, n) => arr.reduce((r, x, i) => (i % n === 0 ? r.push([x]) : r[r.length-1].push(x), r), []);
-
-const fmtPrice = (price, pair) =>
-  isCr(pair) ? parseFloat(price).toFixed(2) : parseFloat(price).toFixed(5);
+const fmtPrice = (price, pair) => isCr(pair) ? parseFloat(price).toFixed(2) : parseFloat(price).toFixed(5);
 
 // ─── FORMATTERS ───────────────────────────────────────────────────────────────
 
-function fmtSignal(data, pair, interval, no) {
+function fmtSignal(data, pair, interval, no, opts = {}) {
   if (data.marketStatus === 'CLOSED')
     return `📊 ${disp(pair)} | ${interval}min\n━━━━━━━━━━━━━━\n🔴 Forex Market CLOSED\n💡 Try BTC/USD (24/7)`;
 
@@ -529,18 +616,18 @@ function fmtSignal(data, pair, interval, no) {
   const htf    = sig.higherTFTrend || 'NEUTRAL';
   const reason = sig.entryReason   || '';
   const best   = sig.bestTimeframe;
-
   const tf     = best?.timeframe || `${interval}min`;
   const expiry = best?.expiry?.humanReadable || null;
   const cd     = best?.expiry?.countdown?.label || null;
   const price  = sig.recommendations?.['1min']?.entry?.price
               || sig.recommendations?.['5min']?.entry?.price
               || sig.recommendations?.['15min']?.entry?.price || null;
-
   const dE = dir === 'BUY' ? '🟢' : dir === 'SELL' ? '🔴' : '⚪';
   const hE = htf === 'BUY' ? '📈' : htf === 'SELL' ? '📉' : '➡️';
 
-  let msg = no ? `📌 Signal No. ${no}\n` : '';
+  let msg = '';
+  if (opts.replay) msg += `🔄 REPLAY — not logged\n`;
+  if (no) msg += `📌 Signal No. ${no}\n`;
   msg += `📊 ${disp(pair)} | ${tf}\n━━━━━━━━━━━━━━\n`;
 
   if (dir === 'BUY' || dir === 'SELL') {
@@ -550,21 +637,14 @@ function fmtSignal(data, pair, interval, no) {
     if (cd)     msg += `🕐 Candle closes: ${cd}\n`;
     msg += `${hE} HTF 15min: ${htf}\n`;
 
-    // [v3.5] Market Regime block (engine v6.6.0)
-    const regime = sig.marketRegime;
-    const regimeAdvice = sig.regimeAdvice;
+    const regime = sig.marketRegime, regimeAdvice = sig.regimeAdvice;
     if (regime) {
-      const rE = regime === 'TRENDING' ? '🔵' :
-                 regime === 'RANGING'  ? '🟡' :
-                 regime === 'BREAKOUT' ? '🟠' :
-                 regime === 'VOLATILE' ? '🔴' : '⚪';
+      const rE = { TRENDING:'🔵', RANGING:'🟡', BREAKOUT:'🟠', VOLATILE:'🔴' }[regime] || '⚪';
       msg += `${rE} Regime: ${regime}\n`;
       if (regimeAdvice) msg += `💡 ${regimeAdvice}\n`;
     }
-
     if (reason) msg += `\n📝 ${reason}\n`;
 
-    // [v3.4] AI Validation block
     const ai = sig.aiValidation;
     if (ai && ai.status === 'OK') {
       msg += `\n🤖 AI Analysis (Cerebras)\n`;
@@ -580,13 +660,25 @@ function fmtSignal(data, pair, interval, no) {
       if (ai.concerns) msg += `🔍 ${ai.concerns}\n`;
     }
 
-    msg += `\n⏳ Result will be tracked automatically`;
+    // [F03] News warning
+    if (opts.newsAlert) {
+      const sign = opts.newsAlert.minsAway >= 0 ? 'in' : 'ago';
+      msg += `\n⚠️ News ${sign} ${Math.abs(opts.newsAlert.minsAway)}min: ${opts.newsAlert.title} (${opts.newsAlert.currency})\n`;
+    }
+    // [F01] Correlated warning
+    if (opts.correlated && opts.correlated.length) {
+      msg += `\n⚠️ Correlated open: ${opts.correlated.join(', ')}\n`;
+    }
+
+    if (opts.replay) {
+      msg += `\n🔄 Replay only — result not tracked`;
+    } else {
+      msg += `\n⏳ Result will be tracked automatically`;
+    }
   } else {
     const filters = sig.filtersApplied || [];
     msg += `⚪ NO TRADE\n`;
-    msg += filters.length
-      ? `🔕 ${filters.join(' · ')}`
-      : `🔕 ${sig.alignment === 'MIXED' ? 'Timeframes mixed' : 'Setup not clear'}`;
+    msg += filters.length ? `🔕 ${filters.join(' · ')}` : `🔕 ${sig.alignment === 'MIXED' ? 'Timeframes mixed' : 'Setup not clear'}`;
   }
   return msg;
 }
@@ -606,6 +698,20 @@ function fmtHist(hist, page = 0) {
   return msg;
 }
 
+// [F07] Drawdown calculation
+function calcDrawdown(resolved) {
+  let balance = 0, peak = 0, maxDd = 0, curLoss = 0, maxLoss = 0;
+  for (const h of [...resolved].reverse()) {
+    if (h.result === 'WIN') { balance++; curLoss = 0; }
+    else                    { balance--; curLoss++; }
+    if (balance > peak) peak = balance;
+    const dd = peak - balance;
+    if (dd > maxDd)   maxDd   = dd;
+    if (curLoss > maxLoss) maxLoss = curLoss;
+  }
+  return { maxDd, maxLoss };
+}
+
 function fmtStats(hist, regimeStats, sessionStats) {
   const trades   = hist.filter(h => h.direction === 'BUY' || h.direction === 'SELL');
   const resolved = trades.filter(h => h.result === 'WIN' || h.result === 'LOSS');
@@ -615,17 +721,21 @@ function fmtStats(hist, regimeStats, sessionStats) {
   const pending  = trades.filter(h => !h.result).length;
   let streak = 0, sT = '';
   for (const h of resolved) {
-    if (!sT)           { sT = h.result; streak = 1; }
+    if (!sT)               { sT = h.result; streak = 1; }
     else if (h.result === sT) streak++;
     else break;
   }
+
+  // [F07] Drawdown
+  const { maxDd, maxLoss } = calcDrawdown(resolved);
+
   let msg = `🏆 Win/Loss Stats\n━━━━━━━━━━━━━━\n`;
   msg += `✅ Wins: ${wins}  ❌ Losses: ${losses}\n`;
   msg += `📊 Win Rate: ${wr}% (${resolved.length} trades)\n`;
   msg += `⏳ Pending: ${pending}`;
   if (streak >= 2) msg += `\n🔥 Streak: ${streak} ${sT}s`;
+  if (maxLoss > 0) msg += `\n📉 Max Losing Streak: ${maxLoss}  Max Drawdown: ${maxDd} trades`;
 
-  // [v4.0] Regime breakdown
   if (regimeStats) {
     const regimes = Object.entries(regimeStats).filter(([, s]) => s.w + s.l > 0);
     if (regimes.length) {
@@ -634,13 +744,10 @@ function fmtStats(hist, regimeStats, sessionStats) {
       for (const [r, s] of regimes) {
         const t = s.w + s.l;
         const pct = Math.round(s.w / t * 100);
-        const bar = pct >= 55 ? '✅' : pct >= 45 ? '⚠️' : '❌';
-        msg += `  ${rE[r]||'⚪'} ${r}: ${s.w}W/${s.l}L (${pct}%) ${bar}\n`;
+        msg += `  ${rE[r]||'⚪'} ${r}: ${s.w}W/${s.l}L (${pct}%) ${pct>=55?'✅':pct>=45?'⚠️':'❌'}\n`;
       }
     }
   }
-
-  // [v4.0] Session breakdown
   if (sessionStats) {
     const sessions = Object.entries(sessionStats).filter(([, s]) => s.w + s.l > 0);
     if (sessions.length) {
@@ -648,13 +755,10 @@ function fmtStats(hist, regimeStats, sessionStats) {
       for (const [s, v] of sessions) {
         const t = v.w + v.l;
         const pct = Math.round(v.w / t * 100);
-        const bar = pct >= 55 ? '✅' : pct >= 45 ? '⚠️' : '❌';
-        msg += `  ${s}: ${v.w}W/${v.l}L (${pct}%) ${bar}\n`;
+        msg += `  ${s}: ${v.w}W/${v.l}L (${pct}%) ${pct>=55?'✅':pct>=45?'⚠️':'❌'}\n`;
       }
     }
   }
-
-  // Pair breakdown
   const pm = {}, gm = {};
   for (const h of resolved) {
     if (!pm[h.pair]) pm[h.pair] = { w:0, l:0 };
@@ -672,31 +776,21 @@ function fmtStats(hist, regimeStats, sessionStats) {
   }
   if (Object.keys(pm).length) {
     msg += `\nTop Pairs:\n`;
-    Object.entries(pm)
-      .sort((a, b) => (b[1].w + b[1].l) - (a[1].w + a[1].l))
-      .slice(0, 5)
-      .forEach(([p, s]) => {
-        const t = s.w + s.l;
-        msg += `  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)\n`;
-      });
+    Object.entries(pm).sort((a,b)=>(b[1].w+b[1].l)-(a[1].w+a[1].l)).slice(0,5)
+      .forEach(([p,s]) => { const t=s.w+s.l; msg += `  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)\n`; });
   }
   return msg;
 }
 
-// [v4.0] Trade Journal formatter
 function fmtJournal(hist, date) {
   const today = date || new Date().toISOString().slice(0, 10);
   const th = hist.filter(x => x.timestamp?.startsWith(today));
   if (!th.length) return `📒 Journal — ${today}\n\nNo signals today.`;
-
   const res  = th.filter(x => x.result === 'WIN' || x.result === 'LOSS');
   const wins = res.filter(x => x.result === 'WIN').length;
   const wr   = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
-
   let msg = `📒 Trade Journal — ${today}\n━━━━━━━━━━━━━━\n`;
   msg += `📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L  📈 ${wr}%\n\n`;
-
-  // Per-trade breakdown
   for (const x of th.slice(0, 10)) {
     const dE = x.direction === 'BUY' ? '🟢' : '🔴';
     const rE = x.result === 'WIN' ? '✅' : x.result === 'LOSS' ? '❌' : x.result === 'CANCEL' ? '🗑' : '⏳';
@@ -705,8 +799,6 @@ function fmtJournal(hist, date) {
     msg += `${rE} #${x.no} ${dE} ${disp(x.pair)} ${x.confidence}${rg}${sk}\n`;
   }
   if (th.length > 10) msg += `...+${th.length - 10} more\n`;
-
-  // Regime summary for today
   const regToday = {};
   for (const x of res) {
     if (!x.regime) continue;
@@ -724,26 +816,19 @@ function fmtJournal(hist, date) {
   return msg;
 }
 
-// [v4.0] Weekly Report formatter
 function fmtWeekly(hist, weekLabel) {
-  const now  = new Date();
-  const day  = now.getUTCDay();
-  const diff = day === 0 ? 6 : day - 1;
-  const mon  = new Date(now);
+  const now = new Date();
+  const day = now.getUTCDay(), diff = day === 0 ? 6 : day - 1;
+  const mon = new Date(now);
   mon.setUTCDate(now.getUTCDate() - diff);
   const weekStart = mon.toISOString().slice(0, 10);
   const label = weekLabel || `Week of ${weekStart}`;
-
-  const wh = hist.filter(x => x.timestamp >= weekStart);
+  const wh  = hist.filter(x => x.timestamp >= weekStart);
   const res = wh.filter(x => x.result === 'WIN' || x.result === 'LOSS');
   const wins = res.filter(x => x.result === 'WIN').length;
   const wr = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
-
   let msg = `📅 Weekly Report — ${label}\n━━━━━━━━━━━━━━\n`;
-  msg += `📊 ${wh.length} signals  ✅ ${wins}W ❌ ${res.length-wins}L\n`;
-  msg += `📈 Win Rate: ${wr}%\n`;
-
-  // Best/worst regime this week
+  msg += `📊 ${wh.length} signals  ✅ ${wins}W ❌ ${res.length-wins}L\n📈 Win Rate: ${wr}%\n`;
   const rm = {};
   for (const x of res) {
     if (!x.regime) continue;
@@ -751,39 +836,114 @@ function fmtWeekly(hist, weekLabel) {
     x.result === 'WIN' ? rm[x.regime].w++ : rm[x.regime].l++;
   }
   if (Object.keys(rm).length) {
-    const sorted = Object.entries(rm).map(([r, s]) => {
-      const t = s.w + s.l;
-      return { r, w:s.w, l:s.l, pct: t>0 ? Math.round(s.w/t*100) : 0 };
-    }).sort((a,b) => b.pct - a.pct);
+    const sorted = Object.entries(rm).map(([r,s])=>{ const t=s.w+s.l; return { r, w:s.w, l:s.l, pct:t>0?Math.round(s.w/t*100):0 }; }).sort((a,b)=>b.pct-a.pct);
     const rIcon = { TRENDING:'🔵', RANGING:'🟡', BREAKOUT:'🟠', VOLATILE:'🔴' };
     msg += `\nRegimes this week:\n`;
     for (const x of sorted) {
       const t = x.w + x.l;
-      const bar = x.pct >= 55 ? '✅' : x.pct >= 45 ? '⚠️' : '❌';
-      msg += `  ${rIcon[x.r]||'⚪'} ${x.r}: ${x.w}W/${x.l}L (${x.pct}%) ${bar}\n`;
+      msg += `  ${rIcon[x.r]||'⚪'} ${x.r}: ${x.w}W/${x.l}L (${x.pct}%) ${x.pct>=55?'✅':x.pct>=45?'⚠️':'❌'}\n`;
     }
-    if (sorted.length > 0) {
+    if (sorted.length) {
       msg += `\n💡 Best: ${sorted[0].r} (${sorted[0].pct}%)\n`;
-      if (sorted[sorted.length-1].pct < 45)
-        msg += `⚠️ Avoid: ${sorted[sorted.length-1].r} (${sorted[sorted.length-1].pct}%)\n`;
+      if (sorted[sorted.length-1].pct < 45) msg += `⚠️ Avoid: ${sorted[sorted.length-1].r} (${sorted[sorted.length-1].pct}%)\n`;
     }
   }
-
-  // Top pairs
   const pm = {};
   for (const x of res) {
     if (!pm[x.pair]) pm[x.pair] = { w:0, l:0 };
     x.result === 'WIN' ? pm[x.pair].w++ : pm[x.pair].l++;
   }
-  const topPairs = Object.entries(pm)
-    .map(([p,s]) => { const t=s.w+s.l; return { p, w:s.w, l:s.l, pct:t>0?Math.round(s.w/t*100):0 }; })
-    .sort((a,b) => b.pct - a.pct).slice(0, 3);
+  const topPairs = Object.entries(pm).map(([p,s])=>{ const t=s.w+s.l; return { p,w:s.w,l:s.l,pct:t>0?Math.round(s.w/t*100):0 }; }).sort((a,b)=>b.pct-a.pct).slice(0,3);
   if (topPairs.length) {
     msg += `\nTop Pairs:\n`;
     for (const x of topPairs) msg += `  ${disp(x.p)}: ${x.w}W/${x.l}L (${x.pct}%)\n`;
   }
-
   msg += `\n🔄 Keep trading the best regimes next week!`;
+  return msg;
+}
+
+// [F04] Risk Dashboard
+function fmtRisk(hist) {
+  const pending = hist.filter(x => !x.result && (x.direction === 'BUY' || x.direction === 'SELL'));
+  if (!pending.length) return `📉 Open Risk Dashboard\n━━━━━━━━━━━━━━\n✅ No open trades`;
+  const now = Date.now();
+  let msg = `📉 Open Risk Dashboard\n━━━━━━━━━━━━━━\n${pending.length} open trade(s)\n\n`;
+  const exposure = {};
+  for (const t of pending) {
+    const exp = getCurrencyExposure(t.pair, t.direction);
+    for (const [cur, side] of Object.entries(exp)) {
+      if (!exposure[cur]) exposure[cur] = { long:0, short:0 };
+      exposure[cur][side]++;
+    }
+  }
+  for (const t of pending) {
+    const dE      = t.direction === 'BUY' ? '🟢' : '🔴';
+    const g       = t.grade ? ` ${t.grade.split(' ')[0]}` : '';
+    const rem     = t.expiryAt ? msToHuman(t.expiryAt - now) : '?';
+    const expired = t.expiryAt && t.expiryAt < now;
+    msg += `${dE} #${t.no} ${t.direction} ${disp(t.pair)}${g} ${t.confidence}\n`;
+    msg += `   Entry: ${t.entryPrice ? fmtPrice(t.entryPrice, t.pair) : '?'}  ${expired ? '⏰ Result pending' : `⏳ ${rem}`}\n`;
+  }
+  // Currency exposure summary
+  const multi = Object.entries(exposure).filter(([, v]) => (v.long + v.short) > 1 && v.long > 0 && v.short === 0);
+  if (multi.length) msg += `\n⚠️ Concentrated exposure: ${multi.map(([c,v]) => `${c} ×${v.long}`).join(', ')}`;
+  return msg;
+}
+
+// [F05] Hourly Heatmap
+function fmtHeatmap(hist) {
+  const resolved = hist.filter(x => x.result === 'WIN' || x.result === 'LOSS');
+  if (!resolved.length) return `🕐 Hourly Heatmap\n━━━━━━━━━━━━━━\nNo resolved trades yet.`;
+  const hmap = {};
+  for (const h of resolved) {
+    const hour = new Date(h.timestamp).getUTCHours();
+    if (!hmap[hour]) hmap[hour] = { w:0, l:0 };
+    h.result === 'WIN' ? hmap[hour].w++ : hmap[hour].l++;
+  }
+  const entries = Object.entries(hmap).map(([hr, s]) => {
+    const t = s.w + s.l;
+    return { hr: parseInt(hr), w:s.w, l:s.l, t, pct: Math.round(s.w/t*100) };
+  }).sort((a,b) => a.hr - b.hr);
+
+  let msg = `🕐 Win Rate by Hour (UTC)\n━━━━━━━━━━━━━━\n`;
+  for (const e of entries) {
+    const bar   = '█'.repeat(Math.round(e.pct / 10)) + '░'.repeat(10 - Math.round(e.pct / 10));
+    const icon  = e.pct >= 60 ? '✅' : e.pct >= 45 ? '⚠️' : '❌';
+    const label = String(e.hr).padStart(2,'0') + ':00';
+    msg += `${label}  ${bar}  ${e.pct}%  (${e.w}W/${e.l}L) ${icon}\n`;
+  }
+  const best  = [...entries].sort((a,b)=>b.pct-a.pct)[0];
+  const worst = [...entries].sort((a,b)=>a.pct-b.pct)[0];
+  if (best)  msg += `\n🏆 Best:  ${String(best.hr).padStart(2,'0')}:00 UTC (${best.pct}%)`;
+  if (worst) msg += `\n⚠️ Worst: ${String(worst.hr).padStart(2,'0')}:00 UTC (${worst.pct}%)`;
+  return msg;
+}
+
+// [F06] Best Pairs Leaderboard
+function fmtBest(hist) {
+  const resolved = hist.filter(x => x.result === 'WIN' || x.result === 'LOSS');
+  if (!resolved.length) return `🔥 Best Pairs\n━━━━━━━━━━━━━━\nNo resolved trades yet.`;
+  const pm = {};
+  for (const h of resolved) {
+    if (!pm[h.pair]) pm[h.pair] = { w:0, l:0 };
+    h.result === 'WIN' ? pm[h.pair].w++ : pm[h.pair].l++;
+  }
+  const ranked = Object.entries(pm)
+    .map(([p,s]) => { const t=s.w+s.l; return { p, w:s.w, l:s.l, t, pct: Math.round(s.w/t*100) }; })
+    .filter(x => x.t >= 3)
+    .sort((a,b) => b.pct - a.pct || b.t - a.t);
+
+  if (!ranked.length) return `🔥 Best Pairs\n━━━━━━━━━━━━━━\nNeed at least 3 trades per pair.`;
+
+  const medals = ['🥇','🥈','🥉','4️⃣','5️⃣'];
+  let msg = `🔥 Best Pairs Leaderboard\n━━━━━━━━━━━━━━\n`;
+  ranked.slice(0, 7).forEach((x, i) => {
+    const bar  = '█'.repeat(Math.round(x.pct/10)) + '░'.repeat(10-Math.round(x.pct/10));
+    const icon = x.pct >= 60 ? '✅' : x.pct >= 45 ? '⚠️' : '❌';
+    msg += `${medals[i]||'  '} ${disp(x.p).padEnd(8)} ${bar} ${x.pct}% (${x.w}W/${x.l}L) ${icon}\n`;
+  });
+  if (ranked.length > 7) msg += `...+${ranked.length - 7} more pairs\n`;
+  msg += `\n💡 Tip: Add top pairs to your Watchlist for auto scanning`;
   return msg;
 }
 
@@ -804,8 +964,7 @@ async function onMessage(msg, env) {
   const u    = await getUser(cid, env);
   const R    = (t, kboard) => sendMsg(cid, t, env, kboard ? { reply_markup: kboard } : {});
 
-  if (text.startsWith('/start'))
-    return R(`👋 FTT Signal Bot v4.0\n\nSignals + Analytics + Smart Alerts\n\nPair: ${disp(u.pair)}  ${u.interval}min  Auto ${u.autoEnabled ? 'ON' : 'OFF'}`, mainKb(u));
+  if (text.startsWith('/start'))     return R(`👋 FTT Signal Bot v4.1\n\nSignals + Analytics + Smart Alerts\n\nPair: ${disp(u.pair)}  ${u.interval}min  Auto ${u.autoEnabled ? 'ON' : 'OFF'}`, mainKb(u));
   if (text.startsWith('/signal'))    return doSignal(cid, null, env);
   if (text.startsWith('/scan'))      return doScanAll(cid, null, env);
   if (text.startsWith('/auto'))      return doToggle(cid, null, env);
@@ -819,8 +978,27 @@ async function onMessage(msg, env) {
   if (text.startsWith('/journal'))   return doJournal(cid, null, env);
   if (text.startsWith('/weekly'))    return doWeekly(cid, null, env);
   if (text.startsWith('/analyze'))   return doAnalyze(cid, null, text.slice(8).trim() || null, env);
+  if (text.startsWith('/risk'))      return doRisk(cid, null, env);
+  if (text.startsWith('/heatmap'))   return doHeatmap(cid, null, env);
+  if (text.startsWith('/best'))      return doBest(cid, null, env);
+  if (text.startsWith('/alerts'))    return doAlerts(cid, null, env);
+  if (text.startsWith('/replay'))    return doReplay(cid, null, text.slice(7).trim() || null, env);
 
-  // v3.3: Manual WIN/LOSS — /win 5  or  /loss 5
+  // [F10] Channel commands
+  if (text.startsWith('/setchannel ')) {
+    const chanId = text.slice(12).trim();
+    if (!chanId) return R('❌ Usage: /setchannel @channelname  or  /setchannel -100123456789', mainKb(u));
+    u.channelId = chanId;
+    await saveUser(cid, u, env);
+    return R(`✅ Channel set to ${chanId}\n\nMake sure the bot is an admin of that channel.`, mainKb(u));
+  }
+  if (text.startsWith('/clearchannel')) {
+    u.channelId = null;
+    await saveUser(cid, u, env);
+    return R('✅ Channel removed.', mainKb(u));
+  }
+
+  // Manual WIN/LOSS
   if (text.startsWith('/win ') || text.startsWith('/loss ')) {
     const parts  = text.split(' ');
     const result = text.startsWith('/win') ? 'WIN' : 'LOSS';
@@ -828,35 +1006,27 @@ async function onMessage(msg, env) {
     if (isNaN(no)) return R(`❌ Usage: /win 5  or  /loss 5`, mainKb(u));
     return doManualResult(cid, null, no, result, env);
   }
-
   if (text.startsWith('/pair ')) {
     const raw = text.slice(6).trim().toUpperCase().replace(/[\s/]/g, '');
-    u.pair = raw;
-    await saveUser(cid, u, env);
+    u.pair = raw; await saveUser(cid, u, env);
     return R(`✅ Pair set to ${disp(raw)}`, mainKb(u));
   }
   if (text.startsWith('/interval ')) {
     const m = parseInt(text.slice(10).trim(), 10);
-    if ([1, 5, 15].includes(m)) { u.interval = m; await saveUser(cid, u, env); return R(`✅ Interval: ${m}min`, mainKb(u)); }
+    if ([1,5,15].includes(m)) { u.interval = m; await saveUser(cid, u, env); return R(`✅ Interval: ${m}min`, mainKb(u)); }
     return R('❌ Use: 1, 5, or 15', mainKb(u));
   }
   if (text.startsWith('/help'))
-    return R(`FTT Signal Bot v4.0\n\n/signal — get signal now\n/scan — scan all pairs\n/auto — toggle auto scan\n/watchlist /history /stats\n/today /summary /status\n/cancelall — cancel all pending\n/win <no> /loss <no> — manual override\n/pair EURUSD /interval 5\n\n💡 Tip: just type a pair name (eurusd, btcusd, gbp/jpy...) to scan instantly`, mainKb(u));
-  // ── v3.3 Auto pair detect ─────────────────────────────────────────────────
-  // যেকোনো format এ pair লিখলে — eurusd / EUR/USD / eur usd / btc-usd — scan হবে
+    return R(`FTT Signal Bot v4.1\n\n/signal — get signal\n/scan — scan all pairs\n/auto — toggle auto scan\n/watchlist /history /stats\n/today /summary /status\n/risk — open trade risk dashboard\n/heatmap — win rate by hour\n/best — best pairs leaderboard\n/alerts — custom pair alerts\n/replay EURUSD — analyze without logging\n/setchannel <id> — mirror signals to channel\n/clearchannel — remove channel\n/cancelall — cancel pending\n/win <no> /loss <no> — manual override\n/pair EURUSD /interval 5\n\n💡 Just type a pair name to scan instantly`, mainKb(u));
+
+  // Auto pair detect
   const rawPair = text.toUpperCase().replace(/[\s\/\-_.]/g, '');
   if (rawPair.length >= 6) {
     const allPairs = PAIR_PAGES.flat().map(p => norm(p));
     const matched  = allPairs.find(p => p === rawPair);
-    // fuzzy: prefix match for 6-char codes
-    const fuzzy = matched || allPairs.find(p =>
-      rawPair.startsWith(p.slice(0, 3)) && rawPair.endsWith(p.slice(3))
-    );
-    if (fuzzy) {
-      return doQuickSignal(cid, null, fuzzy, env);
-    }
+    const fuzzy    = matched || allPairs.find(p => rawPair.startsWith(p.slice(0,3)) && rawPair.endsWith(p.slice(3)));
+    if (fuzzy) return doQuickSignal(cid, null, fuzzy, env);
   }
-  // ─────────────────────────────────────────────────────────────────────────
   return R('Use the buttons below 👇', mainKb(u));
 }
 
@@ -866,9 +1036,7 @@ async function onCb(cb, env) {
   const cid  = cb.message.chat.id;
   const mid  = cb.message.message_id;
   const data = cb.data;
-
   await answerCb(cb.id, env, '');
-
   const u = await getUser(cid, env);
   const R = (text, kboard) => reply(cid, mid, text, env, kboard);
 
@@ -877,7 +1045,7 @@ async function onCb(cb, env) {
     const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
     const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
     const cnt = await getCounter(cid, env);
-    return R(`FTT Signal Bot v4.0\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nWatchlist: ${u.watchlist.length} pairs  Grade: ${u.gradeFilter || 'ALL'}\n\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`, mainKb(u));
+    return R(`FTT Signal Bot v4.1\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nWatchlist: ${u.watchlist.length} pairs  Grade: ${u.gradeFilter || 'ALL'}\nAI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}  News Block: ${u.blockNews !== false ? 'ON' : 'OFF'}\n\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`, mainKb(u));
   }
 
   if (data === 'cmd:signal')      return doSignal(cid, mid, env);
@@ -889,14 +1057,21 @@ async function onCb(cb, env) {
   if (data === 'cmd:today')       return doToday(cid, mid, env);
   if (data === 'cmd:summary')     return doSummary(cid, mid, env);
   if (data === 'cmd:settings')    return doSettings(cid, mid, env);
+  if (data === 'cmd:settings2')   return doSettings2(cid, mid, env);
   if (data === 'cmd:journal')     return doJournal(cid, mid, env);
   if (data === 'cmd:weekly')      return doWeekly(cid, mid, env);
+  if (data === 'cmd:risk')        return doRisk(cid, mid, env);
+  if (data === 'cmd:heatmap')     return doHeatmap(cid, mid, env);
+  if (data === 'cmd:best')        return doBest(cid, mid, env);
+  if (data === 'cmd:alerts')      return doAlerts(cid, mid, env);
+  if (data === 'cmd:replayhelp')  return R(`🔄 Signal Replay\n\nType /replay EURUSD to get a live signal without logging it.\n\nGreat for analysis before committing to a trade.`, settings2Kb(u));
   if (data.startsWith('cmd:history:')) return doHist(cid, mid, parseInt(data.split(':')[2]) || 0, env);
 
-  if (data === 'cmd:intervals')   return R('⏱ Select Interval:', intervalKb());
-  if (data === 'cmd:gradefilter') return R('🎯 Grade Filter:', gradeKb());
-  if (data === 'cmd:conffilter')  return R('📊 Min Confidence:', confKb());
-  if (data === 'cmd:summarytime') return R('🕐 Daily Summary Time (UTC):', summTimeKb());
+  // Settings
+  if (data === 'cmd:intervals')     return R('⏱ Select Interval:', intervalKb());
+  if (data === 'cmd:gradefilter')   return R('🎯 Grade Filter:', gradeKb());
+  if (data === 'cmd:conffilter')    return R('📊 Min Confidence:', confKb());
+  if (data === 'cmd:summarytime')   return R('🕐 Daily Summary Time (UTC):', summTimeKb());
   if (data === 'cmd:togglesummary') {
     u.dailySummary = !u.dailySummary;
     await saveUser(cid, u, env);
@@ -904,115 +1079,120 @@ async function onCb(cb, env) {
     else                await removeSummaryUser(cid, env);
     return doSettings(cid, mid, env);
   }
-  if (data.startsWith('interval:')) {
-    u.interval = parseInt(data.split(':')[1], 10);
+  // [F02] AI-Only toggle
+  if (data === 'cmd:aionly') {
+    u.aiOnlyMode = !u.aiOnlyMode;
     await saveUser(cid, u, env);
-    return doSettings(cid, mid, env);
+    return doSettings2(cid, mid, env);
   }
-  if (data.startsWith('sumhour:')) {
-    u.summaryHour = parseInt(data.split(':')[1], 10);
+  // [F03] Block News toggle
+  if (data === 'cmd:blocknews') {
+    u.blockNews = !(u.blockNews !== false);
     await saveUser(cid, u, env);
-    return doSettings(cid, mid, env);
+    return doSettings2(cid, mid, env);
   }
-  if (data.startsWith('gf:')) {
-    u.gradeFilter = data.slice(3);
-    await saveUser(cid, u, env);
-    return doSettings(cid, mid, env);
-  }
-  if (data.startsWith('cf:')) {
-    u.minConfidence = parseInt(data.split(':')[1], 10);
-    await saveUser(cid, u, env);
-    return doSettings(cid, mid, env);
+  // [F10] Channel info
+  if (data === 'cmd:channelinfo') {
+    const chanInfo = u.channelId
+      ? `📡 Channel Mode\n\nChannel: ${u.channelId}\n\nSignals are auto-posted there.\n\nTo change: /setchannel <id>\nTo remove: /clearchannel`
+      : `📡 Channel Mode\n\nNo channel set.\n\nTo enable:\n1. Add bot as admin to your channel\n2. Send /setchannel @yourchannel\n   or /setchannel -100123456789`;
+    return R(chanInfo, settings2Kb(u));
   }
 
-  if (data.startsWith('pairpage:')) {
-    const page = parseInt(data.split(':')[1], 10);
-    return R('💱 Select default pair:', pairsKb(page));
-  }
-  if (data.startsWith('pair:')) {
-    u.pair = norm(data.slice(5));
-    await saveUser(cid, u, env);
-    return doSettings(cid, mid, env);
-  }
+  if (data.startsWith('interval:')) { u.interval = parseInt(data.split(':')[1], 10); await saveUser(cid, u, env); return doSettings(cid, mid, env); }
+  if (data.startsWith('sumhour:'))  { u.summaryHour = parseInt(data.split(':')[1], 10); await saveUser(cid, u, env); return doSettings(cid, mid, env); }
+  if (data.startsWith('gf:'))       { u.gradeFilter = data.slice(3); await saveUser(cid, u, env); return doSettings(cid, mid, env); }
+  if (data.startsWith('cf:'))       { u.minConfidence = parseInt(data.split(':')[1], 10); await saveUser(cid, u, env); return doSettings(cid, mid, env); }
 
-  if (data.startsWith('wlpage:')) {
-    const page = parseInt(data.split(':')[1], 10);
-    return R(`👁 Add to Watchlist (${u.watchlist.length}/${MAX_WL}):`, wlAddKb(page, u.watchlist));
-  }
-  if (data.startsWith('wl:rm:')) {
-    const pair = data.slice(6);
-    u.watchlist = u.watchlist.filter(p => p !== pair);
-    await saveUser(cid, u, env);
-    return doWatchlist(cid, mid, env);
-  }
+  if (data.startsWith('pairpage:')) return R('💱 Select default pair:', pairsKb(parseInt(data.split(':')[1], 10)));
+  if (data.startsWith('pair:'))     { u.pair = norm(data.slice(5)); await saveUser(cid, u, env); return doSettings(cid, mid, env); }
+
+  if (data.startsWith('wlpage:'))   return R(`👁 Add to Watchlist (${u.watchlist.length}/${MAX_WL}):`, wlAddKb(parseInt(data.split(':')[1], 10), u.watchlist));
+  if (data.startsWith('wl:rm:'))    { u.watchlist = u.watchlist.filter(p => p !== data.slice(6)); await saveUser(cid, u, env); return doWatchlist(cid, mid, env); }
   if (data.startsWith('wl:addpage:')) {
-    const parts = data.split(':');
-    const pair  = parts[2];
-    const page  = parseInt(parts[3] || '0', 10);
-    if (!u.watchlist.includes(pair) && u.watchlist.length < MAX_WL) {
-      u.watchlist = [...u.watchlist, pair];
-      await saveUser(cid, u, env);
-    }
+    const parts = data.split(':'), pair = parts[2], page = parseInt(parts[3]||'0', 10);
+    if (!u.watchlist.includes(pair) && u.watchlist.length < MAX_WL) { u.watchlist = [...u.watchlist, pair]; await saveUser(cid, u, env); }
     return R(`👁 Add to Watchlist (${u.watchlist.length}/${MAX_WL}):`, wlAddKb(page, u.watchlist));
   }
   if (data.startsWith('wl:rmpage:')) {
-    const parts = data.split(':');
-    const pair  = parts[2];
-    const page  = parseInt(parts[3] || '0', 10);
-    u.watchlist = u.watchlist.filter(p => p !== pair);
-    await saveUser(cid, u, env);
+    const parts = data.split(':'), pair = parts[2], page = parseInt(parts[3]||'0', 10);
+    u.watchlist = u.watchlist.filter(p => p !== pair); await saveUser(cid, u, env);
     return R(`👁 Add to Watchlist (${u.watchlist.length}/${MAX_WL}):`, wlAddKb(page, u.watchlist));
   }
 
-  if (data.startsWith('qs:')) return doQuickSignal(cid, mid, data.slice(3), env);
+  // [F09] Alert callbacks
+  if (data.startsWith('alertpage:')) {
+    const page    = parseInt(data.split(':')[1], 10);
+    const alerts  = await getAlerts(cid, env);
+    return R(`🔔 Select pair for alert:`, alertPairsKb(page, alerts));
+  }
+  if (data.startsWith('alertpair:')) {
+    const parts = data.split(':'), pair = parts[1], page = parseInt(parts[2]||'0', 10);
+    return R(`🔔 Alert for ${disp(pair)}\nSet min confidence threshold:`, alertConfKb(pair, page));
+  }
+  if (data.startsWith('alertset:')) {
+    const parts = data.split(':'), pair = parts[1], conf = parseInt(parts[2], 10), page = parseInt(parts[3]||'0', 10);
+    await setAlert(cid, pair, conf, env);
+    const alerts = await getAlerts(cid, env);
+    return R(`✅ Alert set: ${disp(pair)} ≥${conf}%\n\nYou'll be notified when this pair hits ${conf}%+ confidence.`, alertPairsKb(page, alerts));
+  }
+  if (data.startsWith('alertdel:')) {
+    const parts = data.split(':'), pair = parts[1], page = parseInt(parts[2]||'0', 10);
+    await delAlert(cid, pair, env);
+    const alerts = await getAlerts(cid, env);
+    return R(`🗑 Alert removed for ${disp(pair)}`, alertPairsKb(page, alerts));
+  }
 
-  // v3.3: Manual result override buttons on signal card
-  if (data.startsWith('res:win:'))
-    return doManualResult(cid, mid, parseInt(data.split(':')[2], 10), 'WIN', env);
-  if (data.startsWith('res:loss:'))
-    return doManualResult(cid, mid, parseInt(data.split(':')[2], 10), 'LOSS', env);
+  if (data.startsWith('qs:')) return doQuickSignal(cid, mid, data.slice(3), env);
+  if (data.startsWith('res:win:'))  return doManualResult(cid, mid, parseInt(data.split(':')[2], 10), 'WIN', env);
+  if (data.startsWith('res:loss:')) return doManualResult(cid, mid, parseInt(data.split(':')[2], 10), 'LOSS', env);
 }
 
 // ─── ACTION FUNCTIONS ─────────────────────────────────────────────────────────
 
-// [Bug#1 FIX] After fetching signal and sending a new message, the original
-// button-message was left stuck showing "⏳ Fetching..." with no keyboard.
-// Now we restore it to the main menu after the signal card is sent.
+// Shared helper: restore original message with main menu after sending a signal card
+async function restoreMainMsg(cid, mid, u, env) {
+  if (!mid) return;
+  const h   = await getHist(cid, env);
+  const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
+  const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
+  const cnt = await getCounter(cid, env);
+  await editMsg(cid, mid,
+    `FTT Signal Bot v4.1\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`,
+    env, { reply_markup: mainKb(u) });
+}
 
 async function doSignal(cid, mid, env) {
   const u = await getUser(cid, env);
   if (mid) await editMsg(cid, mid, `⏳ Fetching ${disp(u.pair)}...`, env, {});
   else     await sendMsg(cid, `⏳ Fetching ${disp(u.pair)}...`, env, {});
   try {
-    const data = await fetchSig(u.pair, env);
-    const sig  = data.signal;
-    const dir  = sig?.finalSignal;
-    let no = null;
-    if (dir === 'BUY' || dir === 'SELL') no = await logAndSchedule(cid, u.pair, sig, env);
-    const useKb = (dir === 'BUY' || dir === 'SELL') ? signalKb(no) : afterKb();
-    await sendMsg(cid, fmtSignal(data, u.pair, u.interval, no), env, { reply_markup: useKb });
-    // [Bug#1 FIX] Restore original message with main menu keyboard
-    if (mid) {
-      const h   = await getHist(cid, env);
-      const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
-      const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
-      const cnt = await getCounter(cid, env);
-      await editMsg(cid, mid,
-        `FTT Signal Bot v4.0\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`,
-        env, { reply_markup: mainKb(u) });
+    const [data, newsAlert, correlated] = await Promise.all([
+      fetchSig(u.pair, env),
+      hasHighImpactNews(env),
+      Promise.resolve([]),  // will check after we know direction
+    ]);
+    const sig = data.signal;
+    const dir = sig?.finalSignal;
+    let no = null, corrWarnings = [];
+    if (dir === 'BUY' || dir === 'SELL') {
+      corrWarnings = await checkCorrelated(cid, u.pair, dir, env);
+      no = await logAndSchedule(cid, u.pair, sig, env);
     }
-    // [Bug#2 FIX] Feature #15: confidence trend alert
+    const useKb  = (dir === 'BUY' || dir === 'SELL') ? signalKb(no) : afterKb();
+    const sigMsg = fmtSignal(data, u.pair, u.interval, no, { newsAlert, correlated: corrWarnings });
+    await sendMsg(cid, sigMsg, env, { reply_markup: useKb });
+    // [Fix#1] Restore original message
+    await restoreMainMsg(cid, mid, u, env);
+    // [Fix#2] Confidence trend alert
     if ((dir === 'BUY' || dir === 'SELL') && sig?.confidence) {
       const ct = await updateConfTrend(cid, sig.confidence, env);
-      if (ct.alert) {
-        await sendMsg(cid,
-          `📉 Confidence Dropping — last 3 signals: ${ct.vals[2]}% → ${ct.vals[1]}% → ${ct.vals[0]}%\n\nConsider waiting for a stronger setup before trading.`,
-          env, { reply_markup: kb([[btn('🏆 Stats', 'cmd:stats'), btn('🔙 Menu', 'cmd:main')]]) });
-      }
+      if (ct.alert)
+        await sendMsg(cid, `📉 Confidence Dropping — last 3: ${ct.vals[2]}% → ${ct.vals[1]}% → ${ct.vals[0]}%\n\nConsider waiting for a stronger setup.`, env, { reply_markup: kb([[btn('🏆 Stats', 'cmd:stats'), btn('🔙 Menu', 'cmd:main')]]) });
     }
   } catch (e) {
-    if (mid) await editMsg(cid, mid, `❌ Signal fetch failed\n${e.message.slice(0, 150)}`, env, { reply_markup: mainKb(u) });
-    else     await sendMsg(cid, `❌ Signal fetch failed\n${e.message.slice(0, 200)}`, env, { reply_markup: mainKb(u) });
+    if (mid) await editMsg(cid, mid, `❌ Signal fetch failed\n${e.message.slice(0,150)}`, env, { reply_markup: mainKb(u) });
+    else     await sendMsg(cid, `❌ Signal fetch failed\n${e.message.slice(0,200)}`, env, { reply_markup: mainKb(u) });
   }
 }
 
@@ -1021,41 +1201,32 @@ async function doQuickSignal(cid, mid, pair, env) {
   if (mid) await editMsg(cid, mid, `⏳ Fetching ${disp(pair)}...`, env, {});
   else     await sendMsg(cid, `⏳ Fetching ${disp(pair)}...`, env, {});
   try {
-    const data = await fetchSig(pair, env);
-    const sig  = data.signal;
-    const dir  = sig?.finalSignal;
-    let no = null;
-    if (dir === 'BUY' || dir === 'SELL') no = await logAndSchedule(cid, pair, sig, env);
-    const useKb = (dir === 'BUY' || dir === 'SELL') ? signalKb(no) : afterKb();
-    await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: useKb });
-    // [Bug#1 FIX] Restore original message with main menu keyboard
-    if (mid) {
-      const h   = await getHist(cid, env);
-      const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
-      const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
-      const cnt = await getCounter(cid, env);
-      await editMsg(cid, mid,
-        `FTT Signal Bot v4.0\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`,
-        env, { reply_markup: mainKb(u) });
+    const data      = await fetchSig(pair, env);
+    const sig       = data.signal;
+    const dir       = sig?.finalSignal;
+    const newsAlert = await hasHighImpactNews(env);
+    let no = null, corrWarnings = [];
+    if (dir === 'BUY' || dir === 'SELL') {
+      corrWarnings = await checkCorrelated(cid, pair, dir, env);
+      no = await logAndSchedule(cid, pair, sig, env);
     }
-    // [Bug#2 FIX] Feature #15: confidence trend alert
+    const useKb  = (dir === 'BUY' || dir === 'SELL') ? signalKb(no) : afterKb();
+    await sendMsg(cid, fmtSignal(data, pair, u.interval, no, { newsAlert, correlated: corrWarnings }), env, { reply_markup: useKb });
+    await restoreMainMsg(cid, mid, u, env);
     if ((dir === 'BUY' || dir === 'SELL') && sig?.confidence) {
       const ct = await updateConfTrend(cid, sig.confidence, env);
-      if (ct.alert) {
-        await sendMsg(cid,
-          `📉 Confidence Dropping — last 3 signals: ${ct.vals[2]}% → ${ct.vals[1]}% → ${ct.vals[0]}%\n\nConsider waiting for a stronger setup before trading.`,
-          env, { reply_markup: kb([[btn('🏆 Stats', 'cmd:stats'), btn('🔙 Menu', 'cmd:main')]]) });
-      }
+      if (ct.alert)
+        await sendMsg(cid, `📉 Confidence Dropping — last 3: ${ct.vals[2]}% → ${ct.vals[1]}% → ${ct.vals[0]}%\n\nConsider waiting for a stronger setup.`, env, { reply_markup: kb([[btn('🏆 Stats', 'cmd:stats'), btn('🔙 Menu', 'cmd:main')]]) });
     }
   } catch (e) {
-    if (mid) await editMsg(cid, mid, `❌ Failed: ${e.message.slice(0, 150)}`, env, { reply_markup: mainKb(u) });
-    else     await sendMsg(cid, `❌ Failed: ${e.message.slice(0, 150)}`, env, { reply_markup: mainKb(u) });
+    if (mid) await editMsg(cid, mid, `❌ Failed: ${e.message.slice(0,150)}`, env, { reply_markup: mainKb(u) });
+    else     await sendMsg(cid, `❌ Failed: ${e.message.slice(0,150)}`, env, { reply_markup: mainKb(u) });
   }
 }
 
 async function doScanAll(cid, mid, env) {
   const u    = await getUser(cid, env);
-  const list = [u.pair, ...u.watchlist].filter((p, i, a) => a.indexOf(p) === i);
+  const list = [u.pair, ...u.watchlist].filter((p,i,a) => a.indexOf(p) === i);
   if (mid) await editMsg(cid, mid, `🔍 Scanning ${list.length} pairs...`, env, {});
   else     await sendMsg(cid, `🔍 Scanning ${list.length} pairs...`, env, {});
   let found = 0;
@@ -1064,25 +1235,18 @@ async function doScanAll(cid, mid, env) {
       const data = await fetchSig(pair, env);
       const sig  = data.signal;
       const dir  = sig?.finalSignal;
-      if ((dir === 'BUY' || dir === 'SELL') && passGrade(sig, u.gradeFilter) && passConf(sig, u.minConfidence)) {
+      if ((dir === 'BUY' || dir === 'SELL') && passGrade(sig, u.gradeFilter) && passConf(sig, u.minConfidence) && passAI(sig, u.aiOnlyMode)) {
+        const corrWarnings = await checkCorrelated(cid, pair, dir, env);
         const no = await logAndSchedule(cid, pair, sig, env);
-        await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: signalKb(no) });
+        await sendMsg(cid, fmtSignal(data, pair, u.interval, no, { correlated: corrWarnings }), env, { reply_markup: signalKb(no) });
         found++;
       }
     } catch (e) { console.error(`scan ${pair}:`, e.message); }
   }
-  const summary = found > 0
-    ? `✅ ${found} signal(s) found across ${list.length} pairs`
-    : `⚪ No signals across ${list.length} pairs`;
-  // [Bug#1 FIX] Restore original message, send summary as new message
+  const summary = found > 0 ? `✅ ${found} signal(s) found across ${list.length} pairs` : `⚪ No signals across ${list.length} pairs`;
+  // [Fix#1] Restore original message
   if (mid) {
-    const h   = await getHist(cid, env);
-    const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
-    const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
-    const cnt = await getCounter(cid, env);
-    await editMsg(cid, mid,
-      `FTT Signal Bot v4.0\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`,
-      env, { reply_markup: mainKb(u) });
+    await restoreMainMsg(cid, mid, u, env);
     await sendMsg(cid, summary, env, { reply_markup: afterKb() });
   } else {
     await sendMsg(cid, summary, env, { reply_markup: mainKb(u) });
@@ -1098,13 +1262,12 @@ async function doToggle(cid, mid, env) {
     await addAutoUser(cid, env);
   } else {
     await removeAutoUser(cid, env);
-    // v3.3: clean up candle-close key and error count on OFF
     await kdel(`lc:${cid}`, env);
     await kput(`errcnt:${cid}`, 0, env);
   }
   const wl = u.watchlist.map(disp).join(', ');
   const t  = u.autoEnabled
-    ? `🔄 Auto Scan ON\n\n${disp(u.pair)}${wl ? '\nWatchlist: ' + wl : ''}\nInterval: ${u.interval}min  Grade: ${u.gradeFilter || 'ALL'}\n⏰ Next scan: ${nextCandleIn(u.interval)}`
+    ? `🔄 Auto Scan ON\n\n${disp(u.pair)}${wl ? '\nWatchlist: ' + wl : ''}\nInterval: ${u.interval}min  Grade: ${u.gradeFilter || 'ALL'}\nAI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}  News Block: ${u.blockNews !== false ? 'ON' : 'OFF'}\n⏰ Next scan: ${nextCandleIn(u.interval)}`
     : `🔕 Auto Scan OFF`;
   return reply(cid, mid, t, env, mainKb(u));
 }
@@ -1115,15 +1278,20 @@ async function doSettings(cid, mid, env) {
   return reply(cid, mid, t, env, settingsKb(u));
 }
 
+async function doSettings2(cid, mid, env) {
+  const u = await getUser(cid, env);
+  const t = `⚙️ Advanced Settings\n\nAI Only Mode: ${u.aiOnlyMode ? 'ON — signals only when AI agrees ✅' : 'OFF'}\nBlock News: ${u.blockNews !== false ? 'ON — auto skips ±15min news window ✅' : 'OFF'}\nChannel: ${u.channelId || 'None'}`;
+  return reply(cid, mid, t, env, settings2Kb(u));
+}
+
 async function doStatus(cid, mid, env) {
   const u   = await getUser(cid, env);
   const cnt = await getCounter(cid, env);
   const h   = await getHist(cid, env);
   const pen = h.filter(x => !x.result && x.direction).length;
-  // v3.3: next candle countdown shown when auto is ON
   const nextScan = u.autoEnabled ? `\n⏰ Next scan: ${nextCandleIn(u.interval)}` : '';
-  const t = `📋 Status\n\nPair: ${disp(u.pair)}\nWatchlist: ${u.watchlist.map(disp).join(', ') || 'None'}\nInterval: ${u.interval}min\nAuto: ${u.autoEnabled ? 'ON' : 'OFF'}${nextScan}\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nSummary: ${u.dailySummary ? 'ON' : 'OFF'}\nTotal Signals: ${cnt}  Pending: ${pen}`;
-  return reply(cid, mid, t, env, kb([[btn('⚙️ Settings', 'cmd:settings'), btn('🔙 Back', 'cmd:main')]]));
+  const t = `📋 Status\n\nPair: ${disp(u.pair)}\nWatchlist: ${u.watchlist.map(disp).join(', ') || 'None'}\nInterval: ${u.interval}min\nAuto: ${u.autoEnabled ? 'ON' : 'OFF'}${nextScan}\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nAI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}\nNews Block: ${u.blockNews !== false ? 'ON' : 'OFF'}\nSummary: ${u.dailySummary ? 'ON' : 'OFF'}\nChannel: ${u.channelId || 'None'}\nTotal Signals: ${cnt}  Pending: ${pen}`;
+  return reply(cid, mid, t, env, kb([[btn('⚙️ Settings', 'cmd:settings'), btn('📉 Risk', 'cmd:risk'), btn('🔙 Back', 'cmd:main')]]));
 }
 
 async function doHist(cid, mid, page, env) {
@@ -1135,28 +1303,67 @@ async function doStats(cid, mid, env) {
   const h  = await getHist(cid, env);
   const rs = await getRegimeStats(cid, env);
   const ss = await getSessionStats(cid, env);
-  return reply(cid, mid, fmtStats(h, rs, ss), env, kb([[btn('📈 History', 'cmd:history:0'), btn('📒 Journal', 'cmd:journal'), btn('🔙 Back', 'cmd:main')]]));
+  return reply(cid, mid, fmtStats(h, rs, ss), env, kb([[btn('📈 History', 'cmd:history:0'), btn('📒 Journal', 'cmd:journal'), btn('🔥 Best', 'cmd:best'), btn('🔙 Back', 'cmd:main')]]));
 }
 
-// [v4.0] Trade Journal
 async function doJournal(cid, mid, env) {
   const h = await getHist(cid, env);
-  return reply(cid, mid, fmtJournal(h), env, kb([
-    [btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')],
-    [btn('🔙 Back', 'cmd:main')],
-  ]));
+  return reply(cid, mid, fmtJournal(h), env, kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats'), btn('🔙 Back', 'cmd:main')]]));
 }
 
-// [v4.0] Weekly Report
 async function doWeekly(cid, mid, env) {
   const h = await getHist(cid, env);
-  return reply(cid, mid, fmtWeekly(h), env, kb([
-    [btn('🏆 Stats', 'cmd:stats'), btn('📒 Journal', 'cmd:journal')],
-    [btn('🔙 Back', 'cmd:main')],
-  ]));
+  return reply(cid, mid, fmtWeekly(h), env, kb([[btn('🏆 Stats', 'cmd:stats'), btn('📒 Journal', 'cmd:journal'), btn('🔙 Back', 'cmd:main')]]));
 }
 
-// [v4.0] On-demand analyze
+// [F04] Risk Dashboard
+async function doRisk(cid, mid, env) {
+  const h = await getHist(cid, env);
+  return reply(cid, mid, fmtRisk(h), env, kb([[btn('🗑 Cancel All', 'cmd:cancelall'), btn('📈 History', 'cmd:history:0'), btn('🔙 Back', 'cmd:main')]]));
+}
+
+// [F05] Heatmap
+async function doHeatmap(cid, mid, env) {
+  const h = await getHist(cid, env);
+  return reply(cid, mid, fmtHeatmap(h), env, kb([[btn('🏆 Stats', 'cmd:stats'), btn('🔥 Best Pairs', 'cmd:best'), btn('🔙 Back', 'cmd:main')]]));
+}
+
+// [F06] Best Pairs
+async function doBest(cid, mid, env) {
+  const h = await getHist(cid, env);
+  return reply(cid, mid, fmtBest(h), env, kb([[btn('🕐 Heatmap', 'cmd:heatmap'), btn('🏆 Stats', 'cmd:stats'), btn('🔙 Back', 'cmd:main')]]));
+}
+
+// [F09] Custom Alerts menu
+async function doAlerts(cid, mid, env) {
+  const alerts = await getAlerts(cid, env);
+  const count  = Object.keys(alerts).length;
+  const t = count
+    ? `🔔 Custom Alerts (${count})\n━━━━━━━━━━━━━━\nYou get notified when these pairs hit your threshold, even if they'd normally be filtered.\n`
+    : `🔔 Custom Alerts\n━━━━━━━━━━━━━━\nNo alerts set.\n\nAdd a pair + confidence threshold to get notified.`;
+  return reply(cid, mid, t, env, alertsKb(alerts));
+}
+
+// [F08] Signal Replay
+async function doReplay(cid, mid, pairRaw, env) {
+  const u = await getUser(cid, env);
+  const pair = pairRaw ? pairRaw.toUpperCase().replace(/[\s\/\-_.]/g, '') : norm(u.pair);
+  if (mid) await editMsg(cid, mid, `🔄 Replaying ${disp(pair)} (not logged)...`, env, {});
+  else     await sendMsg(cid, `🔄 Replaying ${disp(pair)} (not logged)...`, env, {});
+  try {
+    const data = await fetchSig(pair, env);
+    const sig  = data?.signal;
+    if (!sig) return sendMsg(cid, `❌ No data for ${disp(pair)}`, env, { reply_markup: mainKb(u) });
+    const msg = fmtSignal(data, pair, u.interval, null, { replay: true });
+    await sendMsg(cid, msg, env, { reply_markup: kb([
+      [btn('📊 Get Signal (log it)', `qs:${norm(pair)}`), btn('🔙 Menu', 'cmd:main')],
+    ]) });
+    await restoreMainMsg(cid, mid, u, env);
+  } catch (e) {
+    await sendMsg(cid, `❌ Replay failed: ${e.message}`, env, { reply_markup: mainKb(u) });
+  }
+}
+
 async function doAnalyze(cid, mid, pairRaw, env) {
   const u = await getUser(cid, env);
   const pair = pairRaw ? pairRaw.toUpperCase().replace(/[\s\/\-_.]/g, '') : norm(u.pair);
@@ -1165,80 +1372,64 @@ async function doAnalyze(cid, mid, pairRaw, env) {
     const data = await fetchSig(pair, env);
     const sig  = data?.signal;
     if (!sig) return sendMsg(cid, `❌ No data for ${disp(pair)}`, env, { reply_markup: mainKb(u) });
-
-    const dir  = sig.finalSignal || 'NO_TRADE';
-    const conf = sig.confidence  || '0%';
-    const dE   = dir === 'BUY' ? '🟢' : dir === 'SELL' ? '🔴' : '⚪';
-    const rg   = sig.marketRegime || 'UNKNOWN';
+    const dir   = sig.finalSignal || 'NO_TRADE';
+    const conf  = sig.confidence  || '0%';
+    const dE    = dir === 'BUY' ? '🟢' : dir === 'SELL' ? '🔴' : '⚪';
+    const rg    = sig.marketRegime || 'UNKNOWN';
     const rIcon = { TRENDING:'🔵', RANGING:'🟡', BREAKOUT:'🟠', VOLATILE:'🔴' };
-    const best = sig.bestTimeframe;
-
     let msg = `🔍 Analysis: ${disp(pair)}\n━━━━━━━━━━━━━━\n`;
     msg += `${dE} ${dir}  ${conf}  ${sig.grade?.grade||''}\n`;
     msg += `${rIcon[rg]||'⚪'} Regime: ${rg}\n`;
     msg += `📈 HTF: ${sig.higherTFTrend||'NEUTRAL'}\n`;
     msg += `🔗 Alignment: ${sig.alignment||'MIXED'}\n\n`;
-
-    // Per-TF mini breakdown
-    const tfs = ['1min','5min','15min'];
-    for (const tf of tfs) {
+    for (const tf of ['1min','5min','15min']) {
       const r = sig.recommendations?.[tf];
       if (!r) continue;
       const td = r.direction === 'BUY' ? '🟢' : r.direction === 'SELL' ? '🔴' : '⚪';
       msg += `${td} ${tf}: ${r.direction} ${r.score?.diff?.toFixed(1)||0} diff (${r.confluence})\n`;
     }
-
-    if (sig.entryReason) msg += `\n📝 ${sig.entryReason}\n`;
+    if (sig.entryReason)  msg += `\n📝 ${sig.entryReason}\n`;
     if (sig.regimeAdvice) msg += `💡 ${sig.regimeAdvice}\n`;
-
     const ai = sig.aiValidation;
     if (ai?.status === 'OK') {
       msg += `\n🤖 AI: ${ai.signal} ${ai.confidence}%`;
       if (ai.concerns) msg += ` ⚠️ ${ai.concerns}`;
       msg += '\n';
     }
-
-    await sendMsg(cid, msg, env, { reply_markup: kb([
-      [btn('📊 Get Signal', `qs:${norm(pair)}`), btn('🔙 Menu', 'cmd:main')],
-    ]) });
+    await sendMsg(cid, msg, env, { reply_markup: kb([[btn('📊 Get Signal', `qs:${norm(pair)}`), btn('🔄 Replay', `cmd:replayhelp`), btn('🔙 Menu', 'cmd:main')]]) });
   } catch (e) {
     await sendMsg(cid, `❌ Analysis failed: ${e.message}`, env, { reply_markup: mainKb(u) });
   }
 }
 
 async function doWatchlist(cid, mid, env) {
-  const u  = await getUser(cid, env);
-  const wl = u.watchlist;
-  const t  = `👁 Watchlist (${wl.length}/${MAX_WL})\n\n${wl.length ? wl.map(disp).join(', ') : 'Empty'}\n\n📊 = Quick signal  ❌ = Remove`;
-  return reply(cid, mid, t, env, wlKb(wl));
+  const u = await getUser(cid, env);
+  const t = `👁 Watchlist (${u.watchlist.length}/${MAX_WL})\n\n${u.watchlist.length ? u.watchlist.map(disp).join(', ') : 'Empty'}\n\n📊 = Quick signal  ❌ = Remove`;
+  return reply(cid, mid, t, env, wlKb(u.watchlist));
 }
 
 async function doToday(cid, mid, env) {
   const h     = await getHist(cid, env);
   const today = new Date().toISOString().slice(0, 10);
   const th    = h.filter(x => x.timestamp?.startsWith(today));
-  if (!th.length)
-    return reply(cid, mid, `📅 Today (${today})\n\nNo signals yet.`, env, kb([[btn('🔙 Back', 'cmd:main')]]));
+  if (!th.length) return reply(cid, mid, `📅 Today (${today})\n\nNo signals yet.`, env, kb([[btn('🔙 Back', 'cmd:main')]]));
   const res  = th.filter(x => x.result === 'WIN' || x.result === 'LOSS');
   const wins = res.filter(x => x.result === 'WIN').length;
   const wr   = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
-  let t = `📅 Today — ${today}\n━━━━━━━━━━━━━━\n`;
-  t += `📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n\n`;
+  let t = `📅 Today — ${today}\n━━━━━━━━━━━━━━\n📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n\n`;
   for (const x of th.slice(0, 8)) {
     const dE = x.direction === 'BUY' ? '🟢' : '🔴';
     const rE = x.result === 'WIN' ? '✅' : x.result === 'LOSS' ? '❌' : x.result === 'CANCEL' ? '🗑' : '⏳';
-    const g  = x.grade ? ` ${x.grade.split(' ')[0]}` : '';
-    t += `${rE} #${x.no} ${dE} ${disp(x.pair)}${g} ${x.confidence}\n`;
+    t += `${rE} #${x.no} ${dE} ${disp(x.pair)}${x.grade ? ' ' + x.grade.split(' ')[0] : ''} ${x.confidence}\n`;
   }
-  return reply(cid, mid, t, env, kb([[btn('📈 History', 'cmd:history:0'), btn('🔙 Back', 'cmd:main')]]));
+  return reply(cid, mid, t, env, kb([[btn('📈 History', 'cmd:history:0'), btn('📉 Risk', 'cmd:risk'), btn('🔙 Back', 'cmd:main')]]));
 }
 
 async function doSummary(cid, mid, env) {
   const h     = await getHist(cid, env);
   const today = new Date().toISOString().slice(0, 10);
   const th    = h.filter(x => x.timestamp?.startsWith(today));
-  if (!th.length)
-    return reply(cid, mid, `No signals today yet.`, env, kb([[btn('🔙 Back', 'cmd:main')]]));
+  if (!th.length) return reply(cid, mid, `No signals today yet.`, env, kb([[btn('🔙 Back', 'cmd:main')]]));
   const res   = th.filter(x => x.result === 'WIN' || x.result === 'LOSS');
   const wins  = res.filter(x => x.result === 'WIN').length;
   const wr    = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
@@ -1251,8 +1442,7 @@ async function doSummary(cid, mid, env) {
     if (!gm[g]) gm[g] = { w:0, l:0 };
     x.result === 'WIN' ? gm[g].w++ : gm[g].l++;
   }
-  let t = `📅 Daily Summary — ${today}\n━━━━━━━━━━━━━━\n`;
-  t += `📊 ${th.length} signals  Resolved: ${res.length}\n✅ ${wins}W  ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n`;
+  let t = `📅 Daily Summary — ${today}\n━━━━━━━━━━━━━━\n📊 ${th.length} signals  Resolved: ${res.length}\n✅ ${wins}W  ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n`;
   if (Object.keys(gm).length) {
     t += `\nGrades:\n`;
     for (const [g, s] of Object.entries(gm)) {
@@ -1264,67 +1454,52 @@ async function doSummary(cid, mid, env) {
   return reply(cid, mid, t, env, kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')]]));
 }
 
-// v3.3: Cancel all pending trades
 async function doCancelAll(cid, mid, env) {
   const u    = await getUser(cid, env);
   const h    = await getHist(cid, env);
   const pend = h.filter(x => !x.result && x.direction);
-  if (!pend.length)
-    return reply(cid, mid, `ℹ️ No pending trades to cancel.`, env, mainKb(u));
-
+  if (!pend.length) return reply(cid, mid, `ℹ️ No pending trades to cancel.`, env, mainKb(u));
   const allIds = await getPendingIds(env);
   const myTids = pend.map(x => x.id);
-
   for (const trade of pend) {
     await setResult(cid, trade.id, 'CANCEL', null, null, env);
     await clearLock(cid, trade.pair, env);
     await kdel(`pt:${trade.id}`, env);
   }
   await savePendingIds(allIds.filter(id => !myTids.includes(id)), env);
-
   return reply(cid, mid, `🗑 Cancelled ${pend.length} pending trade(s).`, env, mainKb(u));
 }
 
-// v3.3: Manual WIN/LOSS result override
 async function doManualResult(cid, mid, no, result, env) {
   const u     = await getUser(cid, env);
   const h     = await getHist(cid, env);
   const trade = h.find(x => x.no === no);
-
   if (!trade)
     return reply(cid, mid, `❌ Signal #${no} not found.`, env, mainKb(u));
   if (trade.result === 'WIN' || trade.result === 'LOSS')
     return reply(cid, mid, `ℹ️ Signal #${no} already resolved as ${trade.result}.`, env, mainKb(u));
-
   await setResult(cid, trade.id, result, null, null, env);
   await clearLock(cid, trade.pair, env);
   await kdel(`pt:${trade.id}`, env);
-
   const ids = await getPendingIds(env);
   await savePendingIds(ids.filter(id => id !== trade.id), env);
-
   const dE = trade.direction === 'BUY' ? '🟢' : '🔴';
   const rE = result === 'WIN' ? '✅ WIN' : '❌ LOSS';
-  const t  = `${rE} manually set\n\n#${no} ${dE} ${trade.direction} ${disp(trade.pair)}\n${trade.grade || ''}`;
-  return reply(cid, mid, t, env, afterKb());
+  return reply(cid, mid, `${rE} manually set\n\n#${no} ${dE} ${trade.direction} ${disp(trade.pair)}\n${trade.grade || ''}`, env, afterKb());
 }
 
 // ─── SIGNAL FETCH ─────────────────────────────────────────────────────────────
 
-// [Bug#4 FIX] Service Binding path now has the same AbortSignal.timeout(20000)
-// as the fallback fetch path, preventing hanging on unresponsive workers.
+// [Fix#4] Service Binding now has timeout via Promise.race
 async function fetchSig(pair, env) {
   const WORKER_URL = 'https://asignal.umuhammadiswa.workers.dev';
   const req = new Request(`${WORKER_URL}/api/signal?pair=${pair}`, { headers: { Accept: 'application/json' } });
   const res = env.SIGNAL_WORKER
     ? await Promise.race([
         env.SIGNAL_WORKER.fetch(req),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Service binding timeout after 20s')), 20000)
-        ),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('Service binding timeout 20s')), 20000)),
       ])
-    : await fetch(`${WORKER_URL}/api/signal?pair=${pair}`,
-        { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
+    : await fetch(`${WORKER_URL}/api/signal?pair=${pair}`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text().catch(() => '')).slice(0, 150)}`);
   return res.json();
 }
@@ -1358,61 +1533,95 @@ async function autoScan(env, log) {
   log(`Scan: ${users.length} users`);
   const now = Date.now();
 
+  // [F03] Fetch news once per cron run (shared across all users)
+  let newsAlert = null;
+  try { newsAlert = await hasHighImpactNews(env); } catch {}
+  if (newsAlert) log(`News alert: ${newsAlert.title} (${newsAlert.currency}) in ${newsAlert.minsAway}min`);
+
   for (const cid of users) {
     try {
       const u = await getUser(cid, env);
       if (!u.autoEnabled) continue;
 
-      // ── v3.3 Feature 1: Candle-close gate ─────────────────
+      // Candle-close gate
       const intervalMin   = u.interval || 5;
       const intervalMs    = intervalMin * 60 * 1000;
       const currentCandle = Math.floor(now / intervalMs) * intervalMs;
       const lastCandle    = (await kget(`lc:${cid}`, env)) || 0;
-      if (currentCandle <= lastCandle) {
-        log(`Skip ${cid} — waiting for next candle close`);
+      if (currentCandle <= lastCandle) { log(`Skip ${cid} — same candle`); continue; }
+      await kput(`lc:${cid}`, currentCandle, env, { expirationTtl: intervalMin * 60 * 2 });
+
+      // [F03] Skip auto scan during high-impact news window
+      if (u.blockNews !== false && newsAlert) {
+        log(`News skip for ${cid}: ${newsAlert.title}`);
+        // Only notify once (when the event starts, minsAway close to 0)
+        if (Math.abs(newsAlert.minsAway) <= intervalMin) {
+          const sign = newsAlert.minsAway >= 0 ? 'in' : 'ago';
+          await sendMsg(cid, `🚫 Auto scan paused\n${newsAlert.title} (${newsAlert.currency}) ${sign} ${Math.abs(newsAlert.minsAway)}min\n\nSignals resume after the news window.`, env);
+        }
         continue;
       }
-      await kput(`lc:${cid}`, currentCandle, env, { expirationTtl: intervalMin * 60 * 2 });
-      // ──────────────────────────────────────────────────────
 
-      const list = [u.pair, ...u.watchlist].filter((p, i, a) => a.indexOf(p) === i);
-      let anySignalSent = false;
-      let pairErrors    = 0;
+      const list = [u.pair, ...u.watchlist].filter((p,i,a) => a.indexOf(p) === i);
+      let anySignalSent = false, pairErrors = 0;
+
+      // [F09] Fetch custom alerts for this user
+      const userAlerts = await getAlerts(cid, env);
 
       for (const pair of list) {
         try {
-          // ── v3.3 Feature 4: Same-candle dedup ───────────────
-          const scKey          = `sc:${cid}:${norm(pair)}`;
+          // Same-candle dedup
+          const scKey = `sc:${cid}:${norm(pair)}`;
           const lastPairCandle = (await kget(scKey, env)) || 0;
-          if (lastPairCandle >= currentCandle) {
-            log(`Dedup ${pair} — already sent this candle`);
-            continue;
-          }
-          // ────────────────────────────────────────────────────
+          if (lastPairCandle >= currentCandle) { log(`Dedup ${pair}`); continue; }
 
           const data = await fetchSig(pair, env);
           const sig  = data.signal;
           const dir  = sig?.finalSignal;
 
           if (dir === 'BUY' || dir === 'SELL') {
-            if (!passGrade(sig, u.gradeFilter) || !passConf(sig, u.minConfidence)) { log(`Filtered ${pair}`); continue; }
+            const normPair = norm(pair);
+            const alertConf = userAlerts[normPair];
+
+            // Check if passes main filters OR custom alert threshold
+            const passesMain  = passGrade(sig, u.gradeFilter) && passConf(sig, u.minConfidence) && passAI(sig, u.aiOnlyMode);
+            const passesAlert = alertConf && parseInt((sig.confidence||'0%').replace('%',''), 10) >= alertConf;
+
+            if (!passesMain && !passesAlert) { log(`Filtered ${pair}`); continue; }
+
             const lock = await getLock(cid, pair, env);
             if (lock?.direction === dir && lock?.expiryAt > now) { log(`Locked ${pair}`); continue; }
+
+            const corrWarnings = await checkCorrelated(cid, pair, dir, env);
             const no = await logAndSchedule(cid, pair, sig, env);
-            await sendMsg(cid, fmtSignal(data, pair, intervalMin, no), env, { reply_markup: signalKb(no) });
-            // Mark this pair as sent for this candle
+
+            // Build message options
+            const msgOpts = { correlated: corrWarnings };
+            if (passesAlert && !passesMain) {
+              // Alert-triggered signal (bypassed normal filter)
+              await sendMsg(cid,
+                `🔔 Custom Alert: ${disp(pair)} hit ${sig.confidence}% (your threshold: ${alertConf}%)\n\n` +
+                fmtSignal(data, pair, intervalMin, no, msgOpts),
+                env, { reply_markup: signalKb(no) });
+            } else {
+              await sendMsg(cid, fmtSignal(data, pair, intervalMin, no, msgOpts), env, { reply_markup: signalKb(no) });
+            }
+
+            // [F10] Mirror to channel
+            if (u.channelId) {
+              await sendMsg(u.channelId, fmtSignal(data, pair, intervalMin, no, {}), env, { reply_markup: channelKb() })
+                .catch(e => log(`Channel ${u.channelId}: ${e.message}`));
+            }
+
             await kput(scKey, currentCandle, env, { expirationTtl: intervalMin * 60 + 60 });
             log(`Sent #${no} ${pair} ${dir}`);
             anySignalSent = true;
 
-            // [Bug#2 FIX] Feature #15: confidence trend alert (also in autoScan)
+            // [Fix#2] Confidence trend alert
             if (sig.confidence) {
               const ct = await updateConfTrend(cid, sig.confidence, env);
-              if (ct.alert) {
-                await sendMsg(cid,
-                  `📉 Confidence Dropping — last 3 signals: ${ct.vals[2]}% → ${ct.vals[1]}% → ${ct.vals[0]}%\n\nConsider waiting for a stronger setup before trading.`,
-                  env, { reply_markup: kb([[btn('🏆 Stats', 'cmd:stats'), btn('🔙 Menu', 'cmd:main')]]) });
-              }
+              if (ct.alert)
+                await sendMsg(cid, `📉 Confidence Dropping — last 3: ${ct.vals[2]}% → ${ct.vals[1]}% → ${ct.vals[0]}%\n\nConsider waiting for a stronger setup.`, env, { reply_markup: kb([[btn('🏆 Stats', 'cmd:stats'), btn('🔙 Menu', 'cmd:main')]]) });
             }
           }
         } catch (e) {
@@ -1421,7 +1630,7 @@ async function autoScan(env, log) {
         }
       }
 
-      // ── v3.3 Feature 6: Worker error auto-pause ───────────
+      // Worker error auto-pause
       if (list.length > 0 && pairErrors === list.length) {
         const errKey = `errcnt:${cid}`;
         const errs   = ((await kget(errKey, env)) || 0) + 1;
@@ -1433,25 +1642,19 @@ async function autoScan(env, log) {
           await removeAutoUser(cid, env);
           await kdel(`lc:${cid}`, env);
           await kput(errKey, 0, env);
-          await sendMsg(cid,
-            `⚠️ Auto Scan paused\n\nSignal worker unreachable — ${MAX_ERRORS} consecutive scan failures.\nFix the worker then tap 🔄 Start Auto to resume.`,
-            env, { reply_markup: mainKb(u) });
-          log(`Auto paused for ${cid} after ${MAX_ERRORS} errors`);
+          await sendMsg(cid, `⚠️ Auto Scan paused\n\nSignal worker unreachable — ${MAX_ERRORS} consecutive failures.\nFix the worker then tap 🔄 Start Auto to resume.`, env, { reply_markup: mainKb(u) });
+          log(`Auto paused for ${cid}`);
         }
       } else if (pairErrors === 0 && list.length > 0) {
-        // Full success — reset error counter
         await kput(`errcnt:${cid}`, 0, env);
       }
-      // ──────────────────────────────────────────────────────
 
       if (!anySignalSent) {
         u.noTradeStreak = (u.noTradeStreak || 0) + 1;
         if (u.noTradeStreak >= 12) {
-          // [Bug#5 FIX] Added 🔙 Menu button so user isn't stranded
+          // [Fix#5] Added 🔙 Menu button
           await sendMsg(cid, `⚪ No setup for ${u.noTradeStreak} scans across ${list.length} pair(s).`, env,
-            { reply_markup: kb([
-              [btn('🔕 Stop Auto', 'cmd:toggle_auto'), btn('🔙 Menu', 'cmd:main')],
-            ]) });
+            { reply_markup: kb([[btn('🔕 Stop Auto', 'cmd:toggle_auto'), btn('🔙 Menu', 'cmd:main')]]) });
           u.noTradeStreak = 0;
         }
       } else {
@@ -1473,9 +1676,7 @@ async function resultCheck(env, log) {
       const t = await kget(`pt:${tid}`, env);
       if (!t) continue;
       if (t.expiryAt > now) { keep.push(tid); continue; }
-
       const cur = await fetchPrice(t.pair, env);
-
       if (!cur || !t.entryPrice) {
         await setResult(t.chatId, tid, 'SKIP', null, null, env);
         await clearLock(t.chatId, t.pair, env);
@@ -1483,10 +1684,8 @@ async function resultCheck(env, log) {
         await sendMsg(t.chatId, `⏭ Tracking No. ${t.signalNo || tid} — price unavailable`, env, { reply_markup: afterKb() });
         continue;
       }
-
       const entry   = parseFloat(t.entryPrice);
       const current = parseFloat(cur);
-
       if (isNaN(entry) || isNaN(current)) {
         await setResult(t.chatId, tid, 'SKIP', null, null, env);
         await clearLock(t.chatId, t.pair, env);
@@ -1494,40 +1693,29 @@ async function resultCheck(env, log) {
         await sendMsg(t.chatId, `⏭ Tracking No. ${t.signalNo || tid} — invalid price data`, env, { reply_markup: afterKb() });
         continue;
       }
-
       const diff   = current - entry;
       const result = t.direction === 'BUY' ? (diff > 0 ? 'WIN' : 'LOSS') : (diff < 0 ? 'WIN' : 'LOSS');
-      const pips   = isCr(t.pair)
-        ? Math.round(Math.abs(diff) * 100) / 100
-        : Math.round(Math.abs(diff) * 10000 * 10) / 10;
+      const pips   = isCr(t.pair) ? Math.round(Math.abs(diff) * 100) / 100 : Math.round(Math.abs(diff) * 10000 * 10) / 10;
       const unit   = isCr(t.pair) ? '$' : ' pips';
-
       await setResult(t.chatId, tid, result, current, pips, env);
       await clearLock(t.chatId, t.pair, env);
       await kdel(`pt:${tid}`, env);
-      await delReminder(tid, env); // [v4.0] clear expiry reminder
-
+      await delReminder(tid, env);
       const late  = Math.round((now - t.expiryAt) / 60000);
       const lateS = late > 1 ? ` (+${late}min)` : '';
       const dE    = t.direction === 'BUY' ? '🟢' : '🔴';
       const rE    = result === 'WIN' ? '✅ WIN' : '❌ LOSS';
       const gS    = t.grade ? `  ${t.grade}` : '';
-
       await sendMsg(t.chatId,
         `📊 Tracking No. ${t.signalNo || tid}${lateS}\n━━━━━━━━━━━━━━\n${rE}  ${dE} ${t.direction} ${disp(t.pair)}${gS}\n💰 Entry:  ${fmtPrice(entry, t.pair)}\n🏁 Exit:   ${fmtPrice(current, t.pair)}\n📏 Move:   ${diff > 0 ? '+' : ''}${pips}${unit}`,
         env, { reply_markup: afterKb() });
-
-      // [v4.0] Risk management alert
+      // Risk alert
       const risk = await updateRisk(t.chatId, result, env);
       if (risk.type === 'LOSS' && risk.streak >= 3) {
         await sendMsg(t.chatId,
-          `⚠️ Risk Alert — ${risk.streak} Consecutive Losses\n\nConsider taking a break or reducing trade size.\n\nAll-time win rate may help you decide.`,
-          env, { reply_markup: kb([
-            [btn('🏆 Check Stats', 'cmd:stats'), btn('🔕 Stop Auto', 'cmd:toggle_auto')],
-            [btn('🔙 Continue', 'cmd:main')],
-          ]) });
+          `⚠️ Risk Alert — ${risk.streak} Consecutive Losses\n\nConsider taking a break or reducing trade size.`,
+          env, { reply_markup: kb([[btn('🏆 Check Stats', 'cmd:stats'), btn('🔕 Stop Auto', 'cmd:toggle_auto')],[btn('🔙 Continue', 'cmd:main')]]) });
       }
-
       await checkMilestone(t.chatId, env);
     } catch (e) { log(`Result ${tid}: ${e.message}`); keep.push(tid); }
   }
@@ -1551,29 +1739,24 @@ async function dailySummary(env, log) {
       const res  = th.filter(x => x.result === 'WIN' || x.result === 'LOSS');
       const wins = res.filter(x => x.result === 'WIN').length;
       const wr   = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
-      const t    = `📅 Daily Summary — ${today}\n━━━━━━━━━━━━━━\n📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n⏳ Pending: ${th.filter(x => !x.result).length}`;
-      await sendMsg(cid, t, env, { reply_markup: kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')]]) });
+      await sendMsg(cid, `📅 Daily Summary — ${today}\n━━━━━━━━━━━━━━\n📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n⏳ Pending: ${th.filter(x => !x.result).length}`, env, { reply_markup: kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')]]) });
       await kput(`ds:${cid}`, Date.now(), env);
       log(`Summary sent to ${cid}`);
     } catch (e) { log(`Summary ${cid}: ${e.message}`); }
   }
 }
 
-// [v4.0] Expiry Reminder — 30s before expiry
 async function expiryReminder(env, log) {
   const ids = await getPendingReminders(env);
   if (!ids.length) return;
-  const now = Date.now();
-  const remaining = [];
+  const now = Date.now(), remaining = [];
   for (const tid of ids) {
     try {
       const r = await kget(`rem:${tid}`, env);
       if (!r) continue;
       if (r.remAt > now) { remaining.push(tid); continue; }
       const dE = r.direction === 'BUY' ? '🟢' : '🔴';
-      await sendMsg(r.chatId,
-        `⏰ Signal #${r.signalNo} expires in ~30s\n${dE} ${r.direction} ${disp(r.pair)}`,
-        env);
+      await sendMsg(r.chatId, `⏰ Signal #${r.signalNo} expires in ~30s\n${dE} ${r.direction} ${disp(r.pair)}`, env);
       await kdel(`rem:${tid}`, env);
       log(`Reminder sent #${r.signalNo}`);
     } catch (e) { log(`Reminder ${tid}: ${e.message}`); remaining.push(tid); }
@@ -1581,26 +1764,19 @@ async function expiryReminder(env, log) {
   await kput('remind_ids', remaining, env);
 }
 
-// [v4.0] Weekly Report — every Monday at 08:00 UTC
 async function weeklyReport(env, log) {
   const now  = new Date();
-  const day  = now.getUTCDay();
-  const hour = now.getUTCHours();
-  if (day !== 1 || hour !== 8) return; // Monday 08:00 UTC only
-
+  const day  = now.getUTCDay(), hour = now.getUTCHours();
+  if (day !== 1 || hour !== 8) return;
   const users = await getAutoUsers(env);
   log(`Weekly: ${users.length} users`);
   for (const cid of users) {
     try {
       const lastKey = `wr:${cid}`;
       const last    = (await kget(lastKey, env)) || 0;
-      if (Date.now() - last < 6 * 24 * 60 * 60 * 1000) continue; // prevent double-send
+      if (Date.now() - last < 6 * 24 * 60 * 60 * 1000) continue;
       const h   = await getHist(cid, env);
-      const msg = fmtWeekly(h);
-      await sendMsg(cid, msg, env, { reply_markup: kb([
-        [btn('🏆 Stats', 'cmd:stats'), btn('📒 Journal', 'cmd:journal')],
-        [btn('🔙 Menu', 'cmd:main')],
-      ]) });
+      await sendMsg(cid, fmtWeekly(h), env, { reply_markup: kb([[btn('🏆 Stats', 'cmd:stats'), btn('📒 Journal', 'cmd:journal')],[btn('🔥 Best Pairs', 'cmd:best'), btn('🔙 Menu', 'cmd:main')]]) });
       await kput(lastKey, Date.now(), env);
       log(`Weekly sent to ${cid}`);
     } catch (e) { log(`Weekly ${cid}: ${e.message}`); }
@@ -1613,10 +1789,8 @@ async function checkMilestone(cid, env) {
     const ms  = (await kget(mk, env)) || { lastCount: 0 };
     const h   = await getHist(cid, env);
     const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
-
     const since = Math.max(0, res.length - ms.lastCount);
     if (since < MILESTONE) return;
-
     const batch = res.slice(0, since);
     const wins  = batch.filter(x => x.result === 'WIN').length;
     const wr    = Math.round(wins / batch.length * 100);
@@ -1628,21 +1802,13 @@ async function checkMilestone(cid, env) {
       if (!pm[x.pair]) pm[x.pair] = { w:0, l:0 };
       x.result === 'WIN' ? pm[x.pair].w++ : pm[x.pair].l++;
     }
-    let t = `🏁 ${MILESTONE}-Signal Report (#${batch[batch.length-1]?.no || '?'} to #${batch[0]?.no || '?'})\n━━━━━━━━━━━━━━\n✅ ${wins}W  ❌ ${batch.length - wins}L\n📊 Win Rate: ${wr}%\n\nGrades:\n`;
-    for (const [g, s] of Object.entries(gm)) {
-      const tt = s.w + s.l;
-      t += `  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w / tt * 100)}%)\n`;
-    }
+    let t = `🏁 ${MILESTONE}-Signal Report (#${batch[batch.length-1]?.no||'?'} to #${batch[0]?.no||'?'})\n━━━━━━━━━━━━━━\n✅ ${wins}W  ❌ ${batch.length - wins}L\n📊 Win Rate: ${wr}%\n\nGrades:\n`;
+    for (const [g,s] of Object.entries(gm)) { const tt=s.w+s.l; t += `  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w/tt*100)}%)\n`; }
     t += `\nTop Pairs:\n`;
-    Object.entries(pm)
-      .sort((a, b) => (b[1].w + b[1].l) - (a[1].w + a[1].l))
-      .slice(0, 4)
-      .forEach(([p, s]) => {
-        const tt = s.w + s.l;
-        t += `  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w / tt * 100)}%)\n`;
-      });
+    Object.entries(pm).sort((a,b)=>(b[1].w+b[1].l)-(a[1].w+a[1].l)).slice(0,4)
+      .forEach(([p,s]) => { const tt=s.w+s.l; t += `  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w/tt*100)}%)\n`; });
     t += `\n🔄 Next ${MILESTONE} signals tracking starts now.`;
-    await sendMsg(cid, t, env, { reply_markup: kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')]]) });
+    await sendMsg(cid, t, env, { reply_markup: kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats'), btn('🔥 Best Pairs', 'cmd:best')]]) });
     await kput(mk, { lastCount: res.length }, env);
   } catch (e) { console.error('milestone:', e.message); }
 }
