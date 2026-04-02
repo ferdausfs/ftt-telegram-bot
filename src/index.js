@@ -1158,10 +1158,14 @@ async function onCb(cb, env) {
     return R(`✅ Alert set: ${disp(pair)} ≥${conf}%\n\nYou'll be notified when this pair hits ${conf}%+ confidence.`, alertPairsKb(page, alerts));
   }
   if (data.startsWith('alertdel:')) {
-    const parts = data.split(':'), pair = parts[1], page = parseInt(parts[2]||'0', 10);
+    const parts = data.split(':'), pair = parts[1];
     await delAlert(cid, pair, env);
     const alerts = await getAlerts(cid, env);
-    return R(`🗑 Alert removed for ${disp(pair)}`, alertPairsKb(page, alerts));
+    const count  = Object.keys(alerts).length;
+    const t = count
+      ? `🔔 Custom Alerts (${count})\n━━━━━━━━━━━━━━\nAlert removed for ${disp(pair)}.\n`
+      : `🔔 Custom Alerts\n━━━━━━━━━━━━━━\n🗑 Alert removed for ${disp(pair)}.\n\nNo alerts remaining.`;
+    return R(t, alertsKb(alerts));
   }
 
   // [Bug#2 FIX] cmd:cancelall was used in Risk Dashboard button but had no handler
