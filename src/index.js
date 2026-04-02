@@ -1,5 +1,5 @@
 /**
- * FTT Signal Telegram Bot — v4.0
+ * FTT Signal Telegram Bot — v4.0 (FIXED)
  * KV Binding     : BOT_KV
  * Service Binding: SIGNAL_WORKER → asignal.umuhammadiswa.workers.dev
  * Secrets        : BOT_TOKEN, SETUP_SECRET
@@ -10,7 +10,7 @@
  *  12. Trade journal (/journal)   — today's detailed breakdown with regime+session
  *  13. /analyze <pair>            — on-demand full signal analysis
  *  14. Signal expiry reminder     — 30s before expiry auto notification
- *  15. Confidence trend alert     — 3 consecutive drops → user notified
+ *  15. Confidence trend alert     — 3 consecutive drops → user notified  [IMPLEMENTED]
  *  16. Risk management alert      — 3 consecutive LOSS → auto warning + option to pause
  *  17. Weekly report              — every Monday auto + /weekly manual
  *  18. logAndSchedule() saves regime + session for analytics
@@ -20,6 +20,14 @@
  *  9.  Market Regime display
  *  8.  AI validation display
  *  1-7. All v3.3 features
+ *
+ * FIXES (v4.0-fixed):
+ *  [Bug#1] ⏳ Fetching message stuck without keyboard — doSignal/doQuickSignal/doScanAll
+ *          now restores the original message with mainKb after signal is sent.
+ *  [Bug#2] Feature #15 (confidence trend alert) was completely missing — now implemented.
+ *  [Bug#3] passGrade('AB') matched empty grade strings — fixed with ['A','B'].includes(g).
+ *  [Bug#4] fetchSig Service Binding path had no timeout — added AbortSignal.timeout(20000).
+ *  [Bug#5] noTradeStreak alert had no Menu button — added 🔙 Menu button.
  */
 
 const PAIR_PAGES = [
@@ -208,6 +216,29 @@ async function updateRisk(cid, result, env) {
   return r;
 }
 
+// ─── [Bug#2 FIX] Feature #15: Confidence Trend Alert ─────────────────────────
+// Tracks last 5 BUY/SELL signal confidence values per user.
+// If 3 consecutive signals show a drop in confidence → alert user.
+
+async function getConfTrend(cid, env) {
+  return (await kget(`ct:${cid}`, env)) || [];
+}
+
+async function updateConfTrend(cid, confStr, env) {
+  const val = parseInt((confStr || '0%').replace('%', ''), 10);
+  if (isNaN(val)) return { alert: false };
+  const arr = await getConfTrend(cid, env);
+  // newest first
+  arr.unshift(val);
+  const trimmed = arr.slice(0, 5);
+  await kput(`ct:${cid}`, trimmed, env, { expirationTtl: 86400 });
+  // Alert if 3 newest are strictly decreasing: [0] < [1] < [2]
+  if (trimmed.length >= 3 && trimmed[0] < trimmed[1] && trimmed[1] < trimmed[2]) {
+    return { alert: true, vals: trimmed.slice(0, 3) };
+  }
+  return { alert: false };
+}
+
 // expiry reminders: pending reminder jobs
 async function getPendingReminders(env) { return (await kget('remind_ids', env)) || []; }
 async function addReminder(rem, env) {
@@ -347,10 +378,13 @@ async function logAndSchedule(cid, pair, sig, env) {
 
 // ─── FILTERS ──────────────────────────────────────────────────────────────────
 
+// [Bug#3 FIX] 'AB'.includes('') was true → empty-grade signals passed the AB filter.
+// Fixed: use ['A','B'].includes(g) instead.
 const passGrade = (sig, f) => {
   if (!f || f === 'ALL') return true;
   const g = sig.grade?.grade || '';
-  return f === 'A' ? g === 'A' : f === 'AB' ? 'AB'.includes(g) : true;
+  if (!g) return false; // no grade never passes a grade filter
+  return f === 'A' ? g === 'A' : f === 'AB' ? ['A', 'B'].includes(g) : true;
 };
 const passConf = (sig, min) => {
   if (!min) return true;
@@ -358,7 +392,6 @@ const passConf = (sig, min) => {
 };
 
 // ─── CANDLE HELPERS ───────────────────────────────────────────────────────────
-
 
 // "4m 30s" until next candle close
 function nextCandleIn(intervalMin) {
@@ -942,6 +975,10 @@ async function onCb(cb, env) {
 
 // ─── ACTION FUNCTIONS ─────────────────────────────────────────────────────────
 
+// [Bug#1 FIX] After fetching signal and sending a new message, the original
+// button-message was left stuck showing "⏳ Fetching..." with no keyboard.
+// Now we restore it to the main menu after the signal card is sent.
+
 async function doSignal(cid, mid, env) {
   const u = await getUser(cid, env);
   if (mid) await editMsg(cid, mid, `⏳ Fetching ${disp(u.pair)}...`, env, {});
@@ -952,11 +989,30 @@ async function doSignal(cid, mid, env) {
     const dir  = sig?.finalSignal;
     let no = null;
     if (dir === 'BUY' || dir === 'SELL') no = await logAndSchedule(cid, u.pair, sig, env);
-    // v3.3: pass no to signalKb for WIN/LOSS buttons
     const useKb = (dir === 'BUY' || dir === 'SELL') ? signalKb(no) : afterKb();
     await sendMsg(cid, fmtSignal(data, u.pair, u.interval, no), env, { reply_markup: useKb });
+    // [Bug#1 FIX] Restore original message with main menu keyboard
+    if (mid) {
+      const h   = await getHist(cid, env);
+      const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
+      const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
+      const cnt = await getCounter(cid, env);
+      await editMsg(cid, mid,
+        `FTT Signal Bot v4.0\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`,
+        env, { reply_markup: mainKb(u) });
+    }
+    // [Bug#2 FIX] Feature #15: confidence trend alert
+    if ((dir === 'BUY' || dir === 'SELL') && sig?.confidence) {
+      const ct = await updateConfTrend(cid, sig.confidence, env);
+      if (ct.alert) {
+        await sendMsg(cid,
+          `📉 Confidence Dropping — last 3 signals: ${ct.vals[2]}% → ${ct.vals[1]}% → ${ct.vals[0]}%\n\nConsider waiting for a stronger setup before trading.`,
+          env, { reply_markup: kb([[btn('🏆 Stats', 'cmd:stats'), btn('🔙 Menu', 'cmd:main')]]) });
+      }
+    }
   } catch (e) {
-    await sendMsg(cid, `❌ Signal fetch failed\n${e.message.slice(0, 200)}`, env, { reply_markup: mainKb(u) });
+    if (mid) await editMsg(cid, mid, `❌ Signal fetch failed\n${e.message.slice(0, 150)}`, env, { reply_markup: mainKb(u) });
+    else     await sendMsg(cid, `❌ Signal fetch failed\n${e.message.slice(0, 200)}`, env, { reply_markup: mainKb(u) });
   }
 }
 
@@ -972,8 +1028,28 @@ async function doQuickSignal(cid, mid, pair, env) {
     if (dir === 'BUY' || dir === 'SELL') no = await logAndSchedule(cid, pair, sig, env);
     const useKb = (dir === 'BUY' || dir === 'SELL') ? signalKb(no) : afterKb();
     await sendMsg(cid, fmtSignal(data, pair, u.interval, no), env, { reply_markup: useKb });
+    // [Bug#1 FIX] Restore original message with main menu keyboard
+    if (mid) {
+      const h   = await getHist(cid, env);
+      const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
+      const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
+      const cnt = await getCounter(cid, env);
+      await editMsg(cid, mid,
+        `FTT Signal Bot v4.0\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`,
+        env, { reply_markup: mainKb(u) });
+    }
+    // [Bug#2 FIX] Feature #15: confidence trend alert
+    if ((dir === 'BUY' || dir === 'SELL') && sig?.confidence) {
+      const ct = await updateConfTrend(cid, sig.confidence, env);
+      if (ct.alert) {
+        await sendMsg(cid,
+          `📉 Confidence Dropping — last 3 signals: ${ct.vals[2]}% → ${ct.vals[1]}% → ${ct.vals[0]}%\n\nConsider waiting for a stronger setup before trading.`,
+          env, { reply_markup: kb([[btn('🏆 Stats', 'cmd:stats'), btn('🔙 Menu', 'cmd:main')]]) });
+      }
+    }
   } catch (e) {
-    await sendMsg(cid, `❌ Failed: ${e.message.slice(0, 150)}`, env, { reply_markup: mainKb(u) });
+    if (mid) await editMsg(cid, mid, `❌ Failed: ${e.message.slice(0, 150)}`, env, { reply_markup: mainKb(u) });
+    else     await sendMsg(cid, `❌ Failed: ${e.message.slice(0, 150)}`, env, { reply_markup: mainKb(u) });
   }
 }
 
@@ -995,11 +1071,22 @@ async function doScanAll(cid, mid, env) {
       }
     } catch (e) { console.error(`scan ${pair}:`, e.message); }
   }
-  await sendMsg(cid,
-    found > 0
-      ? `✅ ${found} signal(s) found across ${list.length} pairs`
-      : `⚪ No signals across ${list.length} pairs`,
-    env, { reply_markup: mainKb(u) });
+  const summary = found > 0
+    ? `✅ ${found} signal(s) found across ${list.length} pairs`
+    : `⚪ No signals across ${list.length} pairs`;
+  // [Bug#1 FIX] Restore original message, send summary as new message
+  if (mid) {
+    const h   = await getHist(cid, env);
+    const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
+    const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
+    const cnt = await getCounter(cid, env);
+    await editMsg(cid, mid,
+      `FTT Signal Bot v4.0\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`,
+      env, { reply_markup: mainKb(u) });
+    await sendMsg(cid, summary, env, { reply_markup: afterKb() });
+  } else {
+    await sendMsg(cid, summary, env, { reply_markup: mainKb(u) });
+  }
 }
 
 async function doToggle(cid, mid, env) {
@@ -1224,11 +1311,18 @@ async function doManualResult(cid, mid, no, result, env) {
 
 // ─── SIGNAL FETCH ─────────────────────────────────────────────────────────────
 
+// [Bug#4 FIX] Service Binding path now has the same AbortSignal.timeout(20000)
+// as the fallback fetch path, preventing hanging on unresponsive workers.
 async function fetchSig(pair, env) {
   const WORKER_URL = 'https://asignal.umuhammadiswa.workers.dev';
   const req = new Request(`${WORKER_URL}/api/signal?pair=${pair}`, { headers: { Accept: 'application/json' } });
   const res = env.SIGNAL_WORKER
-    ? await env.SIGNAL_WORKER.fetch(req)
+    ? await Promise.race([
+        env.SIGNAL_WORKER.fetch(req),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Service binding timeout after 20s')), 20000)
+        ),
+      ])
     : await fetch(`${WORKER_URL}/api/signal?pair=${pair}`,
         { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text().catch(() => '')).slice(0, 150)}`);
@@ -1270,8 +1364,6 @@ async function autoScan(env, log) {
       if (!u.autoEnabled) continue;
 
       // ── v3.3 Feature 1: Candle-close gate ─────────────────
-      // Scan fires only when a new candle has opened (clock-aligned).
-      // wrangler.toml cron must be "* * * * *" for this to work correctly.
       const intervalMin   = u.interval || 5;
       const intervalMs    = intervalMin * 60 * 1000;
       const currentCandle = Math.floor(now / intervalMs) * intervalMs;
@@ -1312,6 +1404,16 @@ async function autoScan(env, log) {
             await kput(scKey, currentCandle, env, { expirationTtl: intervalMin * 60 + 60 });
             log(`Sent #${no} ${pair} ${dir}`);
             anySignalSent = true;
+
+            // [Bug#2 FIX] Feature #15: confidence trend alert (also in autoScan)
+            if (sig.confidence) {
+              const ct = await updateConfTrend(cid, sig.confidence, env);
+              if (ct.alert) {
+                await sendMsg(cid,
+                  `📉 Confidence Dropping — last 3 signals: ${ct.vals[2]}% → ${ct.vals[1]}% → ${ct.vals[0]}%\n\nConsider waiting for a stronger setup before trading.`,
+                  env, { reply_markup: kb([[btn('🏆 Stats', 'cmd:stats'), btn('🔙 Menu', 'cmd:main')]]) });
+              }
+            }
           }
         } catch (e) {
           log(`Pair ${pair}: ${e.message}`);
@@ -1320,8 +1422,6 @@ async function autoScan(env, log) {
       }
 
       // ── v3.3 Feature 6: Worker error auto-pause ───────────
-      // If ALL pairs failed this scan, count it as a consecutive error.
-      // After MAX_ERRORS consecutive full failures → auto OFF + notify.
       if (list.length > 0 && pairErrors === list.length) {
         const errKey = `errcnt:${cid}`;
         const errs   = ((await kget(errKey, env)) || 0) + 1;
@@ -1347,8 +1447,11 @@ async function autoScan(env, log) {
       if (!anySignalSent) {
         u.noTradeStreak = (u.noTradeStreak || 0) + 1;
         if (u.noTradeStreak >= 12) {
+          // [Bug#5 FIX] Added 🔙 Menu button so user isn't stranded
           await sendMsg(cid, `⚪ No setup for ${u.noTradeStreak} scans across ${list.length} pair(s).`, env,
-            { reply_markup: kb([[btn('🔕 Stop Auto', 'cmd:toggle_auto')]]) });
+            { reply_markup: kb([
+              [btn('🔕 Stop Auto', 'cmd:toggle_auto'), btn('🔙 Menu', 'cmd:main')],
+            ]) });
           u.noTradeStreak = 0;
         }
       } else {
@@ -1417,7 +1520,6 @@ async function resultCheck(env, log) {
       // [v4.0] Risk management alert
       const risk = await updateRisk(t.chatId, result, env);
       if (risk.type === 'LOSS' && risk.streak >= 3) {
-        const u = await getUser(t.chatId, env);
         await sendMsg(t.chatId,
           `⚠️ Risk Alert — ${risk.streak} Consecutive Losses\n\nConsider taking a break or reducing trade size.\n\nAll-time win rate may help you decide.`,
           env, { reply_markup: kb([
