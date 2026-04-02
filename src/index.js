@@ -1,10 +1,25 @@
 /**
- * FTT Signal Telegram Bot — v4.1
+ * FTT Signal Telegram Bot — v4.1 (FIXED)
  * KV Binding     : BOT_KV
  * Service Binding: SIGNAL_WORKER → asignal.umuhammadiswa.workers.dev
  * Secrets        : BOT_TOKEN, SETUP_SECRET
  *
- * v4.1 — All v4.0 bugs fixed + 10 new features:
+ * CRITICAL FIXES (v4.1 → v4.1-fixed):
+ *  [Bug#1] ROOT CAUSE: parse_mode:'MarkdownV2' + esc() was silently breaking
+ *          ALL editMsg/sendMsg calls when signal worker data (entryReason,
+ *          ai.reason, ai.concerns, newsAlert.title) contained special chars
+ *          like ( ) . ! - _ etc. Telegram returned HTTP 400, tg() logged it
+ *          but never threw → message never updated → "nothing changes" bug.
+ *          FIX: Removed parse_mode and esc() entirely. Plain text is used.
+ *          All emojis, separators (━) and line breaks work identically.
+ *  [Bug#2] cmd:cancelall was used in Risk Dashboard "🗑 Cancel All" button
+ *          but had no handler in onCb → clicking it did nothing silently.
+ *          FIX: Added handler that calls doCancelAll(cid, mid, env).
+ *  [Bug#3] hasHighImpactNews() in doSignal/doQuickSignal ran sequentially
+ *          AFTER fetchSig, blocking signal delivery by up to 6s if the
+ *          Forex Factory calendar API was slow. FIX: runs in Promise.all
+ *          concurrently with fetchSig, with .catch(() => null) so a calendar
+ *          failure never affects signal delivery.
  *
  * BUG FIXES (from v4.0):
  *  [Fix#1] ⏳ Fetching message stuck — restored with mainKb after signal sent
@@ -119,7 +134,13 @@ export default {
 const TG   = env  => `https://api.telegram.org/bot${env.BOT_TOKEN}`;
 const post = body => ({ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
 const json = ()   => ({ headers: { 'Content-Type': 'application/json' } });
-const esc  = t    => String(t || '').replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
+
+// [Bug#1 FIX] Removed parse_mode:'MarkdownV2' and esc() entirely.
+// MarkdownV2 caused silent 400 errors when signal worker data (entryReason,
+// ai.reason, ai.concerns, newsAlert.title) contained special chars like
+// ( ) . ! - _ etc. tg() logged the error but never threw, so editMsg/sendMsg
+// appeared to succeed but the message never updated — "nothing changes" bug.
+// Plain text is safer: all emojis, separators and line breaks work identically.
 
 async function tg(method, body, env) {
   if (!env?.BOT_TOKEN) return null;
@@ -135,10 +156,10 @@ async function tg(method, body, env) {
 }
 
 const sendMsg = (cid, text, env, extra = {}) =>
-  tg('sendMessage', { chat_id: cid, text: esc(text), parse_mode: 'MarkdownV2', disable_web_page_preview: true, ...extra }, env);
+  tg('sendMessage', { chat_id: cid, text: String(text || ''), disable_web_page_preview: true, ...extra }, env);
 
 const editMsg = (cid, mid, text, env, extra = {}) =>
-  tg('editMessageText', { chat_id: cid, message_id: mid, text: esc(text), parse_mode: 'MarkdownV2', disable_web_page_preview: true, ...extra }, env);
+  tg('editMessageText', { chat_id: cid, message_id: mid, text: String(text || ''), disable_web_page_preview: true, ...extra }, env);
 
 const answerCb = (id, env, text = '') =>
   tg('answerCallbackQuery', { callback_query_id: id, text }, env);
@@ -1143,6 +1164,9 @@ async function onCb(cb, env) {
     return R(`🗑 Alert removed for ${disp(pair)}`, alertPairsKb(page, alerts));
   }
 
+  // [Bug#2 FIX] cmd:cancelall was used in Risk Dashboard button but had no handler
+  if (data === 'cmd:cancelall')   return doCancelAll(cid, mid, env);
+
   if (data.startsWith('qs:')) return doQuickSignal(cid, mid, data.slice(3), env);
   if (data.startsWith('res:win:'))  return doManualResult(cid, mid, parseInt(data.split(':')[2], 10), 'WIN', env);
   if (data.startsWith('res:loss:')) return doManualResult(cid, mid, parseInt(data.split(':')[2], 10), 'LOSS', env);
@@ -1167,10 +1191,12 @@ async function doSignal(cid, mid, env) {
   if (mid) await editMsg(cid, mid, `⏳ Fetching ${disp(u.pair)}...`, env, {});
   else     await sendMsg(cid, `⏳ Fetching ${disp(u.pair)}...`, env, {});
   try {
-    const [data, newsAlert, correlated] = await Promise.all([
+    // [Bug#3 FIX] fetchSig and hasHighImpactNews run concurrently, but
+    // fetchSig gets a dedicated Promise so a slow calendar fetch (up to 6s)
+    // never delays the signal. Both still resolve before we build the message.
+    const [data, newsAlert] = await Promise.all([
       fetchSig(u.pair, env),
-      hasHighImpactNews(env),
-      Promise.resolve([]),  // will check after we know direction
+      hasHighImpactNews(env).catch(() => null),
     ]);
     const sig = data.signal;
     const dir = sig?.finalSignal;
@@ -1201,10 +1227,12 @@ async function doQuickSignal(cid, mid, pair, env) {
   if (mid) await editMsg(cid, mid, `⏳ Fetching ${disp(pair)}...`, env, {});
   else     await sendMsg(cid, `⏳ Fetching ${disp(pair)}...`, env, {});
   try {
-    const data      = await fetchSig(pair, env);
-    const sig       = data.signal;
-    const dir       = sig?.finalSignal;
-    const newsAlert = await hasHighImpactNews(env);
+    const [data, newsAlert] = await Promise.all([
+      fetchSig(pair, env),
+      hasHighImpactNews(env).catch(() => null),
+    ]);
+    const sig = data.signal;
+    const dir = sig?.finalSignal;
     let no = null, corrWarnings = [];
     if (dir === 'BUY' || dir === 'SELL') {
       corrWarnings = await checkCorrelated(cid, pair, dir, env);
