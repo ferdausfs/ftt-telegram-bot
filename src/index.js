@@ -278,35 +278,44 @@ async function hasHighImpactNews(env, windowMin = NEWS_WINDOW) {
 
 // ─── [F01] CORRELATED TRADE HELPERS ───────────────────────────────────────────
 
+// [Bug#2 FIX] norm(null) → null.replace() → TypeError THROW.
+// Old history entries from v3.x may have null/undefined pair.
+// Now returns {} on bad input so callers never throw.
 function getCurrencyExposure(pair, direction) {
-  const p = norm(pair).toUpperCase();
-  // Crypto: treat all crypto as one bucket (they move together)
-  if (CRYPTO.some(c => p.startsWith(c))) {
-    return { _CRYPTO: direction === 'BUY' ? 'long' : 'short' };
-  }
-  const base  = p.slice(0, 3);
-  const quote = p.slice(3, 6);
-  return direction === 'BUY'
-    ? { [base]: 'long', [quote]: 'short' }
-    : { [base]: 'short', [quote]: 'long' };
+  if (!pair || !direction) return {};
+  try {
+    const p = String(pair).replace('/', '').toUpperCase();
+    if (!p || p.length < 6) return {};
+    if (CRYPTO.some(c => p.startsWith(c))) {
+      return { _CRYPTO: direction === 'BUY' ? 'long' : 'short' };
+    }
+    const base  = p.slice(0, 3);
+    const quote = p.slice(3, 6);
+    return direction === 'BUY'
+      ? { [base]: 'long', [quote]: 'short' }
+      : { [base]: 'short', [quote]: 'long' };
+  } catch { return {}; }
 }
 
 // Returns array of warning strings for correlated open trades
 async function checkCorrelated(cid, newPair, newDir, env) {
-  const h       = await getHist(cid, env);
-  const pending = h.filter(x => !x.result && x.direction && norm(x.pair) !== norm(newPair));
-  const newExp  = getCurrencyExposure(newPair, newDir);
-  const warnings = [];
-  for (const t of pending) {
-    const exp = getCurrencyExposure(t.pair, t.direction);
-    for (const [currency, side] of Object.entries(newExp)) {
-      if (exp[currency] === side) {
-        warnings.push(`${disp(t.pair)} ${t.direction} (${currency === '_CRYPTO' ? 'crypto' : currency})`);
-        break;
+  try {
+    const h       = await getHist(cid, env);
+    // [Bug#2 FIX] filter out entries with null/undefined pair
+    const pending = h.filter(x => !x.result && x.direction && x.pair && norm(x.pair) !== norm(newPair));
+    const newExp  = getCurrencyExposure(newPair, newDir);
+    const warnings = [];
+    for (const t of pending) {
+      const exp = getCurrencyExposure(t.pair, t.direction);
+      for (const [currency, side] of Object.entries(newExp)) {
+        if (exp[currency] === side) {
+          warnings.push(`${disp(t.pair)} ${t.direction} (${currency === '_CRYPTO' ? 'crypto' : currency})`);
+          break;
+        }
       }
     }
-  }
-  return warnings;
+    return warnings;
+  } catch { return []; }
 }
 
 // ─── EXPIRY REMINDERS ─────────────────────────────────────────────────────────
@@ -885,8 +894,9 @@ function fmtWeekly(hist, weekLabel) {
 
 // [F04] Risk Dashboard
 function fmtRisk(hist) {
-  const pending = hist.filter(x => !x.result && (x.direction === 'BUY' || x.direction === 'SELL'));
-  if (!pending.length) return `📉 Open Risk Dashboard\n━━━━━━━━━━━━━━\n✅ No open trades`;
+  // [Bug#2 FIX] filter out entries with null pair to avoid getCurrencyExposure crash
+  const pending = hist.filter(x => !x.result && (x.direction === 'BUY' || x.direction === 'SELL') && x.pair);
+  if (!pending.length) return `📉 Open Risk Dashboard\n━━━━━━━━━━━━━━\nNo open trades`;
   const now = Date.now();
   let msg = `📉 Open Risk Dashboard\n━━━━━━━━━━━━━━\n${pending.length} open trade(s)\n\n`;
   const exposure = {};
@@ -902,12 +912,11 @@ function fmtRisk(hist) {
     const g       = t.grade ? ` ${t.grade.split(' ')[0]}` : '';
     const rem     = t.expiryAt ? msToHuman(t.expiryAt - now) : '?';
     const expired = t.expiryAt && t.expiryAt < now;
-    msg += `${dE} #${t.no} ${t.direction} ${disp(t.pair)}${g} ${t.confidence}\n`;
-    msg += `   Entry: ${t.entryPrice ? fmtPrice(t.entryPrice, t.pair) : '?'}  ${expired ? '⏰ Result pending' : `⏳ ${rem}`}\n`;
+    msg += `${dE} #${t.no} ${t.direction} ${disp(t.pair)}${g} ${t.confidence || ''}\n`;
+    msg += `   Entry: ${t.entryPrice ? fmtPrice(t.entryPrice, t.pair) : '?'}  ${expired ? 'Result pending' : `${rem} left`}\n`;
   }
-  // Currency exposure summary
   const multi = Object.entries(exposure).filter(([, v]) => (v.long + v.short) > 1 && v.long > 0 && v.short === 0);
-  if (multi.length) msg += `\n⚠️ Concentrated exposure: ${multi.map(([c,v]) => `${c} ×${v.long}`).join(', ')}`;
+  if (multi.length) msg += `\nConcentrated exposure: ${multi.map(([c,v]) => `${c} x${v.long}`).join(', ')}`;
   return msg;
 }
 
@@ -1059,6 +1068,24 @@ async function onCb(cb, env) {
   const data = cb.data;
   await answerCb(cb.id, env, '');
   const u = await getUser(cid, env);
+
+  // [Bug#1 FIX] Global try/catch: every button handler is now wrapped.
+  // Previously, if doRisk/doBest/doHeatmap/doAlerts threw (e.g. from a
+  // null pair in history), dispatch() caught it silently. User saw
+  // "button does nothing". Now they always get an error message + working menu.
+  try {
+    await _handleCb(cid, mid, data, u, env);
+  } catch (e) {
+    console.error('onCb [' + data + ']:', e.message);
+    try {
+      await editMsg(cid, mid, `⚠️ Error: ${e.message.slice(0, 100)}\n\nTap menu to continue.`, env, { reply_markup: mainKb(u) });
+    } catch {
+      await sendMsg(cid, `⚠️ Something went wrong. Use /start to reset.`, env, { reply_markup: mainKb(u) });
+    }
+  }
+}
+
+async function _handleCb(cid, mid, data, u, env) {
   const R = (text, kboard) => reply(cid, mid, text, env, kboard);
 
   if (data === 'cmd:main') {
@@ -1098,19 +1125,20 @@ async function onCb(cb, env) {
     await saveUser(cid, u, env);
     if (u.dailySummary) await addSummaryUser(cid, env);
     else                await removeSummaryUser(cid, env);
-    return doSettings(cid, mid, env);
+    const t = `⚙️ Settings\n\nPair: ${disp(u.pair)}\nInterval: ${u.interval}min\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nDaily Summary: ${u.dailySummary ? `ON (${u.summaryHour ?? 20}:00 UTC)` : 'OFF'}`;
+    return R(t, settingsKb(u));
   }
-  // [F02] AI-Only toggle
   if (data === 'cmd:aionly') {
     u.aiOnlyMode = !u.aiOnlyMode;
     await saveUser(cid, u, env);
-    return doSettings2(cid, mid, env);
+    const t = `⚙️ Advanced Settings\n\nAI Only Mode: ${u.aiOnlyMode ? 'ON — signals only when AI agrees' : 'OFF'}\nBlock News: ${u.blockNews !== false ? 'ON — auto skips +/-15min news window' : 'OFF'}\nChannel: ${u.channelId || 'None'}`;
+    return R(t, settings2Kb(u));
   }
-  // [F03] Block News toggle
   if (data === 'cmd:blocknews') {
     u.blockNews = !(u.blockNews !== false);
     await saveUser(cid, u, env);
-    return doSettings2(cid, mid, env);
+    const t = `⚙️ Advanced Settings\n\nAI Only Mode: ${u.aiOnlyMode ? 'ON — signals only when AI agrees' : 'OFF'}\nBlock News: ${u.blockNews !== false ? 'ON — auto skips +/-15min news window' : 'OFF'}\nChannel: ${u.channelId || 'None'}`;
+    return R(t, settings2Kb(u));
   }
   // [F10] Channel info
   if (data === 'cmd:channelinfo') {
@@ -1120,13 +1148,43 @@ async function onCb(cb, env) {
     return R(chanInfo, settings2Kb(u));
   }
 
-  if (data.startsWith('interval:')) { u.interval = parseInt(data.split(':')[1], 10); await saveUser(cid, u, env); return doSettings(cid, mid, env); }
-  if (data.startsWith('sumhour:'))  { u.summaryHour = parseInt(data.split(':')[1], 10); await saveUser(cid, u, env); return doSettings(cid, mid, env); }
-  if (data.startsWith('gf:'))       { u.gradeFilter = data.slice(3); await saveUser(cid, u, env); return doSettings(cid, mid, env); }
-  if (data.startsWith('cf:'))       { u.minConfidence = parseInt(data.split(':')[1], 10); await saveUser(cid, u, env); return doSettings(cid, mid, env); }
+  // [Bug#3 FIX] All settings changes now use the locally-updated `u` directly
+  // instead of calling doSettings(cid, mid, env) which re-reads from KV and
+  // may return stale data (eventual consistency), making it look like the
+  // change didn't take effect.
+
+  if (data.startsWith('interval:')) {
+    u.interval = parseInt(data.split(':')[1], 10);
+    await saveUser(cid, u, env);
+    const t = `⚙️ Settings\n\nPair: ${disp(u.pair)}\nInterval: ${u.interval}min\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nDaily Summary: ${u.dailySummary ? `ON (${u.summaryHour ?? 20}:00 UTC)` : 'OFF'}`;
+    return R(t, settingsKb(u));
+  }
+  if (data.startsWith('sumhour:')) {
+    u.summaryHour = parseInt(data.split(':')[1], 10);
+    await saveUser(cid, u, env);
+    const t = `⚙️ Settings\n\nPair: ${disp(u.pair)}\nInterval: ${u.interval}min\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nDaily Summary: ${u.dailySummary ? `ON (${u.summaryHour ?? 20}:00 UTC)` : 'OFF'}`;
+    return R(t, settingsKb(u));
+  }
+  if (data.startsWith('gf:')) {
+    u.gradeFilter = data.slice(3);
+    await saveUser(cid, u, env);
+    const t = `⚙️ Settings\n\nPair: ${disp(u.pair)}\nInterval: ${u.interval}min\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nDaily Summary: ${u.dailySummary ? `ON (${u.summaryHour ?? 20}:00 UTC)` : 'OFF'}`;
+    return R(t, settingsKb(u));
+  }
+  if (data.startsWith('cf:')) {
+    u.minConfidence = parseInt(data.split(':')[1], 10);
+    await saveUser(cid, u, env);
+    const t = `⚙️ Settings\n\nPair: ${disp(u.pair)}\nInterval: ${u.interval}min\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nDaily Summary: ${u.dailySummary ? `ON (${u.summaryHour ?? 20}:00 UTC)` : 'OFF'}`;
+    return R(t, settingsKb(u));
+  }
 
   if (data.startsWith('pairpage:')) return R('💱 Select default pair:', pairsKb(parseInt(data.split(':')[1], 10)));
-  if (data.startsWith('pair:'))     { u.pair = norm(data.slice(5)); await saveUser(cid, u, env); return doSettings(cid, mid, env); }
+  if (data.startsWith('pair:')) {
+    u.pair = norm(data.slice(5));
+    await saveUser(cid, u, env);
+    const t = `⚙️ Settings\n\nPair: ${disp(u.pair)}\nInterval: ${u.interval}min\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nDaily Summary: ${u.dailySummary ? `ON (${u.summaryHour ?? 20}:00 UTC)` : 'OFF'}`;
+    return R(t, settingsKb(u));
+  }
 
   if (data.startsWith('wlpage:'))   return R(`👁 Add to Watchlist (${u.watchlist.length}/${MAX_WL}):`, wlAddKb(parseInt(data.split(':')[1], 10), u.watchlist));
   if (data.startsWith('wl:rm:'))    { u.watchlist = u.watchlist.filter(p => p !== data.slice(6)); await saveUser(cid, u, env); return doWatchlist(cid, mid, env); }
@@ -1158,14 +1216,10 @@ async function onCb(cb, env) {
     return R(`✅ Alert set: ${disp(pair)} ≥${conf}%\n\nYou'll be notified when this pair hits ${conf}%+ confidence.`, alertPairsKb(page, alerts));
   }
   if (data.startsWith('alertdel:')) {
-    const parts = data.split(':'), pair = parts[1];
+    const parts = data.split(':'), pair = parts[1], page = parseInt(parts[2]||'0', 10);
     await delAlert(cid, pair, env);
     const alerts = await getAlerts(cid, env);
-    const count  = Object.keys(alerts).length;
-    const t = count
-      ? `🔔 Custom Alerts (${count})\n━━━━━━━━━━━━━━\nAlert removed for ${disp(pair)}.\n`
-      : `🔔 Custom Alerts\n━━━━━━━━━━━━━━\n🗑 Alert removed for ${disp(pair)}.\n\nNo alerts remaining.`;
-    return R(t, alertsKb(alerts));
+    return R(`🗑 Alert removed for ${disp(pair)}`, alertPairsKb(page, alerts));
   }
 
   // [Bug#2 FIX] cmd:cancelall was used in Risk Dashboard button but had no handler
