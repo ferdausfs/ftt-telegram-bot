@@ -164,6 +164,10 @@ const editMsg = (cid, mid, text, env, extra = {}) =>
 const answerCb = (id, env, text = '') =>
   tg('answerCallbackQuery', { callback_query_id: id, text }, env);
 
+// Delete a message silently (ignore errors — e.g. already deleted or too old)
+const deleteMsg = (cid, mid, env) =>
+  tg('deleteMessage', { chat_id: cid, message_id: mid }, env).catch(() => null);
+
 const reply = (cid, mid, text, env, kboard) => {
   const extra = kboard ? { reply_markup: kboard } : {};
   return mid ? editMsg(cid, mid, text, env, extra) : sendMsg(cid, text, env, extra);
@@ -1246,12 +1250,15 @@ async function restoreMainMsg(cid, mid, u, env) {
 
 async function doSignal(cid, mid, env) {
   const u = await getUser(cid, env);
-  if (mid) await editMsg(cid, mid, `⏳ Fetching ${disp(u.pair)}...`, env, {});
-  else     await sendMsg(cid, `⏳ Fetching ${disp(u.pair)}...`, env, {});
+  let loadingMid = mid;
+  if (mid) {
+    await editMsg(cid, mid, `⏳ Fetching ${disp(u.pair)}...`, env, {});
+  } else {
+    // Text command: send loading msg, capture its id so we can delete it later
+    const r = await sendMsg(cid, `⏳ Fetching ${disp(u.pair)}...`, env, {});
+    try { const j = await r?.json(); loadingMid = j?.result?.message_id || null; } catch {}
+  }
   try {
-    // [Bug#3 FIX] fetchSig and hasHighImpactNews run concurrently, but
-    // fetchSig gets a dedicated Promise so a slow calendar fetch (up to 6s)
-    // never delays the signal. Both still resolve before we build the message.
     const [data, newsAlert] = await Promise.all([
       fetchSig(u.pair, env),
       hasHighImpactNews(env).catch(() => null),
@@ -1264,11 +1271,13 @@ async function doSignal(cid, mid, env) {
       no = await logAndSchedule(cid, u.pair, sig, env);
     }
     const useKb  = (dir === 'BUY' || dir === 'SELL') ? signalKb(no) : afterKb();
-    const sigMsg = fmtSignal(data, u.pair, u.interval, no, { newsAlert, correlated: corrWarnings });
-    await sendMsg(cid, sigMsg, env, { reply_markup: useKb });
-    // [Fix#1] Restore original message
-    await restoreMainMsg(cid, mid, u, env);
-    // [Fix#2] Confidence trend alert
+    await sendMsg(cid, fmtSignal(data, u.pair, u.interval, no, { newsAlert, correlated: corrWarnings }), env, { reply_markup: useKb });
+    // Restore button message (button flow) or delete loading msg (text command flow)
+    if (mid) {
+      await restoreMainMsg(cid, mid, u, env);
+    } else if (loadingMid) {
+      await deleteMsg(cid, loadingMid, env);
+    }
     if ((dir === 'BUY' || dir === 'SELL') && sig?.confidence) {
       const ct = await updateConfTrend(cid, sig.confidence, env);
       if (ct.alert)
@@ -1276,14 +1285,22 @@ async function doSignal(cid, mid, env) {
     }
   } catch (e) {
     if (mid) await editMsg(cid, mid, `❌ Signal fetch failed\n${e.message.slice(0,150)}`, env, { reply_markup: mainKb(u) });
-    else     await sendMsg(cid, `❌ Signal fetch failed\n${e.message.slice(0,200)}`, env, { reply_markup: mainKb(u) });
+    else {
+      if (loadingMid) await deleteMsg(cid, loadingMid, env);
+      await sendMsg(cid, `❌ Signal fetch failed\n${e.message.slice(0,200)}`, env, { reply_markup: mainKb(u) });
+    }
   }
 }
 
 async function doQuickSignal(cid, mid, pair, env) {
   const u = await getUser(cid, env);
-  if (mid) await editMsg(cid, mid, `⏳ Fetching ${disp(pair)}...`, env, {});
-  else     await sendMsg(cid, `⏳ Fetching ${disp(pair)}...`, env, {});
+  let loadingMid = mid;
+  if (mid) {
+    await editMsg(cid, mid, `⏳ Fetching ${disp(pair)}...`, env, {});
+  } else {
+    const r = await sendMsg(cid, `⏳ Fetching ${disp(pair)}...`, env, {});
+    try { const j = await r?.json(); loadingMid = j?.result?.message_id || null; } catch {}
+  }
   try {
     const [data, newsAlert] = await Promise.all([
       fetchSig(pair, env),
@@ -1298,7 +1315,11 @@ async function doQuickSignal(cid, mid, pair, env) {
     }
     const useKb  = (dir === 'BUY' || dir === 'SELL') ? signalKb(no) : afterKb();
     await sendMsg(cid, fmtSignal(data, pair, u.interval, no, { newsAlert, correlated: corrWarnings }), env, { reply_markup: useKb });
-    await restoreMainMsg(cid, mid, u, env);
+    if (mid) {
+      await restoreMainMsg(cid, mid, u, env);
+    } else if (loadingMid) {
+      await deleteMsg(cid, loadingMid, env);
+    }
     if ((dir === 'BUY' || dir === 'SELL') && sig?.confidence) {
       const ct = await updateConfTrend(cid, sig.confidence, env);
       if (ct.alert)
@@ -1306,15 +1327,23 @@ async function doQuickSignal(cid, mid, pair, env) {
     }
   } catch (e) {
     if (mid) await editMsg(cid, mid, `❌ Failed: ${e.message.slice(0,150)}`, env, { reply_markup: mainKb(u) });
-    else     await sendMsg(cid, `❌ Failed: ${e.message.slice(0,150)}`, env, { reply_markup: mainKb(u) });
+    else {
+      if (loadingMid) await deleteMsg(cid, loadingMid, env);
+      await sendMsg(cid, `❌ Failed: ${e.message.slice(0,150)}`, env, { reply_markup: mainKb(u) });
+    }
   }
 }
 
 async function doScanAll(cid, mid, env) {
   const u    = await getUser(cid, env);
   const list = [u.pair, ...u.watchlist].filter((p,i,a) => a.indexOf(p) === i);
-  if (mid) await editMsg(cid, mid, `🔍 Scanning ${list.length} pairs...`, env, {});
-  else     await sendMsg(cid, `🔍 Scanning ${list.length} pairs...`, env, {});
+  let loadingMid = mid;
+  if (mid) {
+    await editMsg(cid, mid, `🔍 Scanning ${list.length} pairs...`, env, {});
+  } else {
+    const r = await sendMsg(cid, `🔍 Scanning ${list.length} pairs...`, env, {});
+    try { const j = await r?.json(); loadingMid = j?.result?.message_id || null; } catch {}
+  }
   let found = 0;
   for (const pair of list) {
     try {
@@ -1330,11 +1359,11 @@ async function doScanAll(cid, mid, env) {
     } catch (e) { console.error(`scan ${pair}:`, e.message); }
   }
   const summary = found > 0 ? `✅ ${found} signal(s) found across ${list.length} pairs` : `⚪ No signals across ${list.length} pairs`;
-  // [Fix#1] Restore original message
   if (mid) {
     await restoreMainMsg(cid, mid, u, env);
     await sendMsg(cid, summary, env, { reply_markup: afterKb() });
   } else {
+    if (loadingMid) await deleteMsg(cid, loadingMid, env);
     await sendMsg(cid, summary, env, { reply_markup: mainKb(u) });
   }
 }
