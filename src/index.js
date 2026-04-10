@@ -1607,7 +1607,7 @@ async function doManualResult(cid, mid, no, result, env) {
 
 // [Fix#4] Service Binding now has timeout via Promise.race
 async function fetchSig(pair, env) {
-  const WORKER_URL = 'https://asignal.umuhammadiswa.workers.dev';
+  const WORKER_URL = 'https://fttotcv6.umuhammadiswa.workers.dev';
   const req = new Request(`${WORKER_URL}/api/signal?pair=${pair}`, { headers: { Accept: 'application/json' } });
   const res = env.SIGNAL_WORKER
     ? await Promise.race([
