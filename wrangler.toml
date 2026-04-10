@@ -15,5 +15,5 @@ service = "asignal"
 
 [[services]]
 binding = "SIGNAL_WORKER"
-service = "asignal"
+service = "fttotcv6"
 
