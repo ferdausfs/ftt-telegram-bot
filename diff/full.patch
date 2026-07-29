@@ -1,0 +1,367 @@
+diff --git a/scripts/phase9_smoke.mjs b/scripts/phase9_smoke.mjs
+new file mode 100644
+index 0000000..d8e3d5e
+--- /dev/null
++++ b/scripts/phase9_smoke.mjs
+@@ -0,0 +1,219 @@
++/**
++ * Phase 9 smoke tests — node scripts/phase9_smoke.mjs
++ *
++ * The Bot is one 1900-line Worker module with no exports, so these tests work
++ * two ways:
++ *   1. behavioural — the cache-routing and freshness helpers are re-created
++ *      from the real source by extracting the functions and evaluating them
++ *      against a mocked worker, so the actual shipped logic is executed;
++ *   2. structural — asserts on the source that user commands still force fresh
++ *      generation and that only background paths were switched to the cache.
++ *
++ * No network, no Telegram, no KV.
++ */
++
++import { readFileSync } from 'node:fs';
++import { fileURLToPath } from 'node:url';
++import path from 'node:path';
++import vm from 'node:vm';
++
++const here = path.dirname(fileURLToPath(import.meta.url));
++const root = path.resolve(here, '..');
++const src = readFileSync(path.join(root, 'src/index.js'), 'utf8');
++
++let pass = 0, fail = 0;
++const failures = [];
++const ok = (n, c, d) => { if (c) { pass++; console.log('PASS  ' + n); } else { fail++; failures.push(n); console.log('FAIL  ' + n + (d ? ' — ' + d : '')); } };
++const eq = (n, a, b) => ok(n, JSON.stringify(a) === JSON.stringify(b), 'expected ' + JSON.stringify(b) + ', got ' + JSON.stringify(a));
++
++/** Pull a top-level function's source out of the module by brace matching. */
++function extractFn(name) {
++  const re = new RegExp('(?:^|\\n)(async\\s+)?function\\s+' + name + '\\s*\\(', 'm');
++  const m = re.exec(src);
++  if (!m) throw new Error('function not found: ' + name);
++  // m[0] may begin with the preceding newline; skip it but KEEP `async`.
++  const start = m.index + (src[m.index] === '\n' ? 1 : 0);
++
++  // Skip the PARAMETER LIST before brace-matching the body: a destructured
++  // default like `{ allow404 = false } = {}` would otherwise be mistaken for
++  // the function body and truncate the extraction.
++  let p = src.indexOf('(', m.index), pd = 0;
++  for (; p < src.length; p++) {
++    if (src[p] === '(') pd++;
++    else if (src[p] === ')') { pd--; if (pd === 0) { p++; break; } }
++  }
++
++  let i = src.indexOf('{', p), depth = 0;
++  for (; i < src.length; i++) {
++    if (src[i] === '{') depth++;
++    else if (src[i] === '}') { depth--; if (depth === 0) { i++; break; } }
++  }
++  return src.slice(start, i);
++}
++
++// Build a sandbox containing the REAL fetchSig / fetchSigCached / workerFetch /
++// fmtFreshness, with the network faked.
++function buildSandbox(routes) {
++  const calls = [];
++  const ctx = {
++    console: { log: () => {} },
++    setTimeout, clearTimeout, Promise, Error, JSON, Math, Object, encodeURIComponent,
++    AbortSignal: { timeout: () => undefined },
++    Request: class { constructor(url) { this.url = url; } },
++    fetch: async (url) => { throw new Error('direct fetch should not be used when SIGNAL_WORKER exists: ' + url); },
++    __calls: calls,
++  };
++  ctx.globalThis = ctx;
++  vm.createContext(ctx);
++  // module-level constant the extracted functions close over
++  const workerUrl = /const WORKER_URL = '([^']+)'/.exec(src);
++  vm.runInContext(
++    `const WORKER_URL = ${JSON.stringify(workerUrl ? workerUrl[1] : '')};\n` +
++    extractFn('workerFetch') + '\n' +
++    extractFn('fetchSig') + '\n' +
++    extractFn('fetchSigCached') + '\n' +
++    extractFn('fmtFreshness') + '\n', ctx);
++
++  const env = {
++    SIGNAL_WORKER: {
++      fetch: async (req) => {
++        calls.push(req.url);
++        for (const [match, make] of routes) {
++          if (req.url.includes(match)) return make();
++        }
++        throw new Error('unrouted ' + req.url);
++      },
++    },
++  };
++  return { ctx, env, calls };
++}
++
++const res = (body, status = 200) => () => ({
++  ok: status >= 200 && status < 300, status,
++  json: async () => body,
++  text: async () => JSON.stringify(body),
++});
++
++const sigBody = (extra = {}) => ({
++  id: 'sig_1', pair: 'BTC/USD', marketStatus: 'OPEN',
++  signal: { finalSignal: 'BUY', confidence: '87%' }, ...extra,
++});
++
++console.log('── background scan reads the shared cache ─────────────────');
++{
++  const { ctx, env, calls } = buildSandbox([
++    ['/api/signals/latest', res(sigBody({ cached: true, generationAge: 120, generationId: 'gen_a' }))],
++  ]);
++  const out = await ctx.fetchSigCached('BTCUSD', env);
++  eq('one request', calls.length, 1);
++  ok('hit the cache endpoint', calls[0].includes('/api/signals/latest?pair=BTCUSD'), calls[0]);
++  ok('never ran the engine', !calls.some(c => c.includes('/api/signal?')));
++  eq('cached payload returned', out.cached, true);
++  eq('generationId preserved (same id the App sees)', out.generationId, 'gen_a');
++}
++
++console.log('\n── cache miss falls back to a fresh run ───────────────────');
++{
++  const { ctx, env, calls } = buildSandbox([
++    ['/api/signals/latest', res({ error: true, stale: true }, 404)],
++    ['/api/signal?', res(sigBody())],
++  ]);
++  const out = await ctx.fetchSigCached('USDCHF', env);
++  eq('two requests', calls.length, 2);
++  ok('cache first', calls[0].includes('/api/signals/latest'));
++  ok('then fresh', calls[1].includes('/api/signal?pair=USDCHF'));
++  eq('marked not cached', out.cached, false);
++  ok('watchlist coverage preserved (still got a signal)', !!out.signal);
++}
++
++console.log('\n── cache error also falls back (never skips a pair) ───────');
++{
++  const { ctx, env, calls } = buildSandbox([
++    ['/api/signals/latest', res({}, 500)],
++    ['/api/signal?', res(sigBody())],
++  ]);
++  const out = await ctx.fetchSigCached('BTCUSD', env);
++  eq('fell through after the 500', calls.length, 2);
++  ok('still returned a signal', !!out.signal);
++}
++
++console.log('\n── a 200 without a signal is treated as a miss ────────────');
++{
++  const { ctx, env, calls } = buildSandbox([
++    ['/api/signals/latest', res({ cached: true, pair: 'BTC/USD' })],
++    ['/api/signal?', res(sigBody())],
++  ]);
++  const out = await ctx.fetchSigCached('BTCUSD', env);
++  eq('fresh run attempted', calls.length, 2);
++  ok('usable signal returned', !!out.signal);
++}
++
++console.log('\n── user command path stays fresh ──────────────────────────');
++{
++  const { ctx, env, calls } = buildSandbox([['/api/signal?', res(sigBody())]]);
++  await ctx.fetchSig('EURUSD', env);
++  eq('single request', calls.length, 1);
++  ok('goes straight to the engine', calls[0].includes('/api/signal?pair=EURUSD'));
++  ok('never reads the cache', !calls.some(c => c.includes('/api/signals/latest')));
++}
++
++console.log('\n── freshness line (B3) ────────────────────────────────────');
++{
++  const { ctx } = buildSandbox([]);
++  eq('seconds', ctx.fmtFreshness({ cached: true, generationAge: 45 }), '🕐 Cached 45s ago');
++  eq('exact minutes', ctx.fmtFreshness({ cached: true, generationAge: 120 }), '🕐 Cached 2m ago');
++  eq('minutes + seconds', ctx.fmtFreshness({ cached: true, generationAge: 145 }), '🕐 Cached 2m 25s ago');
++  eq('fresh run', ctx.fmtFreshness({ cached: false }), '⚡ Freshly generated');
++  eq('no metadata -> nothing', ctx.fmtFreshness({}), null);
++  eq('null safe', ctx.fmtFreshness(null), null);
++  eq('cached but no age', ctx.fmtFreshness({ cached: true }), '🕐 Cached');
++  ok('never emits NaN', !String(ctx.fmtFreshness({ cached: true, generationAge: 'x' })).includes('NaN'));
++}
++
++console.log('\n── structural: only background paths switched ─────────────');
++{
++  const fnOf = (line) => {
++    const upto = src.slice(0, line);
++    const m = [...upto.matchAll(/\n(?:async )?function ([a-zA-Z0-9_]+)\s*\(/g)].pop();
++    return m ? m[1] : '?';
++  };
++  const callers = [...src.matchAll(/fetchSig(Cached)?\(/g)]
++    .map(m => ({ cached: !!m[1], fn: fnOf(m.index) }))
++    .filter(c => c.fn !== 'fetchSigCached' && c.fn !== 'fetchPrice' || c.cached);
++
++  const background = ['autoScan', 'fetchPrice'];
++  const userFacing = ['doSignal', 'doQuickSignal', 'doScanAll', 'doReplay', 'doAnalyze'];
++
++  for (const fn of background) {
++    const hits = callers.filter(c => c.fn === fn);
++    ok(`background ${fn}() uses the cache`, hits.length > 0 && hits.every(c => c.cached),
++       JSON.stringify(hits));
++  }
++  for (const fn of userFacing) {
++    const hits = callers.filter(c => c.fn === fn);
++    ok(`user command ${fn}() stays fresh`, hits.length > 0 && hits.every(c => !c.cached),
++       JSON.stringify(hits));
++  }
++}
++
++console.log('\n── unchanged surfaces (spec §B.2) ─────────────────────────');
++{
++  ok('/history untouched', src.includes("text.startsWith('/history')"));
++  ok('/settings-style state untouched', src.includes('saveUser('));
++  ok('result reporting flow intact', src.includes('async function resultCheck'));
++  ok('manual /win /loss intact', src.includes("text.startsWith('/win')") || src.includes("'/win'"));
++  ok('/refresh command added', src.includes("text.startsWith('/refresh')"));
++  ok('help mentions /refresh', src.includes('/refresh EURUSD'));
++  ok('cron interval unchanged (5 min)',
++     readFileSync(path.join(root, 'wrangler.toml'), 'utf8').includes('crons = ["*/5 * * * *"]'));
++  ok('SIGNAL_WORKER binding unchanged',
++     readFileSync(path.join(root, 'wrangler.toml'), 'utf8').includes('service = "fttotcv6"'));
++  ok('no deploy commands', !/wrangler deploy|git push/.test(src));
++  ok('single shared transport (no duplicated fetch logic)',
++     (src.match(/new Promise\(\(_, rej\) => setTimeout/g) || []).length === 1);
++}
++
++console.log('\n───────────────────────────────────────────────────────────');
++console.log('PASS: ' + pass + '   FAIL: ' + fail);
++if (fail > 0) { console.log('\nFailures:'); failures.forEach(f => console.log('  - ' + f)); process.exit(1); }
++console.log('ALL PHASE 9 SMOKE TESTS PASSED');
+diff --git a/src/index.js b/src/index.js
+index 47df065..237dabb 100644
+--- a/src/index.js
++++ b/src/index.js
+@@ -714,9 +714,27 @@ function fmtSignal(data, pair, interval, no, opts = {}) {
+     msg += `⚪ NO TRADE\n`;
+     msg += filters.length ? `🔕 ${filters.join(' · ')}` : `🔕 ${sig.alignment === 'MIXED' ? 'Timeframes mixed' : 'Setup not clear'}`;
+   }
++  // PHASE 9 (B3): transparency line — say whether this came from the shared
++  // 5-min cache or was generated on the spot. Same concept as the App's
++  // freshness pill, so a user comparing both screens sees one consistent story.
++  const freshness = fmtFreshness(data);
++  if (freshness) msg += `\n${freshness}`;
++
+   return msg;
+ }
+ 
++/** "🕐 Cached 2m ago" / "⚡ Freshly generated" — null when no cache metadata. */
++function fmtFreshness(data) {
++  if (!data || typeof data !== 'object') return null;
++  if (data.cached !== true) return data.cached === false ? '⚡ Freshly generated' : null;
++  const age = typeof data.generationAge === 'number' ? Math.max(0, Math.floor(data.generationAge)) : null;
++  if (age === null) return '🕐 Cached';
++  if (age < 60) return `🕐 Cached ${age}s ago`;
++  const m = Math.floor(age / 60);
++  const rem = age % 60;
++  return rem === 0 ? `🕐 Cached ${m}m ago` : `🕐 Cached ${m}m ${rem}s ago`;
++}
++
+ function fmtHist(hist, page = 0) {
+   const per = 10, slice = hist.slice(page * per, page * per + per);
+   if (!slice.length) return 'No signals yet.';
+@@ -1000,6 +1018,13 @@ async function onMessage(msg, env) {
+ 
+   if (text.startsWith('/start'))     return R(`👋 FTT Signal Bot v4.1\n\nSignals + Analytics + Smart Alerts\n\nPair: ${disp(u.pair)}  ${u.interval}min  Auto ${u.autoEnabled ? 'ON' : 'OFF'}`, mainKb(u));
+   if (text.startsWith('/signal'))    return doSignal(cid, null, env);
++  // PHASE 9: explicit force-refresh wording. /signal already runs the engine —
++  // /refresh <pair> is the same thing, named so the intent is unambiguous now
++  // that background scans are served from cache.
++  if (text.startsWith('/refresh')) {
++    const arg = text.slice(8).trim();
++    return arg ? doQuickSignal(cid, null, arg, env) : doSignal(cid, null, env);
++  }
+   if (text.startsWith('/scan'))      return doScanAll(cid, null, env);
+   if (text.startsWith('/auto'))      return doToggle(cid, null, env);
+   if (text.startsWith('/status'))    return doStatus(cid, null, env);
+@@ -1051,7 +1076,7 @@ async function onMessage(msg, env) {
+     return R('❌ Use: 1, 5, or 15', mainKb(u));
+   }
+   if (text.startsWith('/help'))
+-    return R(`FTT Signal Bot v4.1\n\n/signal — get signal\n/scan — scan all pairs\n/auto — toggle auto scan\n/watchlist /history /stats\n/today /summary /status\n/risk — open trade risk dashboard\n/heatmap — win rate by hour\n/best — best pairs leaderboard\n/alerts — custom pair alerts\n/replay EURUSD — analyze without logging\n/setchannel <id> — mirror signals to channel\n/clearchannel — remove channel\n/cancelall — cancel pending\n/win <no> /loss <no> — manual override\n/pair EURUSD /interval 5\n\n💡 Just type a pair name to scan instantly`, mainKb(u));
++    return R(`FTT Signal Bot v4.1\n\n/signal — get signal (fresh)\n/refresh EURUSD — force fresh signal\n/scan — scan all pairs\n/auto — toggle auto scan\n/watchlist /history /stats\n/today /summary /status\n/risk — open trade risk dashboard\n/heatmap — win rate by hour\n/best — best pairs leaderboard\n/alerts — custom pair alerts\n/replay EURUSD — analyze without logging\n/setchannel <id> — mirror signals to channel\n/clearchannel — remove channel\n/cancelall — cancel pending\n/win <no> /loss <no> — manual override\n/pair EURUSD /interval 5\n\n💡 Just type a pair name to scan instantly`, mainKb(u));
+ 
+   // Auto pair detect
+   const rawPair = text.toUpperCase().replace(/[\s\/\-_.]/g, '');
+@@ -1605,23 +1630,69 @@ async function doManualResult(cid, mid, no, result, env) {
+ 
+ // ─── SIGNAL FETCH ─────────────────────────────────────────────────────────────
+ 
+-// [Fix#4] Service Binding now has timeout via Promise.race
+-async function fetchSig(pair, env) {
+-  const WORKER_URL = 'https://fttotcv6.umuhammadiswa.workers.dev';
+-  const req = new Request(`${WORKER_URL}/api/signal?pair=${pair}`, { headers: { Accept: 'application/json' } });
++const WORKER_URL = 'https://fttotcv6.umuhammadiswa.workers.dev';
++
++/**
++ * [Fix#4] Service Binding now has timeout via Promise.race.
++ * Shared transport for every worker call — service binding when available,
++ * plain fetch otherwise. `allow404` lets the cache probe treat a miss as data
++ * rather than an exception.
++ */
++async function workerFetch(pathAndQuery, env, { allow404 = false } = {}) {
++  const url = `${WORKER_URL}${pathAndQuery}`;
++  const req = new Request(url, { headers: { Accept: 'application/json' } });
+   const res = env.SIGNAL_WORKER
+     ? await Promise.race([
+         env.SIGNAL_WORKER.fetch(req),
+         new Promise((_, rej) => setTimeout(() => rej(new Error('Service binding timeout 20s')), 20000)),
+       ])
+-    : await fetch(`${WORKER_URL}/api/signal?pair=${pair}`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
++    : await fetch(url, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
++  if (res.status === 404 && allow404) return null;
+   if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text().catch(() => '')).slice(0, 150)}`);
+   return res.json();
+ }
+ 
++/**
++ * Fresh engine run — force-refresh semantics.
++ * Used by every USER-INITIATED command (/signal, /scan, quick signal, replay,
++ * analyze) so a person asking a question always gets a newly computed answer.
++ */
++async function fetchSig(pair, env) {
++  return workerFetch(`/api/signal?pair=${pair}`, env);
++}
++
++/**
++ * PHASE 9 — background reads go through the worker's unified cache.
++ *
++ * The cron scans 14 pairs every 5 minutes and stores each result under
++ * `latest:<PAIR>`; reading that costs the backend nothing, and it means an App
++ * user and a Bot subscriber see the SAME signal `id` for the same pair.
++ *
++ * A pair outside SCAN_PAIRS (or an expired entry) answers 404 — we then fall
++ * back to a fresh generation so watchlist coverage is never reduced.
++ *
++ * Returns the normal signal payload, plus the cache metadata
++ * (`cached`, `generationAge`, `generationId`) that the worker attaches.
++ */
++async function fetchSigCached(pair, env) {
++  try {
++    const cached = await workerFetch(
++      `/api/signals/latest?pair=${encodeURIComponent(pair)}`, env, { allow404: true });
++    if (cached && cached.signal) return cached;
++  } catch (e) {
++    // Cache unreachable — fall through to a fresh run rather than skip the pair.
++    console.log('Cache read failed for ' + pair + ': ' + e.message);
++  }
++  const fresh = await fetchSig(pair, env);
++  if (fresh && typeof fresh === 'object') fresh.cached = false;
++  return fresh;
++}
++
+ async function fetchPrice(pair, env) {
+   try {
+-    const d = await fetchSig(pair, env);
++    // Background result-checking: the cached candle price is good enough and
++    // costs nothing. Falls back to a fresh run automatically on a cache miss.
++    const d = await fetchSigCached(pair, env);
+     return d?.signal?.recommendations?.['1min']?.entry?.price
+         || d?.signal?.recommendations?.['5min']?.entry?.price
+         || d?.signal?.recommendations?.['15min']?.entry?.price || null;
+@@ -1690,7 +1761,9 @@ async function autoScan(env, log) {
+           const lastPairCandle = (await kget(scKey, env)) || 0;
+           if (lastPairCandle >= currentCandle) { log(`Dedup ${pair}`); continue; }
+ 
+-          const data = await fetchSig(pair, env);
++          // PHASE 9: watchlist scan reads the shared cache (one canonical
++          // signal per pair per 5-min window, same id the App shows).
++          const data = await fetchSigCached(pair, env);
+           const sig  = data.signal;
+           const dir  = sig?.finalSignal;
+ 

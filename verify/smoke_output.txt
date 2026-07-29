@@ -1,0 +1,64 @@
+# B.5.3 — smoke tests
+$ node scripts/phase9_smoke.mjs
+
+── background scan reads the shared cache ─────────────────
+PASS  one request
+PASS  hit the cache endpoint
+PASS  never ran the engine
+PASS  cached payload returned
+PASS  generationId preserved (same id the App sees)
+
+── cache miss falls back to a fresh run ───────────────────
+PASS  two requests
+PASS  cache first
+PASS  then fresh
+PASS  marked not cached
+PASS  watchlist coverage preserved (still got a signal)
+
+── cache error also falls back (never skips a pair) ───────
+PASS  fell through after the 500
+PASS  still returned a signal
+
+── a 200 without a signal is treated as a miss ────────────
+PASS  fresh run attempted
+PASS  usable signal returned
+
+── user command path stays fresh ──────────────────────────
+PASS  single request
+PASS  goes straight to the engine
+PASS  never reads the cache
+
+── freshness line (B3) ────────────────────────────────────
+PASS  seconds
+PASS  exact minutes
+PASS  minutes + seconds
+PASS  fresh run
+PASS  no metadata -> nothing
+PASS  null safe
+PASS  cached but no age
+PASS  never emits NaN
+
+── structural: only background paths switched ─────────────
+PASS  background autoScan() uses the cache
+PASS  background fetchPrice() uses the cache
+PASS  user command doSignal() stays fresh
+PASS  user command doQuickSignal() stays fresh
+PASS  user command doScanAll() stays fresh
+PASS  user command doReplay() stays fresh
+PASS  user command doAnalyze() stays fresh
+
+── unchanged surfaces (spec §B.2) ─────────────────────────
+PASS  /history untouched
+PASS  /settings-style state untouched
+PASS  result reporting flow intact
+PASS  manual /win /loss intact
+PASS  /refresh command added
+PASS  help mentions /refresh
+PASS  cron interval unchanged (5 min)
+PASS  SIGNAL_WORKER binding unchanged
+PASS  no deploy commands
+PASS  single shared transport (no duplicated fetch logic)
+
+───────────────────────────────────────────────────────────
+PASS: 42   FAIL: 0
+ALL PHASE 9 SMOKE TESTS PASSED
