@@ -714,25 +714,7 @@ function fmtSignal(data, pair, interval, no, opts = {}) {
     msg += `⚪ NO TRADE\n`;
     msg += filters.length ? `🔕 ${filters.join(' · ')}` : `🔕 ${sig.alignment === 'MIXED' ? 'Timeframes mixed' : 'Setup not clear'}`;
   }
-  // PHASE 9 (B3): transparency line — say whether this came from the shared
-  // 5-min cache or was generated on the spot. Same concept as the App's
-  // freshness pill, so a user comparing both screens sees one consistent story.
-  const freshness = fmtFreshness(data);
-  if (freshness) msg += `\n${freshness}`;
-
   return msg;
-}
-
-/** "🕐 Cached 2m ago" / "⚡ Freshly generated" — null when no cache metadata. */
-function fmtFreshness(data) {
-  if (!data || typeof data !== 'object') return null;
-  if (data.cached !== true) return data.cached === false ? '⚡ Freshly generated' : null;
-  const age = typeof data.generationAge === 'number' ? Math.max(0, Math.floor(data.generationAge)) : null;
-  if (age === null) return '🕐 Cached';
-  if (age < 60) return `🕐 Cached ${age}s ago`;
-  const m = Math.floor(age / 60);
-  const rem = age % 60;
-  return rem === 0 ? `🕐 Cached ${m}m ago` : `🕐 Cached ${m}m ${rem}s ago`;
 }
 
 function fmtHist(hist, page = 0) {
@@ -1018,13 +1000,6 @@ async function onMessage(msg, env) {
 
   if (text.startsWith('/start'))     return R(`👋 FTT Signal Bot v4.1\n\nSignals + Analytics + Smart Alerts\n\nPair: ${disp(u.pair)}  ${u.interval}min  Auto ${u.autoEnabled ? 'ON' : 'OFF'}`, mainKb(u));
   if (text.startsWith('/signal'))    return doSignal(cid, null, env);
-  // PHASE 9: explicit force-refresh wording. /signal already runs the engine —
-  // /refresh <pair> is the same thing, named so the intent is unambiguous now
-  // that background scans are served from cache.
-  if (text.startsWith('/refresh')) {
-    const arg = text.slice(8).trim();
-    return arg ? doQuickSignal(cid, null, arg, env) : doSignal(cid, null, env);
-  }
   if (text.startsWith('/scan'))      return doScanAll(cid, null, env);
   if (text.startsWith('/auto'))      return doToggle(cid, null, env);
   if (text.startsWith('/status'))    return doStatus(cid, null, env);
@@ -1076,7 +1051,7 @@ async function onMessage(msg, env) {
     return R('❌ Use: 1, 5, or 15', mainKb(u));
   }
   if (text.startsWith('/help'))
-    return R(`FTT Signal Bot v4.1\n\n/signal — get signal (fresh)\n/refresh EURUSD — force fresh signal\n/scan — scan all pairs\n/auto — toggle auto scan\n/watchlist /history /stats\n/today /summary /status\n/risk — open trade risk dashboard\n/heatmap — win rate by hour\n/best — best pairs leaderboard\n/alerts — custom pair alerts\n/replay EURUSD — analyze without logging\n/setchannel <id> — mirror signals to channel\n/clearchannel — remove channel\n/cancelall — cancel pending\n/win <no> /loss <no> — manual override\n/pair EURUSD /interval 5\n\n💡 Just type a pair name to scan instantly`, mainKb(u));
+    return R(`FTT Signal Bot v4.1\n\n/signal — get signal\n/scan — scan all pairs\n/auto — toggle auto scan\n/watchlist /history /stats\n/today /summary /status\n/risk — open trade risk dashboard\n/heatmap — win rate by hour\n/best — best pairs leaderboard\n/alerts — custom pair alerts\n/replay EURUSD — analyze without logging\n/setchannel <id> — mirror signals to channel\n/clearchannel — remove channel\n/cancelall — cancel pending\n/win <no> /loss <no> — manual override\n/pair EURUSD /interval 5\n\n💡 Just type a pair name to scan instantly`, mainKb(u));
 
   // Auto pair detect
   const rawPair = text.toUpperCase().replace(/[\s\/\-_.]/g, '');
@@ -1630,69 +1605,23 @@ async function doManualResult(cid, mid, no, result, env) {
 
 // ─── SIGNAL FETCH ─────────────────────────────────────────────────────────────
 
-const WORKER_URL = 'https://fttotcv6.umuhammadiswa.workers.dev';
-
-/**
- * [Fix#4] Service Binding now has timeout via Promise.race.
- * Shared transport for every worker call — service binding when available,
- * plain fetch otherwise. `allow404` lets the cache probe treat a miss as data
- * rather than an exception.
- */
-async function workerFetch(pathAndQuery, env, { allow404 = false } = {}) {
-  const url = `${WORKER_URL}${pathAndQuery}`;
-  const req = new Request(url, { headers: { Accept: 'application/json' } });
+// [Fix#4] Service Binding now has timeout via Promise.race
+async function fetchSig(pair, env) {
+  const WORKER_URL = 'https://fttotcv6.umuhammadiswa.workers.dev';
+  const req = new Request(`${WORKER_URL}/api/signal?pair=${pair}`, { headers: { Accept: 'application/json' } });
   const res = env.SIGNAL_WORKER
     ? await Promise.race([
         env.SIGNAL_WORKER.fetch(req),
         new Promise((_, rej) => setTimeout(() => rej(new Error('Service binding timeout 20s')), 20000)),
       ])
-    : await fetch(url, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
-  if (res.status === 404 && allow404) return null;
+    : await fetch(`${WORKER_URL}/api/signal?pair=${pair}`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text().catch(() => '')).slice(0, 150)}`);
   return res.json();
 }
 
-/**
- * Fresh engine run — force-refresh semantics.
- * Used by every USER-INITIATED command (/signal, /scan, quick signal, replay,
- * analyze) so a person asking a question always gets a newly computed answer.
- */
-async function fetchSig(pair, env) {
-  return workerFetch(`/api/signal?pair=${pair}`, env);
-}
-
-/**
- * PHASE 9 — background reads go through the worker's unified cache.
- *
- * The cron scans 14 pairs every 5 minutes and stores each result under
- * `latest:<PAIR>`; reading that costs the backend nothing, and it means an App
- * user and a Bot subscriber see the SAME signal `id` for the same pair.
- *
- * A pair outside SCAN_PAIRS (or an expired entry) answers 404 — we then fall
- * back to a fresh generation so watchlist coverage is never reduced.
- *
- * Returns the normal signal payload, plus the cache metadata
- * (`cached`, `generationAge`, `generationId`) that the worker attaches.
- */
-async function fetchSigCached(pair, env) {
-  try {
-    const cached = await workerFetch(
-      `/api/signals/latest?pair=${encodeURIComponent(pair)}`, env, { allow404: true });
-    if (cached && cached.signal) return cached;
-  } catch (e) {
-    // Cache unreachable — fall through to a fresh run rather than skip the pair.
-    console.log('Cache read failed for ' + pair + ': ' + e.message);
-  }
-  const fresh = await fetchSig(pair, env);
-  if (fresh && typeof fresh === 'object') fresh.cached = false;
-  return fresh;
-}
-
 async function fetchPrice(pair, env) {
   try {
-    // Background result-checking: the cached candle price is good enough and
-    // costs nothing. Falls back to a fresh run automatically on a cache miss.
-    const d = await fetchSigCached(pair, env);
+    const d = await fetchSig(pair, env);
     return d?.signal?.recommendations?.['1min']?.entry?.price
         || d?.signal?.recommendations?.['5min']?.entry?.price
         || d?.signal?.recommendations?.['15min']?.entry?.price || null;
@@ -1761,9 +1690,7 @@ async function autoScan(env, log) {
           const lastPairCandle = (await kget(scKey, env)) || 0;
           if (lastPairCandle >= currentCandle) { log(`Dedup ${pair}`); continue; }
 
-          // PHASE 9: watchlist scan reads the shared cache (one canonical
-          // signal per pair per 5-min window, same id the App shows).
-          const data = await fetchSigCached(pair, env);
+          const data = await fetchSig(pair, env);
           const sig  = data.signal;
           const dir  = sig?.finalSignal;
 
