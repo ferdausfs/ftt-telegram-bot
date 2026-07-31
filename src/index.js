@@ -155,11 +155,20 @@ async function tg(method, body, env) {
   } catch (e) { console.error(`tg/${method}:`, e.message); return null; }
 }
 
+// HTML escape for dynamic content (safe with parse_mode:'HTML' — only 3 chars)
+const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+// Unicode confidence bar: █████░░░░░
+function confBar(pct) {
+  const n = Math.round((parseInt(String(pct).replace('%','')) || 0) / 10);
+  return '█'.repeat(n) + '░'.repeat(10 - n);
+}
+
 const sendMsg = (cid, text, env, extra = {}) =>
-  tg('sendMessage', { chat_id: cid, text: String(text || ''), disable_web_page_preview: true, ...extra }, env);
+  tg('sendMessage', { chat_id: cid, text: String(text || ''), disable_web_page_preview: true, parse_mode: 'HTML', ...extra }, env);
 
 const editMsg = (cid, mid, text, env, extra = {}) =>
-  tg('editMessageText', { chat_id: cid, message_id: mid, text: String(text || ''), disable_web_page_preview: true, ...extra }, env);
+  tg('editMessageText', { chat_id: cid, message_id: mid, text: String(text || ''), disable_web_page_preview: true, parse_mode: 'HTML', ...extra }, env);
 
 const answerCb = (id, env, text = '') =>
   tg('answerCallbackQuery', { callback_query_id: id, text }, env);
@@ -639,10 +648,10 @@ const fmtPrice = (price, pair) => isCr(pair) ? parseFloat(price).toFixed(2) : pa
 
 function fmtSignal(data, pair, interval, no, opts = {}) {
   if (data.marketStatus === 'CLOSED')
-    return `📊 ${disp(pair)} | ${interval}min\n━━━━━━━━━━━━━━\n🔴 Forex Market CLOSED\n💡 Try BTC/USD (24/7)`;
+    return `📊 <b>${esc(disp(pair))}</b> | ${interval}min\n━━━━━━━━━━━━━━\n🔴 <b>Forex Market CLOSED</b>\n💡 Try <b>BTC/USD</b> (24/7)`;
 
   const sig = data.signal;
-  if (!sig) return `📊 ${disp(pair)} | ${interval}min\n━━━━━━━━━━━━━━\nNo signal data`;
+  if (!sig) return `📊 <b>${esc(disp(pair))}</b> | ${interval}min\n━━━━━━━━━━━━━━\nNo signal data`;
 
   const dir    = sig.finalSignal   || 'NO_TRADE';
   const conf   = sig.confidence    || '0%';
@@ -658,61 +667,84 @@ function fmtSignal(data, pair, interval, no, opts = {}) {
               || sig.recommendations?.['15min']?.entry?.price || null;
   const dE = dir === 'BUY' ? '🟢' : dir === 'SELL' ? '🔴' : '⚪';
   const hE = htf === 'BUY' ? '📈' : htf === 'SELL' ? '📉' : '➡️';
+  const confNum = parseInt(String(conf).replace('%','')) || 0;
+  const confColor = confNum >= 85 ? '🟢' : confNum >= 70 ? '🟡' : '🔴';
 
   let msg = '';
-  if (opts.replay) msg += `🔄 REPLAY — not logged\n`;
-  if (no) msg += `📌 Signal No. ${no}\n`;
-  msg += `📊 ${disp(pair)} | ${tf}\n━━━━━━━━━━━━━━\n`;
+  if (opts.replay) msg += `🔄 <i>REPLAY — not logged</i>\n`;
+  if (no) msg += `📌 Signal No. <b>${no}</b>\n`;
+  msg += `📊 <b>${esc(disp(pair))}</b> | ${esc(tf)}\n`;
+  msg += `<b>━━━━━━━━━━━━━━</b>\n`;
 
   if (dir === 'BUY' || dir === 'SELL') {
-    msg += `${dE} ${dir}  ${conf}  ${grade}\n`;
-    if (price)  msg += `💰 Entry: ${fmtPrice(price, pair)}\n`;
-    if (expiry) msg += `⏰ Expiry: ${expiry}\n`;
-    if (cd)     msg += `🕐 Candle closes: ${cd}\n`;
-    msg += `${hE} HTF 15min: ${htf}\n`;
+    msg += `${dE} <b>${dir}</b>  <code>${esc(conf)}</code>  ${esc(grade)}\n`;
+    msg += `${confColor} <code>${confBar(conf)}</code>\n`;
+    if (price)  msg += `💰 Entry: <code>${esc(fmtPrice(price, pair))}</code>\n`;
+    if (expiry) msg += `⏰ Expiry: <b>${esc(expiry)}</b>\n`;
+    if (cd)     msg += `🕐 Candle closes: <code>${esc(cd)}</code>\n`;
+    msg += `${hE} HTF: <b>${esc(htf)}</b>\n`;
 
     const regime = sig.marketRegime, regimeAdvice = sig.regimeAdvice;
     if (regime) {
       const rE = { TRENDING:'🔵', RANGING:'🟡', BREAKOUT:'🟠', VOLATILE:'🔴' }[regime] || '⚪';
-      msg += `${rE} Regime: ${regime}\n`;
-      if (regimeAdvice) msg += `💡 ${regimeAdvice}\n`;
+      msg += `${rE} Regime: <b>${esc(regime)}</b>\n`;
+      if (regimeAdvice) msg += `💡 <i>${esc(regimeAdvice)}</i>\n`;
     }
-    if (reason) msg += `\n📝 ${reason}\n`;
+
+    // Structure verdict (B5)
+    const sv = sig.structureVerdict;
+    if (sv && sv.overall && sv.overall !== 'N/A') {
+      const sE = sv.overall === 'ALIGNED' ? '✅' : sv.overall === 'AGAINST' ? '⚠️' : sv.overall === 'MIXED' ? '🔀' : '➡️';
+      msg += `${sE} Structure: <b>${esc(sv.overall)}</b>`;
+      if (sv.direction && sv.direction !== 'NEUTRAL') msg += ` (${esc(sv.direction)} ${esc(sv.strength || '')})`;
+      msg += `\n`;
+    }
+
+    // Filters (D2 transparency)
+    const filters = sig.filtersApplied || [];
+    if (filters.length > 0) {
+      const d2 = filters.filter(f => f.includes('D2_') || f.includes('BLOCK'));
+      if (d2.length > 0) msg += `🚫 <i>Blocked: ${esc(d2.join(' · '))}</i>\n`;
+    }
+
+    if (reason) msg += `\n📝 <i>${esc(reason)}</i>\n`;
 
     const ai = sig.aiValidation;
     if (ai && ai.status === 'OK') {
-      msg += `\n🤖 AI Analysis (Cerebras)\n`;
+      msg += `\n🤖 <b>AI Validation</b>\n`;
       if (ai.agrees === true) {
-        msg += `✅ Agrees: ${ai.signal} ${ai.confidence}%\n`;
-        if (ai.reason) msg += `💬 ${ai.reason}\n`;
+        msg += `✅ Agrees: <b>${esc(ai.signal)}</b> <code>${esc(ai.confidence)}%</code>\n`;
+        if (ai.reason) msg += `💬 <i>${esc(ai.reason)}</i>\n`;
       } else if (ai.agrees === false && ai.signal !== 'NO_TRADE') {
-        msg += `⚠️ Disagrees: AI says ${ai.signal} ${ai.confidence}%\n`;
-        if (ai.reason) msg += `💬 ${ai.reason}\n`;
+        msg += `⚠️ Disagrees: AI says <b>${esc(ai.signal)}</b> <code>${esc(ai.confidence)}%</code>\n`;
+        if (ai.reason) msg += `💬 <i>${esc(ai.reason)}</i>\n`;
       } else {
-        msg += `🤔 Uncertain: NO_TRADE ${ai.confidence}%\n`;
+        msg += `🤔 Uncertain: <code>NO_TRADE ${esc(ai.confidence)}%</code>\n`;
       }
-      if (ai.concerns) msg += `🔍 ${ai.concerns}\n`;
+      if (ai.concerns) msg += `🔍 <i>${esc(ai.concerns)}</i>\n`;
     }
 
     // [F03] News warning
     if (opts.newsAlert) {
       const sign = opts.newsAlert.minsAway >= 0 ? 'in' : 'ago';
-      msg += `\n⚠️ News ${sign} ${Math.abs(opts.newsAlert.minsAway)}min: ${opts.newsAlert.title} (${opts.newsAlert.currency})\n`;
+      msg += `\n⚠️ <b>News ${sign} ${Math.abs(opts.newsAlert.minsAway)}min</b>: ${esc(opts.newsAlert.title)} (${esc(opts.newsAlert.currency)})\n`;
     }
     // [F01] Correlated warning
     if (opts.correlated && opts.correlated.length) {
-      msg += `\n⚠️ Correlated open: ${opts.correlated.join(', ')}\n`;
+      msg += `\n⚠️ <b>Correlated open:</b> ${esc(opts.correlated.join(', '))}\n`;
     }
 
     if (opts.replay) {
-      msg += `\n🔄 Replay only — result not tracked`;
+      msg += `\n🔄 <i>Replay only — result not tracked</i>`;
     } else {
-      msg += `\n⏳ Result will be tracked automatically`;
+      msg += `\n⏳ <i>Result will be tracked automatically</i>`;
     }
   } else {
     const filters = sig.filtersApplied || [];
-    msg += `⚪ NO TRADE\n`;
-    msg += filters.length ? `🔕 ${filters.join(' · ')}` : `🔕 ${sig.alignment === 'MIXED' ? 'Timeframes mixed' : 'Setup not clear'}`;
+    msg += `⚪ <b>NO TRADE</b>\n`;
+    msg += filters.length
+      ? `🔕 <i>${esc(filters.join(' · '))}</i>`
+      : `🔕 <i>${sig.alignment === 'MIXED' ? 'Timeframes mixed' : 'Setup not clear'}</i>`;
   }
   return msg;
 }
@@ -998,7 +1030,7 @@ async function onMessage(msg, env) {
   const u    = await getUser(cid, env);
   const R    = (t, kboard) => sendMsg(cid, t, env, kboard ? { reply_markup: kboard } : {});
 
-  if (text.startsWith('/start'))     return R(`👋 FTT Signal Bot v4.1\n\nSignals + Analytics + Smart Alerts\n\nPair: ${disp(u.pair)}  ${u.interval}min  Auto ${u.autoEnabled ? 'ON' : 'OFF'}`, mainKb(u));
+  if (text.startsWith('/start'))     return R(`👋 <b>Welcome to FTT Signal Bot</b>\n\n📊 <b>Professional Trading Signals</b>\n🤖 AI-validated · Multi-timeframe · Real-time\n\n━━━━━━━━━━━━━━\n💱 Pair: <b>${esc(disp(u.pair))}</b>  ${u.interval}min\n🔄 Auto: <b>${u.autoEnabled ? 'ON ✅' : 'OFF'}</b>\n🎯 Grade: <b>${u.gradeFilter || 'ALL'}</b>  Conf: <b>${u.minConfidence || 0}%+</b>\n━━━━━━━━━━━━━━\n\n<b>Quick Start:</b>\n📊 <b>Signal Now</b> — instant signal\n🔄 <b>Start Auto</b> — hands-free alerts\n🔍 <b>Scan All</b> — multi-pair scan\n\n💡 <i>Tap buttons below to navigate</i>`, mainKb(u));
   if (text.startsWith('/signal'))    return doSignal(cid, null, env);
   if (text.startsWith('/scan'))      return doScanAll(cid, null, env);
   if (text.startsWith('/auto'))      return doToggle(cid, null, env);
@@ -1051,7 +1083,7 @@ async function onMessage(msg, env) {
     return R('❌ Use: 1, 5, or 15', mainKb(u));
   }
   if (text.startsWith('/help'))
-    return R(`FTT Signal Bot v4.1\n\n/signal — get signal\n/scan — scan all pairs\n/auto — toggle auto scan\n/watchlist /history /stats\n/today /summary /status\n/risk — open trade risk dashboard\n/heatmap — win rate by hour\n/best — best pairs leaderboard\n/alerts — custom pair alerts\n/replay EURUSD — analyze without logging\n/setchannel <id> — mirror signals to channel\n/clearchannel — remove channel\n/cancelall — cancel pending\n/win <no> /loss <no> — manual override\n/pair EURUSD /interval 5\n\n💡 Just type a pair name to scan instantly`, mainKb(u));
+    return R(`<b>FTT Signal Bot — Commands</b>\n\n📊 <b>Core:</b>\n/signal — get signal\n/scan — scan all pairs\n/auto — toggle auto scan\n\n📈 <b>Analytics:</b>\n/history — trade history\n/stats — win rate stats\n/today — today's performance\n/summary — daily summary\n/best — best pairs leaderboard\n/risk — risk dashboard\n/heatmap — win rate by hour\n\n⚙️ <b>Settings:</b>\n/pair EURUSD — set pair\n/interval 5 — set interval\n/watchlist — manage watchlist\n/alerts — custom pair alerts\n/replay EURUSD — analyze without logging\n/setchannel — mirror to channel\n/cancelall — cancel pending\n/win <no> /loss <no> — manual override\n\n💡 <i>Just type a pair name to scan instantly</i>`, mainKb(u));
 
   // Auto pair detect
   const rawPair = text.toUpperCase().replace(/[\s\/\-_.]/g, '');
