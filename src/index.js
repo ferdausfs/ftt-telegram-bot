@@ -125,7 +125,9 @@ export default {
   },
 
   async scheduled(e, env, ctx) {
-    ctx.waitUntil(cron(env, [], true));
+    // Worker push (Phase 10) now handles all auto signal delivery + result push.
+    // Bot cron only handles: result tracking (for bot analytics), reminders, summaries.
+    ctx.waitUntil(cronLite(env));
   },
 };
 
@@ -1662,6 +1664,23 @@ async function fetchPrice(pair, env) {
 
 // ─── CRON ─────────────────────────────────────────────────────────────────────
 
+// Lite cron: signal generation disabled (Worker Push / Phase 10 handles auto signals).
+// Bot cron only tracks: result resolution (bot analytics), reminders, summaries.
+async function cronLite(env) {
+  const logs = [];
+  const log = m => { console.log(m); logs.push(String(m)); };
+  log(`CronLite ${new Date().toISOString()}`);
+  if (!env?.BOT_TOKEN) { log('ERROR: BOT_TOKEN missing'); return; }
+  if (!env?.BOT_KV)    { log('ERROR: BOT_KV missing');    return; }
+  // autoScan DISABLED — Worker Push delivers signals directly to subscribers.
+  await resultCheck(env, log).catch(e => log('ResultErr: ' + e.message));
+  await expiryReminder(env, log).catch(e => log('ReminderErr: ' + e.message));
+  await dailySummary(env, log).catch(e => log('SummaryErr: ' + e.message));
+  await weeklyReport(env, log).catch(e => log('WeeklyErr: ' + e.message));
+  log('Done');
+}
+
+// Full cron (kept for /runcron debug — includes autoScan if ever needed)
 async function cron(env, logs = [], force = false) {
   const log = m => { console.log(m); logs.push(String(m)); };
   log(`Cron ${new Date().toISOString()}`);
