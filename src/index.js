@@ -1331,7 +1331,7 @@ async function doSignal(cid, mid, env) {
       no = await logAndSchedule(cid, u.pair, sig, env);
     }
     const useKb  = (dir === 'BUY' || dir === 'SELL') ? signalKb(no) : afterKb();
-    await sendMsg(cid, fmtSignal(data, u.pair, u.interval, no, { newsAlert, correlated: corrWarnings }), env, { reply_markup: useKb });
+    await sendMsg(cid, fmtSignal(data, u.pair, u.interval, no, { newsAlert, correlated: corrWarnings, mode: normMode(u.fxMode) }), env, { reply_markup: useKb });
     // Restore button message (button flow) or delete loading msg (text command flow)
     if (mid) {
       await restoreMainMsg(cid, mid, u, env);
@@ -1374,7 +1374,7 @@ async function doQuickSignal(cid, mid, pair, env) {
       no = await logAndSchedule(cid, pair, sig, env);
     }
     const useKb  = (dir === 'BUY' || dir === 'SELL') ? signalKb(no) : afterKb();
-    await sendMsg(cid, fmtSignal(data, pair, u.interval, no, { newsAlert, correlated: corrWarnings }), env, { reply_markup: useKb });
+    await sendMsg(cid, fmtSignal(data, pair, u.interval, no, { newsAlert, correlated: corrWarnings, mode: normMode(u.fxMode) }), env, { reply_markup: useKb });
     if (mid) {
       await restoreMainMsg(cid, mid, u, env);
     } else if (loadingMid) {
@@ -1413,7 +1413,7 @@ async function doScanAll(cid, mid, env) {
       if ((dir === 'BUY' || dir === 'SELL') && passGrade(sig, u.gradeFilter) && passConf(sig, u.minConfidence) && passAI(sig, u.aiOnlyMode)) {
         const corrWarnings = await checkCorrelated(cid, pair, dir, env);
         const no = await logAndSchedule(cid, pair, sig, env);
-        await sendMsg(cid, fmtSignal(data, pair, u.interval, no, { correlated: corrWarnings }), env, { reply_markup: signalKb(no) });
+        await sendMsg(cid, fmtSignal(data, pair, u.interval, no, { correlated: corrWarnings, mode: normMode(u.fxMode) }), env, { reply_markup: signalKb(no) });
         found++;
       }
     } catch (e) { console.error(`scan ${pair}:`, e.message); }
@@ -1529,7 +1529,7 @@ async function doReplay(cid, mid, pairRaw, env) {
     const data = await fetchSig(pair, env, { mode: normMode(u.fxMode) });
     const sig  = data?.signal;
     if (!sig) return sendMsg(cid, `❌ No data for ${disp(pair)}`, env, { reply_markup: mainKb(u) });
-    const msg = fmtSignal(data, pair, u.interval, null, { replay: true });
+    const msg = fmtSignal(data, pair, u.interval, null, { replay: true, mode: normMode(u.fxMode) });
     await sendMsg(cid, msg, env, { reply_markup: kb([
       [btn('📊 Get Signal (log it)', `qs:${norm(pair)}`), btn('🔙 Menu', 'cmd:main')],
     ]) });
@@ -1774,7 +1774,7 @@ async function autoScan(env, log) {
           const lastPairCandle = (await kget(scKey, env)) || 0;
           if (lastPairCandle >= currentCandle) { log(`Dedup ${pair}`); continue; }
 
-          const data = await fetchSig(pair, env);
+          const data = await fetchSig(pair, env, { mode: normMode(u.fxMode) });
           const sig  = data.signal;
           const dir  = sig?.finalSignal;
 
@@ -1795,7 +1795,7 @@ async function autoScan(env, log) {
             const no = await logAndSchedule(cid, pair, sig, env);
 
             // Build message options
-            const msgOpts = { correlated: corrWarnings };
+            const msgOpts = { correlated: corrWarnings, mode: normMode(u.fxMode) };
             if (passesAlert && !passesMain) {
               // Alert-triggered signal (bypassed normal filter)
               await sendMsg(cid,
@@ -1808,7 +1808,7 @@ async function autoScan(env, log) {
 
             // [F10] Mirror to channel
             if (u.channelId) {
-              await sendMsg(u.channelId, fmtSignal(data, pair, intervalMin, no, {}), env, { reply_markup: channelKb() })
+              await sendMsg(u.channelId, fmtSignal(data, pair, intervalMin, no, { mode: normMode(u.fxMode) }), env, { reply_markup: channelKb() })
                 .catch(e => log(`Channel ${u.channelId}: ${e.message}`));
             }
 
