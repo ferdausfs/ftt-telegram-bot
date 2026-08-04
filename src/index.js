@@ -349,6 +349,8 @@ async function delReminder(tid, env) {
 
 // ─── USER ─────────────────────────────────────────────────────────────────────
 
+const normFxMode = (v) => (v === 'fx' || v === 'both' ? v : 'ftt');   // legacy true→ftt, false→ftt
+
 const DEF_USER = () => ({
   pair: 'EURUSD', watchlist: [], interval: 5, autoEnabled: false,
   noTradeStreak: 0, gradeFilter: 'ALL', minConfidence: 0,
@@ -357,7 +359,7 @@ const DEF_USER = () => ({
   aiOnlyMode: false,   // [F02] only send when AI agrees
   blockNews: true,     // [F03] skip auto signals during news window
   channelId: null,     // [F10] channel to mirror signals to
-  fxMode: false,       // [FX] true → signals show entry/SL/TP (mode=fx)
+  fxMode: 'ftt',        // [FX] 'ftt' | 'fx' | 'both' — signal output mode
 });
 
 async function getUser(cid, env) {
@@ -537,7 +539,7 @@ const settingsKb = u => kb([
 
 const settings2Kb = u => kb([
   [btn(`🤖 AI Only: ${u.aiOnlyMode ? 'ON ✅' : 'OFF'}`, 'cmd:aionly'), btn(`📰 Block News: ${u.blockNews !== false ? 'ON ✅' : 'OFF'}`, 'cmd:blocknews')],
-  [btn(`💹 FX Mode: ${u.fxMode ? 'ON ✅ (SL/TP)' : 'OFF (FTT)'}`, 'cmd:fxmode'), btn(`📡 Channel: ${u.channelId ? '✅ Set' : 'None'}`, 'cmd:channelinfo')],
+  [btn(`💹 Mode: ${u.fxMode === 'fx' ? 'FX ✅' : u.fxMode === 'both' ? 'BOTH 🔄' : 'FTT'}`, 'cmd:fxmode'), btn(`📡 Channel: ${u.channelId ? '✅ Set' : 'None'}`, 'cmd:channelinfo')],
   [btn('🔔 Custom Alerts', 'cmd:alerts')],
   [btn('🔁 Signal Replay', 'cmd:replayhelp'), btn('◀ Back', 'cmd:settings')],
 ]);
@@ -676,20 +678,30 @@ function fmtSignal(data, pair, interval, no, opts = {}) {
   let msg = '';
   if (opts.replay) msg += `🔄 <i>REPLAY — not logged</i>\n`;
   if (no) msg += `📌 Signal No. <b>${no}</b>\n`;
-  msg += `📊 <b>${esc(disp(pair))}</b> | ${esc(tf)}\n`;
+  // Mode badge: FX / FTT / BOTH
+  const m = opts.mode || 'ftt';
+  const modeBadge = m === 'both' ? '🔄 <b>BOTH</b>' : (m === 'fx' || sig.mode === 'fx') ? '💹 <b>FX</b>' : '⏱ <b>FTT</b>';
+  msg += `📊 <b>${esc(disp(pair))}</b> | ${esc(tf)} | ${modeBadge}\n`;
   msg += `<b>━━━━━━━━━━━━━━</b>\n`;
 
   if (dir === 'BUY' || dir === 'SELL') {
     msg += `${dE} <b>${dir}</b>  <code>${esc(conf)}</code>  ${esc(grade)}\n`;
     msg += `${confColor} <code>${confBar(conf)}</code>\n`;
     if (price)  msg += `💰 Entry: <code>${esc(fmtPrice(price, pair))}</code>\n`;
-    // FX Mode: show ATR-based SL/TP when present
-    if (sig.mode === 'fx' && sig.fxLevels && sig.fxLevels.sl && sig.fxLevels.tp) {
+    // FX/BOTH: show ATR-based SL/TP when present
+    const hasFx = sig.mode === 'fx' && sig.fxLevels && sig.fxLevels.sl && sig.fxLevels.tp;
+    if (hasFx) {
       msg += `🛑 SL: <code>${esc(fmtPrice(sig.fxLevels.sl, pair))}</code>\n`;
       msg += `🎯 TP: <code>${esc(fmtPrice(sig.fxLevels.tp, pair))}</code>  (1:${esc(sig.fxLevels.rr || '2.5')})\n`;
+      if (m === 'fx') {
+        msg += `💹 <i>FX mode — hold until SL/TP (spot). Fixed expiry নয়।</i>\n`;
+      }
     }
-    if (expiry) msg += `⏰ Expiry: <b>${esc(expiry)}</b>\n`;
-    if (cd)     msg += `🕐 Candle closes: <code>${esc(cd)}</code>\n`;
+    // FTT / BOTH: show expiry lines
+    if (m !== 'fx') {
+      if (expiry) msg += `⏰ Expiry: <b>${esc(expiry)}</b>\n`;
+      if (cd)     msg += `🕐 Candle closes: <code>${esc(cd)}</code>\n`;
+    }
     msg += `${hE} HTF: <b>${esc(htf)}</b>\n`;
 
     const regime = sig.marketRegime, regimeAdvice = sig.regimeAdvice;
@@ -1185,9 +1197,11 @@ async function _handleCb(cid, mid, data, u, env) {
     return R(t, settings2Kb(u));
   }
   if (data === 'cmd:fxmode') {
-    u.fxMode = !u.fxMode;
+    const cycle = { ftt: 'fx', fx: 'both', both: 'ftt' };
+    u.fxMode = cycle[normMode(u.fxMode)] || 'ftt';
     await saveUser(cid, u, env);
-    const t = `⚙️ Advanced Settings\n\n💹 FX Mode: ${u.fxMode ? 'ON ✅ — signals show Entry/SL/TP (mode=fx)' : 'OFF — FTT fixed-time mode'}\nAI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'} · Block News: ${u.blockNews !== false ? 'ON' : 'OFF'}\nChannel: ${u.channelId || 'None'}`;
+    const label = u.fxMode === 'fx' ? 'FX ✅ — Entry/SL/TP (spot)' : u.fxMode === 'both' ? 'BOTH 🔄 — SL/TP + expiry' : 'FTT — fixed-time';
+    const t = `⚙️ Advanced Settings\n\n💹 Mode: <b>${label}</b>\n(ট্যাপ করলে বদলাবে: FTT → FX → BOTH)\nAI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'} · Block News: ${u.blockNews !== false ? 'ON' : 'OFF'}\nChannel: ${u.channelId || 'None'}`;
     return R(t, settings2Kb(u));
   }
   // [F10] Channel info
@@ -1306,7 +1320,7 @@ async function doSignal(cid, mid, env) {
   }
   try {
     const [data, newsAlert] = await Promise.all([
-      fetchSig(u.pair, env, { mode: u.fxMode ? 'fx' : 'ftt' }),
+      fetchSig(u.pair, env, { mode: normMode(u.fxMode) }),
       hasHighImpactNews(env).catch(() => null),
     ]);
     const sig = data.signal;
@@ -1349,7 +1363,7 @@ async function doQuickSignal(cid, mid, pair, env) {
   }
   try {
     const [data, newsAlert] = await Promise.all([
-      fetchSig(pair, env, { mode: u.fxMode ? 'fx' : 'ftt' }),
+      fetchSig(pair, env, { mode: normMode(u.fxMode) }),
       hasHighImpactNews(env).catch(() => null),
     ]);
     const sig = data.signal;
@@ -1512,7 +1526,7 @@ async function doReplay(cid, mid, pairRaw, env) {
   if (mid) await editMsg(cid, mid, `🔄 Replaying ${disp(pair)} (not logged)...`, env, {});
   else     await sendMsg(cid, `🔄 Replaying ${disp(pair)} (not logged)...`, env, {});
   try {
-    const data = await fetchSig(pair, env, { mode: u.fxMode ? 'fx' : 'ftt' });
+    const data = await fetchSig(pair, env, { mode: normMode(u.fxMode) });
     const sig  = data?.signal;
     if (!sig) return sendMsg(cid, `❌ No data for ${disp(pair)}`, env, { reply_markup: mainKb(u) });
     const msg = fmtSignal(data, pair, u.interval, null, { replay: true });
@@ -1530,7 +1544,7 @@ async function doAnalyze(cid, mid, pairRaw, env) {
   const pair = pairRaw ? pairRaw.toUpperCase().replace(/[\s\/\-_.]/g, '') : norm(u.pair);
   await reply(cid, mid, `🔍 Analyzing ${disp(pair)}...`, env);
   try {
-    const data = await fetchSig(pair, env, { mode: u.fxMode ? 'fx' : 'ftt' });
+    const data = await fetchSig(pair, env, { mode: normMode(u.fxMode) });
     const sig  = data?.signal;
     if (!sig) return sendMsg(cid, `❌ No data for ${disp(pair)}`, env, { reply_markup: mainKb(u) });
     const dir   = sig.finalSignal || 'NO_TRADE';
@@ -1652,9 +1666,15 @@ async function doManualResult(cid, mid, no, result, env) {
 // ─── SIGNAL FETCH ─────────────────────────────────────────────────────────────
 
 // [Fix#4] Service Binding now has timeout via Promise.race
+// map user fxMode ('ftt'|'fx'|'both') to worker ?mode= param
+// - 'fx'  → mode=fx (SL/TP only)
+// - 'both'→ fetch FX payload (SL/TP); bot shows both expiry + levels
+const workerModeParam = (m) => (m === 'fx' || m === 'both' || m === true) ? '&mode=fx' : '';
+const normMode = (m) => { if (m === 'fx' || m === 'both') return m; return 'ftt'; };   // legacy bool/undefined → ftt
+
 async function fetchSig(pair, env, opts = {}) {
   const WORKER_URL = 'https://fttotcv6.umuhammadiswa.workers.dev';
-  const mode = opts.mode === 'fx' ? '&mode=fx' : '';
+  const mode = workerModeParam(opts.mode);
   const req = new Request(`${WORKER_URL}/api/signal?pair=${pair}${mode}`, { headers: { Accept: 'application/json' } });
   const res = env.SIGNAL_WORKER
     ? await Promise.race([
