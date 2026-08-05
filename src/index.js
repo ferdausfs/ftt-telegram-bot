@@ -1705,7 +1705,10 @@ async function cronLite(env) {
   log(`CronLite ${new Date().toISOString()}`);
   if (!env?.BOT_TOKEN) { log('ERROR: BOT_TOKEN missing'); return; }
   if (!env?.BOT_KV)    { log('ERROR: BOT_KV missing');    return; }
-  // autoScan DISABLED — Worker Push delivers signals directly to subscribers.
+  // AutoScan re-enabled (2026-08-05): worker push alone was not delivering
+  // reliably for all users; the bot's own scan uses the same gates and also
+  // honors each user's fxMode (FX/BOTH get SL/TP levels).
+  await autoScan(env, log).catch(e => log('ScanErr: ' + e.message));
   await resultCheck(env, log).catch(e => log('ResultErr: ' + e.message));
   await expiryReminder(env, log).catch(e => log('ReminderErr: ' + e.message));
   await dailySummary(env, log).catch(e => log('SummaryErr: ' + e.message));
