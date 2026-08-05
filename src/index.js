@@ -1,8 +1,18 @@
 /**
- * FTT Signal Telegram Bot — v4.3 (PREMIUM UX + BUG FIXES)
+ * FTT Signal Telegram Bot — v4.4 (ARENA-STYLE MENU + PREMIUM UX)
  * KV Binding     : BOT_KV
  * Service Binding: SIGNAL_WORKER → asignal.umuhammadiswa.workers.dev
  * Secrets        : BOT_TOKEN, SETUP_SECRET
+ *
+ * ── v4.4 ARENA-STYLE MENU (hub like Arena screenshot) ────────────────────────
+ *  [M1] mainKb = clean 2×3 grid (Arena pattern):
+ *        📊 Signal Now     👁 Watchlist
+ *        🚀 Premium        ⚡ Quick actions
+ *        📈 History        ⚙️ Settings
+ *  [M2] ⚡ Quick actions → submenu hub (Signal/Auto/Scan + Explore analytics)
+ *  [M3] settingsKb unified + Mode prominent; settings2 merged (legacy ok)
+ *  [M4] 🚀 Premium placeholder — informational, no payment
+ *  [M5] Back/nav: every submenu 🔙 Back → previous (quick→main, settings→main)
  *
  * ── v4.3 RESULT/HISTORY PREMIUM + ENTRY HIT ──────────────────────────────────
  *  [UX4] Result push card is now a leveled premium card:
@@ -170,7 +180,7 @@ export default {
         },
       });
     }
-    return new Response('FTT Signal Bot v4.1');
+    return new Response('FTT Signal Bot v4.4');
   },
 
   async scheduled(e, env, ctx) {
@@ -573,29 +583,51 @@ const afterKb = () => kb([
   [btn('🔁 New Signal', 'cmd:signal'), btn('📈 History', 'cmd:history:0'), btn('🔙 Menu', 'cmd:main')],
 ]);
 
+// Arena hub (matches Arena screenshot layout — clean 2-col category grid):
+//   📊 Signal Now     👁 Watchlist      ← "New chat" / "Photo Styles" slots
+//   🚀 Premium        ⚡ Quick actions  ← Premium / Quick actions
+//   📈 History        ⚙️ Settings       ← Chat history / Settings
 const mainKb = u => kb([
-  [btn('📊 Signal Now',  'cmd:signal'),   btn(u.autoEnabled ? '🔕 Stop Auto' : '🔄 Start Auto', 'cmd:toggle_auto')],
-  [btn('🔍 Scan All',   'cmd:scanall'),   btn('📅 Today',     'cmd:today')    ],
-  [btn('👁 Watchlist',  'cmd:watchlist'), btn('📈 History',   'cmd:history:0')],
-  [btn('🏆 Stats',      'cmd:stats'),     btn('📒 Journal',   'cmd:journal')  ],
-  [btn('📋 Summary',    'cmd:summary'),   btn('📊 Weekly',    'cmd:weekly')   ],
-  [btn('🔥 Best Pairs', 'cmd:best'),      btn('📉 Risk',      'cmd:risk')     ],
-  [btn('🕐 Heatmap',    'cmd:heatmap'),   btn('🔔 Alerts',    'cmd:alerts')   ],
-  [btn('⚙️ Settings',  'cmd:settings'),  btn('📋 Status',    'cmd:status')   ],
+  [btn('📊 Signal Now', 'cmd:signal'),    btn('👁 Watchlist', 'cmd:watchlist')],
+  [btn('🚀 Premium',    'cmd:premium'),   btn('⚡ Quick actions', 'cmd:quick')],
+  [btn('📈 History',    'cmd:history:0'), btn('⚙️ Settings', 'cmd:settings')],
 ]);
 
-const settingsKb = u => kb([
-  [btn(`💱 Pair: ${disp(u.pair)}`, 'pairpage:0'), btn(`⏱ Interval: ${u.interval}min`, 'cmd:intervals')],
-  [btn(`🎯 Grade: ${u.gradeFilter || 'ALL'}`, 'cmd:gradefilter'), btn(`📊 Conf: ${u.minConfidence || 0}%+`, 'cmd:conffilter')],
-  [btn(`📅 Summary: ${u.dailySummary ? 'ON' : 'OFF'}`, 'cmd:togglesummary'), btn(`🕐 Time: ${u.summaryHour ?? 20}:00 UTC`, 'cmd:summarytime')],
-  [btn('⚙️ More Settings ▶', 'cmd:settings2'), btn('🔙 Back', 'cmd:main')],
+// ⚡ Quick actions submenu — primary actions + explore analytics
+const quickKb = u => kb([
+  [btn('📊 Signal Now', 'cmd:signal'), btn(u.autoEnabled ? '🔕 Stop Auto' : '🔄 Start Auto', 'cmd:toggle_auto')],
+  [btn('🔍 Scan All',   'cmd:scanall'), btn('📋 Status', 'cmd:status')],
+  [btn('📅 Today', 'cmd:today'), btn('📊 Weekly', 'cmd:weekly'), btn('🔥 Best', 'cmd:best')],
+  [btn('📉 Risk',  'cmd:risk'),  btn('🕐 Heatmap', 'cmd:heatmap'), btn('📒 Journal', 'cmd:journal')],
+  [btn('🏆 Stats', 'cmd:stats'), btn('📋 Summary', 'cmd:summary')],
+  [btn('🔙 Back', 'cmd:main')],
 ]);
 
-const settings2Kb = u => kb([
-  [btn(`🤖 AI Only: ${u.aiOnlyMode ? 'ON ✅' : 'OFF'}`, 'cmd:aionly'), btn(`📰 Block News: ${u.blockNews !== false ? 'ON ✅' : 'OFF'}`, 'cmd:blocknews')],
-  [btn(`💹 Mode: ${u.fxMode === 'fx' ? 'FX ✅' : u.fxMode === 'both' ? 'BOTH 🔄' : 'FTT'}`, 'cmd:fxmode'), btn(`📡 Channel: ${u.channelId ? '✅ Set' : 'None'}`, 'cmd:channelinfo')],
-  [btn('🔔 Custom Alerts', 'cmd:alerts')],
-  [btn('🔁 Signal Replay', 'cmd:replayhelp'), btn('◀ Back', 'cmd:settings')],
+// Unified Arena-style settings: Signal · Auto · Data (mode prominent on top)
+const settingsKb = u => {
+  const modeLbl = u.fxMode === 'fx' ? 'FX ✅' : u.fxMode === 'both' ? 'BOTH 🔄' : 'FTT';
+  return kb([
+    // ── Signal ──────────────────────────────────────────────────────────────
+    [btn(`💹 Mode: ${modeLbl}`, 'cmd:fxmode')],
+    [btn(`🎯 Grade: ${u.gradeFilter || 'ALL'}`, 'cmd:gradefilter'), btn(`📊 Conf: ${u.minConfidence || 0}%+`, 'cmd:conffilter')],
+    [btn(`⏱ Interval: ${u.interval}min`, 'cmd:intervals'), btn(`💱 Pair: ${disp(u.pair)}`, 'pairpage:0')],
+    // ── Auto ────────────────────────────────────────────────────────────────
+    [btn(`🤖 AI Only: ${u.aiOnlyMode ? 'ON ✅' : 'OFF'}`, 'cmd:aionly'), btn(`📰 News Block: ${u.blockNews !== false ? 'ON ✅' : 'OFF'}`, 'cmd:blocknews')],
+    [btn('🔔 Alerts', 'cmd:alerts'), btn('🔁 Replay', 'cmd:replayhelp')],
+    [btn(`📅 Summary: ${u.dailySummary ? 'ON' : 'OFF'}`, 'cmd:togglesummary'), btn(`🕐 ${u.summaryHour ?? 20}:00 UTC`, 'cmd:summarytime')],
+    // ── Data ────────────────────────────────────────────────────────────────
+    [btn(`📡 Channel: ${u.channelId ? '✅ Set' : 'None'}`, 'cmd:channelinfo'), btn('⬇ Export', 'cmd:exportinfo')],
+    [btn('🔙 Back', 'cmd:main')],
+  ]);
+};
+
+// Legacy alias — settings2 merged into unified settingsKb (cmd:settings2 still routes here)
+const settings2Kb = settingsKb;
+
+// Premium placeholder keyboard
+const premiumKb = () => kb([
+  [btn('📣 Channel Info', 'cmd:channelinfo')],
+  [btn('🔙 Back', 'cmd:main')],
 ]);
 
 const pairsKb = (page, backTo = 'cmd:settings') => {
@@ -639,7 +671,7 @@ const alertsKb = (alerts) => {
     btn('🗑', `alertdel:${pair}:0`),
   ]);
   rows.push([btn('➕ Add/Edit Alert', 'alertpage:0')]);
-  rows.push([btn('🔙 Menu', 'cmd:main')]);
+  rows.push([btn('🔙 Back', 'cmd:settings'), btn('🏠 Menu', 'cmd:main')]);
   return kb(rows);
 };
 
@@ -694,6 +726,9 @@ const histNavKb   = (page, total) => {
   return kb(rows);
 };
 
+// Shared back-row for screens opened from Quick actions
+const backQuick = () => [btn('🔙 Back', 'cmd:quick'), btn('🏠 Menu', 'cmd:main')];
+
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 // [Bug#2 FIX] disp(null) used to throw (v3 legacy history can hold null pair),
@@ -708,6 +743,54 @@ const fmtPrice = (price, pair) => {
   if (isNaN(v)) return '?';
   return isCr(pair) ? v.toFixed(2) : v.toFixed(5);
 };
+const modeLabel = m => m === 'fx' ? 'FX' : m === 'both' ? 'BOTH' : 'FTT';
+
+// Arena hub card (status + 6-button grid below)
+function fmtMainMenu(u, cnt, wr, resolvedN) {
+  return `FTT Signal Bot v4.4\n${SEP}\n` +
+    `💱 ${esc(disp(u.pair))} · ${u.interval}min · ${modeLabel(u.fxMode)}\n` +
+    `🔄 Auto: ${u.autoEnabled ? 'ON ✅' : 'OFF'}  👁 Watchlist: ${u.watchlist.length} pairs\n` +
+    `🎯 Grade: ${esc(u.gradeFilter || 'ALL')}  🤖 AI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}\n` +
+    `📰 News Block: ${u.blockNews !== false ? 'ON' : 'OFF'}\n` +
+    `${SEP}\n` +
+    `📊 Signals: ${cnt}  📈 Win Rate: ${wr}% (${resolvedN} resolved)\n` +
+    `${SEP}\n` +
+    `💡 <i>Tap a button below</i>`;
+}
+
+// Quick actions hub card
+function fmtQuickMenu(u) {
+  return `⚡ Quick actions\n${SEP}\n` +
+    `💱 ${esc(disp(u.pair))} · ${u.interval}min · ${modeLabel(u.fxMode)}\n` +
+    `🔄 Auto: <b>${u.autoEnabled ? 'ON ✅' : 'OFF'}</b>\n` +
+    `${SEP}\n` +
+    `<b>Primary</b> — Signal · Auto · Scan · Status\n` +
+    `<b>Explore</b> — Today · Weekly · Best · Risk · Heatmap · Journal · Stats`;
+}
+
+// Arena-style grouped settings card (Mode prominent)
+function fmtSettings(u) {
+  const mode = u.fxMode === 'fx'
+    ? 'FX ✅ — Entry/SL/TP (spot)'
+    : u.fxMode === 'both'
+      ? 'BOTH 🔄 — SL/TP + expiry'
+      : 'FTT — fixed-time';
+  return `⚙️ Settings\n${SEP}\n` +
+    `<b>Signal</b>\n` +
+    `💹 Mode: <b>${mode}</b>\n` +
+    `<i>Tap Mode to cycle: FTT → FX → BOTH</i>\n` +
+    `🎯 Grade: <b>${esc(u.gradeFilter || 'ALL')}</b>  📊 Conf: <b>${u.minConfidence || 0}%+</b>\n` +
+    `⏱ Interval: <b>${u.interval}min</b>  💱 Pair: <b>${esc(disp(u.pair))}</b>\n` +
+    `${SEP}\n` +
+    `<b>Auto</b>\n` +
+    `🤖 AI Only: <b>${u.aiOnlyMode ? 'ON ✅' : 'OFF'}</b>\n` +
+    `📰 News Block: <b>${u.blockNews !== false ? 'ON ✅' : 'OFF'}</b>\n` +
+    `📅 Summary: <b>${u.dailySummary ? `ON (${u.summaryHour ?? 20}:00 UTC)` : 'OFF'}</b>\n` +
+    `${SEP}\n` +
+    `<b>Data</b>\n` +
+    `📡 Channel: <b>${u.channelId ? esc(String(u.channelId)) : 'None'}</b>\n` +
+    `⬇ Export: use /export via admin endpoint`;
+}
 
 // ─── FORMATTERS ───────────────────────────────────────────────────────────────
 
@@ -1131,7 +1214,7 @@ async function onMessage(msg, env) {
   const u    = await getUser(cid, env);
   const R    = (t, kboard) => sendMsg(cid, t, env, kboard ? { reply_markup: kboard } : {});
 
-  if (text.startsWith('/start'))     return R(`👋 <b>Welcome to FTT Signal Bot</b>\n\n📊 <b>Professional Trading Signals</b>\n🤖 AI-validated · Multi-timeframe · Real-time\n\n${SEP}\n💱 Pair: <b>${esc(disp(u.pair))}</b> · ${u.interval}min\n💹 Mode: <b>${u.fxMode === 'fx' ? 'FX' : u.fxMode === 'both' ? 'BOTH' : 'FTT'}</b>\n🔄 Auto: <b>${u.autoEnabled ? 'ON ✅' : 'OFF'}</b>\n🎯 Grade: <b>${u.gradeFilter || 'ALL'}</b> · Conf: <b>${u.minConfidence || 0}%+</b>\n${SEP}\n\n<b>Quick Start:</b>\n📊 <b>Signal Now</b> — instant signal\n🔄 <b>Start Auto</b> — hands-free alerts\n🔍 <b>Scan All</b> — multi-pair scan\n\n💡 <i>Tap buttons below to navigate</i>`, mainKb(u));
+  if (text.startsWith('/start'))     return R(`👋 <b>Welcome to FTT Signal Bot</b>\n\n📊 <b>Professional Trading Signals</b>\n🤖 AI-validated · Multi-timeframe · Real-time\n\n${SEP}\n💱 Pair: <b>${esc(disp(u.pair))}</b> · ${u.interval}min\n💹 Mode: <b>${modeLabel(u.fxMode)}</b>\n🔄 Auto: <b>${u.autoEnabled ? 'ON ✅' : 'OFF'}</b>\n🎯 Grade: <b>${esc(u.gradeFilter || 'ALL')}</b> · Conf: <b>${u.minConfidence || 0}%+</b>\n${SEP}\n\n📊 <b>Signal Now</b> — instant signal\n⚡ <b>Quick actions</b> — Auto · Scan · Explore\n📈 <b>History</b> · ⚙️ <b>Settings</b> · 🚀 <b>Premium</b>\n\n💡 <i>Tap a button below</i>`, mainKb(u));
   if (text.startsWith('/signal'))    return doSignal(cid, null, env);
   if (text.startsWith('/scan'))      return doScanAll(cid, null, env);
   if (text.startsWith('/auto'))      return doToggle(cid, null, env);
@@ -1230,7 +1313,7 @@ async function _handleCb(cid, mid, data, u, env) {
     const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
     const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
     const cnt = await getCounter(cid, env);
-    return R(`FTT Signal Bot v4.3\n${SEP}\n💱 ${disp(u.pair)} · ${u.interval}min · ${u.fxMode === 'fx' ? 'FX' : u.fxMode === 'both' ? 'BOTH' : 'FTT'}\n🔄 Auto: ${u.autoEnabled ? 'ON ✅' : 'OFF'}  👁 Watchlist: ${u.watchlist.length} pairs\n🎯 Grade: ${u.gradeFilter || 'ALL'}  🤖 AI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}\n📰 News Block: ${u.blockNews !== false ? 'ON' : 'OFF'}\n${SEP}\n📊 Signals: ${cnt}  📈 Win Rate: ${wr}% (${res.length} resolved)`, mainKb(u));
+    return R(fmtMainMenu(u, cnt, wr, res.length), mainKb(u));
   }
 
   if (data === 'cmd:signal')      return doSignal(cid, mid, env);
@@ -1242,14 +1325,17 @@ async function _handleCb(cid, mid, data, u, env) {
   if (data === 'cmd:today')       return doToday(cid, mid, env);
   if (data === 'cmd:summary')     return doSummary(cid, mid, env);
   if (data === 'cmd:settings')    return doSettings(cid, mid, env);
-  if (data === 'cmd:settings2')   return doSettings2(cid, mid, env);
+  if (data === 'cmd:settings2')   return doSettings(cid, mid, env); // legacy → unified settings
+  if (data === 'cmd:quick')       return doQuick(cid, mid, env);
   if (data === 'cmd:journal')     return doJournal(cid, mid, env);
   if (data === 'cmd:weekly')      return doWeekly(cid, mid, env);
   if (data === 'cmd:risk')        return doRisk(cid, mid, env);
   if (data === 'cmd:heatmap')     return doHeatmap(cid, mid, env);
   if (data === 'cmd:best')        return doBest(cid, mid, env);
   if (data === 'cmd:alerts')      return doAlerts(cid, mid, env);
-  if (data === 'cmd:replayhelp')  return R(`🔄 Signal Replay\n\nType /replay EURUSD to get a live signal without logging it.\n\nGreat for analysis before committing to a trade.`, settings2Kb(u));
+  if (data === 'cmd:premium')     return doPremium(cid, mid, env);
+  if (data === 'cmd:exportinfo')  return doExportInfo(cid, mid, env);
+  if (data === 'cmd:replayhelp')  return R(`🔄 Signal Replay\n${SEP}\nType <code>/replay EURUSD</code> to get a live signal without logging it.\n\nGreat for analysis before committing to a trade.`, settingsKb(u));
   if (data.startsWith('cmd:history:')) return doHist(cid, mid, parseInt(data.split(':')[2]) || 0, env);
 
   // Settings
@@ -1262,35 +1348,30 @@ async function _handleCb(cid, mid, data, u, env) {
     await saveUser(cid, u, env);
     if (u.dailySummary) await addSummaryUser(cid, env);
     else                await removeSummaryUser(cid, env);
-    const t = `⚙️ Settings\n\nPair: ${disp(u.pair)}\nInterval: ${u.interval}min\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nDaily Summary: ${u.dailySummary ? `ON (${u.summaryHour ?? 20}:00 UTC)` : 'OFF'}`;
-    return R(t, settingsKb(u));
+    return R(fmtSettings(u), settingsKb(u));
   }
   if (data === 'cmd:aionly') {
     u.aiOnlyMode = !u.aiOnlyMode;
     await saveUser(cid, u, env);
-    const t = `⚙️ Advanced Settings\n\nAI Only Mode: ${u.aiOnlyMode ? 'ON — signals only when AI agrees' : 'OFF'}\nBlock News: ${u.blockNews !== false ? 'ON — auto skips +/-15min news window' : 'OFF'}\nChannel: ${u.channelId || 'None'}`;
-    return R(t, settings2Kb(u));
+    return R(fmtSettings(u), settingsKb(u));
   }
   if (data === 'cmd:blocknews') {
     u.blockNews = !(u.blockNews !== false);
     await saveUser(cid, u, env);
-    const t = `⚙️ Advanced Settings\n\nAI Only Mode: ${u.aiOnlyMode ? 'ON — signals only when AI agrees' : 'OFF'}\nBlock News: ${u.blockNews !== false ? 'ON — auto skips +/-15min news window' : 'OFF'}\nChannel: ${u.channelId || 'None'}`;
-    return R(t, settings2Kb(u));
+    return R(fmtSettings(u), settingsKb(u));
   }
   if (data === 'cmd:fxmode') {
     const cycle = { ftt: 'fx', fx: 'both', both: 'ftt' };
     u.fxMode = cycle[normMode(u.fxMode)] || 'ftt';
     await saveUser(cid, u, env);
-    const label = u.fxMode === 'fx' ? 'FX ✅ — Entry/SL/TP (spot)' : u.fxMode === 'both' ? 'BOTH 🔄 — SL/TP + expiry' : 'FTT — fixed-time';
-    const t = `⚙️ Advanced Settings\n\n💹 Mode: <b>${label}</b>\n(ট্যাপ করলে বদলাবে: FTT → FX → BOTH)\nAI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'} · Block News: ${u.blockNews !== false ? 'ON' : 'OFF'}\nChannel: ${u.channelId || 'None'}`;
-    return R(t, settings2Kb(u));
+    return R(fmtSettings(u), settingsKb(u));
   }
   // [F10] Channel info
   if (data === 'cmd:channelinfo') {
     const chanInfo = u.channelId
-      ? `📡 Channel Mode\n\nChannel: ${esc(u.channelId)}\n\nSignals are auto-posted there.\n\nTo change: /setchannel <id>\nTo remove: /clearchannel`
-      : `📡 Channel Mode\n\nNo channel set.\n\nTo enable:\n1. Add bot as admin to your channel\n2. Send /setchannel @yourchannel\n   or /setchannel -100123456789`;
-    return R(chanInfo, settings2Kb(u));
+      ? `📡 Channel Mode\n${SEP}\nChannel: <code>${esc(u.channelId)}</code>\n\nSignals are auto-posted there.\n\nTo change: /setchannel &lt;id&gt;\nTo remove: /clearchannel`
+      : `📡 Channel Mode\n${SEP}\nNo channel set.\n\nTo enable:\n1. Add bot as admin to your channel\n2. Send /setchannel @yourchannel\n   or /setchannel -100123456789`;
+    return R(chanInfo, settingsKb(u));
   }
 
   // [Bug#3 FIX] All settings changes now use the locally-updated `u` directly
@@ -1301,34 +1382,29 @@ async function _handleCb(cid, mid, data, u, env) {
   if (data.startsWith('interval:')) {
     u.interval = parseInt(data.split(':')[1], 10);
     await saveUser(cid, u, env);
-    const t = `⚙️ Settings\n\nPair: ${disp(u.pair)}\nInterval: ${u.interval}min\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nDaily Summary: ${u.dailySummary ? `ON (${u.summaryHour ?? 20}:00 UTC)` : 'OFF'}`;
-    return R(t, settingsKb(u));
+    return R(fmtSettings(u), settingsKb(u));
   }
   if (data.startsWith('sumhour:')) {
     u.summaryHour = parseInt(data.split(':')[1], 10);
     await saveUser(cid, u, env);
-    const t = `⚙️ Settings\n\nPair: ${disp(u.pair)}\nInterval: ${u.interval}min\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nDaily Summary: ${u.dailySummary ? `ON (${u.summaryHour ?? 20}:00 UTC)` : 'OFF'}`;
-    return R(t, settingsKb(u));
+    return R(fmtSettings(u), settingsKb(u));
   }
   if (data.startsWith('gf:')) {
     u.gradeFilter = data.slice(3);
     await saveUser(cid, u, env);
-    const t = `⚙️ Settings\n\nPair: ${disp(u.pair)}\nInterval: ${u.interval}min\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nDaily Summary: ${u.dailySummary ? `ON (${u.summaryHour ?? 20}:00 UTC)` : 'OFF'}`;
-    return R(t, settingsKb(u));
+    return R(fmtSettings(u), settingsKb(u));
   }
   if (data.startsWith('cf:')) {
     u.minConfidence = parseInt(data.split(':')[1], 10);
     await saveUser(cid, u, env);
-    const t = `⚙️ Settings\n\nPair: ${disp(u.pair)}\nInterval: ${u.interval}min\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nDaily Summary: ${u.dailySummary ? `ON (${u.summaryHour ?? 20}:00 UTC)` : 'OFF'}`;
-    return R(t, settingsKb(u));
+    return R(fmtSettings(u), settingsKb(u));
   }
 
   if (data.startsWith('pairpage:')) return R('💱 Select default pair:', pairsKb(parseInt(data.split(':')[1], 10)));
   if (data.startsWith('pair:')) {
     u.pair = norm(data.slice(5));
     await saveUser(cid, u, env);
-    const t = `⚙️ Settings\n\nPair: ${disp(u.pair)}\nInterval: ${u.interval}min\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nDaily Summary: ${u.dailySummary ? `ON (${u.summaryHour ?? 20}:00 UTC)` : 'OFF'}`;
-    return R(t, settingsKb(u));
+    return R(fmtSettings(u), settingsKb(u));
   }
 
   if (data.startsWith('wlpage:'))   return R(`👁 Add to Watchlist (${u.watchlist.length}/${MAX_WL}):`, wlAddKb(parseInt(data.split(':')[1], 10), u.watchlist));
@@ -1384,9 +1460,7 @@ async function restoreMainMsg(cid, mid, u, env) {
   const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
   const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
   const cnt = await getCounter(cid, env);
-  await editMsg(cid, mid,
-    `FTT Signal Bot v4.3\n${SEP}\n💱 ${disp(u.pair)} · ${u.interval}min · ${u.fxMode === 'fx' ? 'FX' : u.fxMode === 'both' ? 'BOTH' : 'FTT'}\n🔄 Auto: ${u.autoEnabled ? 'ON ✅' : 'OFF'}\n${SEP}\n📊 Signals: ${cnt}  📈 Win Rate: ${wr}% (${res.length} resolved)`,
-    env, { reply_markup: mainKb(u) });
+  await editMsg(cid, mid, fmtMainMenu(u, cnt, wr, res.length), env, { reply_markup: mainKb(u) });
 }
 
 async function doSignal(cid, mid, env) {
@@ -1527,21 +1601,53 @@ async function doToggle(cid, mid, env) {
   }
   const wl = u.watchlist.map(disp).join(', ');
   const t  = u.autoEnabled
-    ? `🔄 Auto Scan ON\n\n${disp(u.pair)}${wl ? '\nWatchlist: ' + wl : ''}\nInterval: ${u.interval}min  Grade: ${u.gradeFilter || 'ALL'}\nAI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}  News Block: ${u.blockNews !== false ? 'ON' : 'OFF'}\n⏰ Next scan: ${nextCandleIn(u.interval)}`
-    : `🔕 Auto Scan OFF`;
-  return reply(cid, mid, t, env, mainKb(u));
+    ? `🔄 Auto Scan ON\n${SEP}\n${esc(disp(u.pair))}${wl ? '\nWatchlist: ' + esc(wl) : ''}\nInterval: ${u.interval}min  Grade: ${esc(u.gradeFilter || 'ALL')}\nAI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}  News Block: ${u.blockNews !== false ? 'ON' : 'OFF'}\n⏰ Next scan: ${nextCandleIn(u.interval)}`
+    : `🔕 Auto Scan OFF\n${SEP}\nAuto scanning stopped.`;
+  // Stay on Quick actions hub so user can keep acting
+  return reply(cid, mid, t, env, quickKb(u));
+}
+
+async function doQuick(cid, mid, env) {
+  const u = await getUser(cid, env);
+  return reply(cid, mid, fmtQuickMenu(u), env, quickKb(u));
 }
 
 async function doSettings(cid, mid, env) {
   const u = await getUser(cid, env);
-  const t = `⚙️ Settings\n\nPair: ${disp(u.pair)}\nInterval: ${u.interval}min\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nDaily Summary: ${u.dailySummary ? `ON (${u.summaryHour ?? 20}:00 UTC)` : 'OFF'}`;
-  return reply(cid, mid, t, env, settingsKb(u));
+  return reply(cid, mid, fmtSettings(u), env, settingsKb(u));
 }
 
+// Legacy — settings2 merged into unified settings
 async function doSettings2(cid, mid, env) {
-  const u = await getUser(cid, env);
-  const t = `⚙️ Advanced Settings\n\nAI Only Mode: ${u.aiOnlyMode ? 'ON — signals only when AI agrees ✅' : 'OFF'}\nBlock News: ${u.blockNews !== false ? 'ON — auto skips ±15min news window ✅' : 'OFF'}\nChannel: ${u.channelId || 'None'}`;
-  return reply(cid, mid, t, env, settings2Kb(u));
+  return doSettings(cid, mid, env);
+}
+
+// [v4.4] Premium placeholder — informational only, no payment
+async function doPremium(cid, mid, env) {
+  const t =
+    `🚀 Premium\n${SEP}\n` +
+    `<b>Coming soon — future features</b>\n\n` +
+    `🚀 Signal priority (faster delivery)\n` +
+    `📈 More pairs & custom watchlists\n` +
+    `🎯 Advanced grade filters\n` +
+    `📊 Extended history & CSV export\n` +
+    `🔔 Multi-channel alerts\n` +
+    `🤖 Higher AI confidence gates\n` +
+    `${SEP}\n` +
+    `💡 <i>This is informational only — no payment, no unlock yet.</i>\n` +
+    `All current features are free for every user.`;
+  return reply(cid, mid, t, env, premiumKb());
+}
+
+// [v4.4] Export info (admin endpoint pointer)
+async function doExportInfo(cid, mid, env) {
+  const t =
+    `⬇ Export History\n${SEP}\n` +
+    `CSV export is available via the admin endpoint:\n\n` +
+    `<code>/export?secret=…&amp;chat=${cid}</code>\n\n` +
+    `Columns: No, Pair, Dir, Grade, Conf, Entry, Exit, Pips, Result, Expiry, Time, ResolvedAt\n\n` +
+    `💡 Ask your bot admin if you need a dump.`;
+  return reply(cid, mid, t, env, settingsKb(await getUser(cid, env)));
 }
 
 async function doStatus(cid, mid, env) {
@@ -1550,8 +1656,8 @@ async function doStatus(cid, mid, env) {
   const h   = await getHist(cid, env);
   const pen = h.filter(x => !x.result && x.direction).length;
   const nextScan = u.autoEnabled ? `\n⏰ Next scan: ${nextCandleIn(u.interval)}` : '';
-  const t = `📋 Status\n\nPair: ${disp(u.pair)}\nWatchlist: ${u.watchlist.map(disp).join(', ') || 'None'}\nInterval: ${u.interval}min\nAuto: ${u.autoEnabled ? 'ON' : 'OFF'}${nextScan}\nGrade: ${u.gradeFilter || 'ALL'}\nMin Conf: ${u.minConfidence || 0}%\nAI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}\nNews Block: ${u.blockNews !== false ? 'ON' : 'OFF'}\nSummary: ${u.dailySummary ? 'ON' : 'OFF'}\nChannel: ${u.channelId || 'None'}\nTotal Signals: ${cnt}  Pending: ${pen}`;
-  return reply(cid, mid, t, env, kb([[btn('⚙️ Settings', 'cmd:settings'), btn('📉 Risk', 'cmd:risk'), btn('🔙 Back', 'cmd:main')]]));
+  const t = `📋 Status\n${SEP}\nPair: ${esc(disp(u.pair))}\nWatchlist: ${u.watchlist.map(disp).join(', ') || 'None'}\nInterval: ${u.interval}min\nAuto: ${u.autoEnabled ? 'ON' : 'OFF'}${nextScan}\nGrade: ${esc(u.gradeFilter || 'ALL')}\nMin Conf: ${u.minConfidence || 0}%\nAI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}\nNews Block: ${u.blockNews !== false ? 'ON' : 'OFF'}\nSummary: ${u.dailySummary ? 'ON' : 'OFF'}\nChannel: ${u.channelId ? esc(String(u.channelId)) : 'None'}\nTotal Signals: ${cnt}  Pending: ${pen}`;
+  return reply(cid, mid, t, env, kb([[btn('⚙️ Settings', 'cmd:settings'), btn('📉 Risk', 'cmd:risk')], backQuick()]));
 }
 
 async function doHist(cid, mid, page, env) {
@@ -1563,35 +1669,35 @@ async function doStats(cid, mid, env) {
   const h  = await getHist(cid, env);
   const rs = await getRegimeStats(cid, env);
   const ss = await getSessionStats(cid, env);
-  return reply(cid, mid, fmtStats(h, rs, ss), env, kb([[btn('📈 History', 'cmd:history:0'), btn('📒 Journal', 'cmd:journal'), btn('🔥 Best', 'cmd:best'), btn('🔙 Back', 'cmd:main')]]));
+  return reply(cid, mid, fmtStats(h, rs, ss), env, kb([[btn('📈 History', 'cmd:history:0'), btn('📒 Journal', 'cmd:journal'), btn('🔥 Best', 'cmd:best')], backQuick()]));
 }
 
 async function doJournal(cid, mid, env) {
   const h = await getHist(cid, env);
-  return reply(cid, mid, fmtJournal(h), env, kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats'), btn('🔙 Back', 'cmd:main')]]));
+  return reply(cid, mid, fmtJournal(h), env, kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')], backQuick()]));
 }
 
 async function doWeekly(cid, mid, env) {
   const h = await getHist(cid, env);
-  return reply(cid, mid, fmtWeekly(h), env, kb([[btn('🏆 Stats', 'cmd:stats'), btn('📒 Journal', 'cmd:journal'), btn('🔙 Back', 'cmd:main')]]));
+  return reply(cid, mid, fmtWeekly(h), env, kb([[btn('🏆 Stats', 'cmd:stats'), btn('📒 Journal', 'cmd:journal')], backQuick()]));
 }
 
 // [F04] Risk Dashboard
 async function doRisk(cid, mid, env) {
   const h = await getHist(cid, env);
-  return reply(cid, mid, fmtRisk(h), env, kb([[btn('🗑 Cancel All', 'cmd:cancelall'), btn('📈 History', 'cmd:history:0'), btn('🔙 Back', 'cmd:main')]]));
+  return reply(cid, mid, fmtRisk(h), env, kb([[btn('🗑 Cancel All', 'cmd:cancelall'), btn('📈 History', 'cmd:history:0')], backQuick()]));
 }
 
 // [F05] Heatmap
 async function doHeatmap(cid, mid, env) {
   const h = await getHist(cid, env);
-  return reply(cid, mid, fmtHeatmap(h), env, kb([[btn('🏆 Stats', 'cmd:stats'), btn('🔥 Best Pairs', 'cmd:best'), btn('🔙 Back', 'cmd:main')]]));
+  return reply(cid, mid, fmtHeatmap(h), env, kb([[btn('🏆 Stats', 'cmd:stats'), btn('🔥 Best Pairs', 'cmd:best')], backQuick()]));
 }
 
 // [F06] Best Pairs
 async function doBest(cid, mid, env) {
   const h = await getHist(cid, env);
-  return reply(cid, mid, fmtBest(h), env, kb([[btn('🕐 Heatmap', 'cmd:heatmap'), btn('🏆 Stats', 'cmd:stats'), btn('🔙 Back', 'cmd:main')]]));
+  return reply(cid, mid, fmtBest(h), env, kb([[btn('🕐 Heatmap', 'cmd:heatmap'), btn('🏆 Stats', 'cmd:stats')], backQuick()]));
 }
 
 // [F09] Custom Alerts menu
@@ -1673,7 +1779,7 @@ async function doToday(cid, mid, env) {
   const h     = await getHist(cid, env);
   const today = new Date().toISOString().slice(0, 10);
   const th    = h.filter(x => x.timestamp?.startsWith(today));
-  if (!th.length) return reply(cid, mid, `📅 Today (${today})\n\nNo signals yet.`, env, kb([[btn('🔙 Back', 'cmd:main')]]));
+  if (!th.length) return reply(cid, mid, `📅 Today (${today})\n${SEP}\nNo signals yet.`, env, kb([backQuick()]));
   const res  = th.filter(x => x.result === 'WIN' || x.result === 'LOSS');
   const wins = res.filter(x => x.result === 'WIN').length;
   const wr   = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
@@ -1683,14 +1789,14 @@ async function doToday(cid, mid, env) {
     const rE = x.result === 'WIN' ? '✅' : x.result === 'LOSS' ? '❌' : x.result === 'CANCEL' ? '🗑' : '⏳';
     t += `${rE} #${x.no} ${dE} ${disp(x.pair)}${x.grade ? ' [' + esc(x.grade.split(' ')[0]) + ']' : ''} ${esc(x.confidence || '')}\n`;
   }
-  return reply(cid, mid, t, env, kb([[btn('📈 History', 'cmd:history:0'), btn('📉 Risk', 'cmd:risk'), btn('🔙 Back', 'cmd:main')]]));
+  return reply(cid, mid, t, env, kb([[btn('📈 History', 'cmd:history:0'), btn('📉 Risk', 'cmd:risk')], backQuick()]));
 }
 
 async function doSummary(cid, mid, env) {
   const h     = await getHist(cid, env);
   const today = new Date().toISOString().slice(0, 10);
   const th    = h.filter(x => x.timestamp?.startsWith(today));
-  if (!th.length) return reply(cid, mid, `No signals today yet.`, env, kb([[btn('🔙 Back', 'cmd:main')]]));
+  if (!th.length) return reply(cid, mid, `No signals today yet.`, env, kb([backQuick()]));
   const res   = th.filter(x => x.result === 'WIN' || x.result === 'LOSS');
   const wins  = res.filter(x => x.result === 'WIN').length;
   const wr    = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
@@ -1712,7 +1818,7 @@ async function doSummary(cid, mid, env) {
     }
   }
   t += `\n${trend} (all-time: ${allWR}%)`;
-  return reply(cid, mid, t, env, kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')]]));
+  return reply(cid, mid, t, env, kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')], backQuick()]));
 }
 
 async function doCancelAll(cid, mid, env) {

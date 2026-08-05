@@ -1,10 +1,66 @@
-# CHANGES — v4.1 → v4.3 (Premium UX + Bug Fixes)
+# CHANGES — v4.4 Arena-style Menu Redesign (+ v4.3 Premium UX)
 
-PR: `arena/019fd2e9-ftt-telegram-bot` → `main` (reviewer must approve before merge; no direct push to main).
+PR: `arena/019fd350-ftt-telegram-bot` → `main` (reviewer must approve before merge; no direct push to main).
 
 ---
 
-## 0. v4.3 — Result/History premium + entryHit (final polish)
+## 0. v4.4 — Arena hub menu (matches Arena screenshot)
+
+Main menu is a **clean 2×3 category grid** like Arena's attachment menu — not a long list of every feature.
+
+### Main hub (`mainKb`) — Arena layout
+
+```
+📊 Signal Now          👁 Watchlist
+🚀 Premium             ⚡ Quick actions
+📈 History             ⚙️ Settings
+```
+
+Maps to Arena slots:
+| Arena | FTT Bot |
+|-------|---------|
+| New chat | 📊 Signal Now |
+| Photo Styles | 👁 Watchlist |
+| Premium | 🚀 Premium |
+| Quick actions | ⚡ Quick actions |
+| Chat history | 📈 History |
+| Settings | ⚙️ Settings |
+
+### ⚡ Quick actions submenu (`quickKb`)
+
+```
+📊 Signal Now     🔄 Start Auto / 🔕 Stop Auto
+🔍 Scan All       📋 Status
+📅 Today   📊 Weekly   🔥 Best
+📉 Risk    🕐 Heatmap  📒 Journal
+🏆 Stats   📋 Summary
+🔙 Back → main hub
+```
+
+- Auto toggle stays on Quick actions
+- Explore screens Back → Quick actions + 🏠 Menu
+
+### Settings — unified + Mode prominent
+
+Mode full-width cycle · Grade/Conf/Interval/Pair · AI Only/News/Alerts/Replay/Summary · Channel/Export · Back
+
+### 🚀 Premium placeholder
+
+Future features list. **Honesty:** informational only — no payment.
+
+### No regression
+
+All cmds intact. New: `cmd:quick`, `cmd:premium`, `cmd:exportinfo`.
+
+### Verification
+
+```
+$ node --check src/index.js     → SYNTAX OK
+$ node menu-test.mjs            → 🎉 ALL MENU TESTS PASSED
+```
+
+
+## 0b. v4.3 — Result/History premium + entryHit (final polish)
 
 ### Premium result card
 ```
