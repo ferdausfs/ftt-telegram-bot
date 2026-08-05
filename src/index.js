@@ -1,8 +1,25 @@
 /**
- * FTT Signal Telegram Bot — v4.2 (PREMIUM UX + BUG FIXES)
+ * FTT Signal Telegram Bot — v4.3 (PREMIUM UX + BUG FIXES)
  * KV Binding     : BOT_KV
  * Service Binding: SIGNAL_WORKER → asignal.umuhammadiswa.workers.dev
  * Secrets        : BOT_TOKEN, SETUP_SECRET
+ *
+ * ── v4.3 RESULT/HISTORY PREMIUM + ENTRY HIT ──────────────────────────────────
+ *  [UX4] Result push card is now a leveled premium card:
+ *        📌 Signal #12 · 🎯 TP hit · +3min
+ *        ✅ WIN — 🟢 EUR/USD [A+ EXCELLENT]
+ *        ━━━━━━━━━━━━━━━━━
+ *        💰 Entry: 1.08000 → Exit: 1.08550
+ *        🎯 Result: WIN +55.0 pips (+0.51%)
+ *        ━━━━━━━━━━━━━━━━━
+ *        ⚡ Entry hit ✓ — price reached entry
+ *  [UX5] Entry hit/miss line: PENDING_ENTRY trades are watched during the
+ *        tracking window — if price touches the entry level → "⚡ Entry hit ✓",
+ *        otherwise "⚠️ Entry miss — price never reached entry". INSTANT fills
+ *        always count as hit. Trades store fillStatus + observed entryHit.
+ *  [UX6] fmtHist pending rows show live countdown; daily summary shows grade
+ *        breakdown; fmtSignal AI block leveled (AGREE/DISAGREE/UNCERTAIN),
+ *        D2 filters as code badges, news warning as a clean 2-line block.
  *
  * ── v4.2 PREMIUM MESSAGE DESIGN ──────────────────────────────────────────────
  *  [UX1] fmtSignal rewritten as a leveled premium card: 19-char ━ separators
@@ -486,10 +503,11 @@ async function logAndSchedule(cid, pair, sig, env) {
   const no = await addHist(cid, {
     id: tid, pair, direction: dir, confidence: sig.confidence || '0%', grade,
     entryPrice: entry, expiryMinutes: expMins, expiryAt: expAt, sl, tp,
+    fillStatus: sig.fillStatus || 'INSTANT',
     timestamp: new Date().toISOString(), result: null, regime, sessionKey,
   }, env);
 
-  await addPending({ chatId: String(cid), tradeId: tid, pair, direction: dir, entryPrice: entry, expiryAt: expAt, signalNo: no, grade, regime, sessionKey, sl, tp }, env);
+  await addPending({ chatId: String(cid), tradeId: tid, pair, direction: dir, entryPrice: entry, expiryAt: expAt, signalNo: no, grade, regime, sessionKey, sl, tp, fillStatus: sig.fillStatus || 'INSTANT' }, env);
 
   // FX: no "expires in ~30s" reminder — the trade stays open until SL/TP
   if (!isFx) {
@@ -776,31 +794,33 @@ function fmtSignal(data, pair, interval, no, opts = {}) {
     // ── Reason block ───────────────────────────────────────────────────────
     if (reason) msg += `📝 <i>${esc(reason)}</i>\n`;
 
-    // ── AI block (compact) ─────────────────────────────────────────────────
+    // ── AI block (compact, leveled status) ─────────────────────────────────
     const ai = sig.aiValidation;
     if (ai && ai.status === 'OK') {
-      if (ai.agrees === true) {
-        msg += `🤖 AI: ✅ Agrees — <b>${esc(ai.signal)}</b> (${esc(ai.confidence)}%)\n`;
-      } else if (ai.agrees === false && ai.signal !== 'NO_TRADE') {
-        msg += `🤖 AI: ⚠️ Disagrees — says <b>${esc(ai.signal)}</b> (${esc(ai.confidence)}%)\n`;
-      } else {
-        msg += `🤖 AI: 🤔 Uncertain — <b>NO_TRADE</b> (${esc(ai.confidence)}%)\n`;
-      }
+      const st = ai.agrees === true
+        ? '✅ <b>AGREE</b>'
+        : (ai.agrees === false && ai.signal !== 'NO_TRADE')
+          ? '⚠️ <b>DISAGREE</b>'
+          : '🤔 <b>UNCERTAIN</b>';
+      const aiSig = (ai.agrees === true || (ai.agrees === false && ai.signal !== 'NO_TRADE'))
+        ? `<b>${esc(ai.signal)}</b>` : '<b>NO_TRADE</b>';
+      msg += `🤖 AI: ${st} — ${aiSig} (${esc(ai.confidence)}%)\n`;
       if (ai.reason)   msg += `💬 <i>${esc(ai.reason)}</i>\n`;
       if (ai.concerns) msg += `🔍 <i>${esc(ai.concerns)}</i>\n`;
     }
 
-    // ── Blocked filters (D2 transparency) ──────────────────────────────────
+    // ── Blocked filters (D2 transparency, badge style) ─────────────────────
     const filters = sig.filtersApplied || [];
     const d2 = filters.filter(f => f.includes('D2_') || f.includes('BLOCK'));
-    if (d2.length) msg += `🚫 <i>Blocked: ${esc(d2.join(' · '))}</i>\n`;
+    if (d2.length) msg += `🚫 <b>Blocked:</b> ${d2.map(f => `<code>${esc(f)}</code>`).join(' ')}\n`;
 
     if (reason || (ai && ai.status === 'OK')) msg += SEP + '\n';
 
     // ── Warnings block (news / correlation) ────────────────────────────────
     if (opts.newsAlert) {
-      const sign = opts.newsAlert.minsAway >= 0 ? 'in' : 'ago';
-      msg += `⚠️ <b>News ${sign} ${Math.abs(opts.newsAlert.minsAway)}min</b>: ${esc(opts.newsAlert.title)} (${esc(opts.newsAlert.currency)})\n`;
+      const n = Math.abs(opts.newsAlert.minsAway);
+      const when = opts.newsAlert.minsAway >= 0 ? `in ${n}min` : `${n}min ago`;
+      msg += `⚠️ <b>High-impact news ${when}</b>\n📰 ${esc(opts.newsAlert.title)} (${esc(opts.newsAlert.currency)})\n`;
     }
     if (opts.correlated && opts.correlated.length) {
       msg += `⚠️ <b>Correlated open:</b> ${esc(opts.correlated.join(', '))}\n`;
@@ -815,7 +835,7 @@ function fmtSignal(data, pair, interval, no, opts = {}) {
     const filters = sig.filtersApplied || [];
     msg += `⚪ <b>NO TRADE</b>\n`;
     msg += filters.length
-      ? `🔕 <i>${esc(filters.join(' · '))}</i>\n`
+      ? `🔕 <b>Filters:</b> ${filters.map(f => `<code>${esc(f)}</code>`).join(' ')}\n`
       : `🔕 <i>${sig.alignment === 'MIXED' ? 'Timeframes mixed — no clear setup' : 'Setup not clear yet'}</i>\n`;
     msg += `💡 Next check at the next ${esc(tf)} candle close`;
   }
@@ -832,8 +852,11 @@ function fmtHist(hist, page = 0) {
     const rE = h.result === 'WIN' ? '✅' : h.result === 'LOSS' ? '❌' : h.result === 'SKIP' ? '⏭' : h.result === 'CANCEL' ? '🗑' : '⏳';
     const g  = h.grade  ? ` [${esc(h.grade.split(' ')[0])}]` : '';
     const p  = h.pips != null ? ` ${h.pips > 0 ? '+' : ''}${h.pips}` : '';
-    const t  = new Date(h.timestamp).toUTCString().slice(5, 17);
-    msg += `${rE} #${String(h.no || '?').padStart(3)} ${dE} ${disp(h.pair).padEnd(8)} ${esc(h.confidence || '').padStart(4)}${g}${p.padStart(6)}  ${t}\n`;
+    // [UX3] pending rows show live countdown instead of the timestamp
+    const timeStr = (!h.result && h.expiryAt)
+      ? `⏳ ${msToHuman(h.expiryAt - Date.now())} left`
+      : new Date(h.timestamp).toUTCString().slice(5, 17);
+    msg += `${rE} #${String(h.no || '?').padStart(3)} ${dE} ${disp(h.pair).padEnd(8)} ${esc(h.confidence || '').padStart(4)}${g}${p.padStart(6)}  ${timeStr}\n`;
   }
   return msg;
 }
@@ -1207,7 +1230,7 @@ async function _handleCb(cid, mid, data, u, env) {
     const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
     const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
     const cnt = await getCounter(cid, env);
-    return R(`FTT Signal Bot v4.2\n${SEP}\n💱 ${disp(u.pair)} · ${u.interval}min · ${u.fxMode === 'fx' ? 'FX' : u.fxMode === 'both' ? 'BOTH' : 'FTT'}\n🔄 Auto: ${u.autoEnabled ? 'ON ✅' : 'OFF'}  👁 Watchlist: ${u.watchlist.length} pairs\n🎯 Grade: ${u.gradeFilter || 'ALL'}  🤖 AI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}\n📰 News Block: ${u.blockNews !== false ? 'ON' : 'OFF'}\n${SEP}\n📊 Signals: ${cnt}  📈 Win Rate: ${wr}% (${res.length} resolved)`, mainKb(u));
+    return R(`FTT Signal Bot v4.3\n${SEP}\n💱 ${disp(u.pair)} · ${u.interval}min · ${u.fxMode === 'fx' ? 'FX' : u.fxMode === 'both' ? 'BOTH' : 'FTT'}\n🔄 Auto: ${u.autoEnabled ? 'ON ✅' : 'OFF'}  👁 Watchlist: ${u.watchlist.length} pairs\n🎯 Grade: ${u.gradeFilter || 'ALL'}  🤖 AI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}\n📰 News Block: ${u.blockNews !== false ? 'ON' : 'OFF'}\n${SEP}\n📊 Signals: ${cnt}  📈 Win Rate: ${wr}% (${res.length} resolved)`, mainKb(u));
   }
 
   if (data === 'cmd:signal')      return doSignal(cid, mid, env);
@@ -1362,7 +1385,7 @@ async function restoreMainMsg(cid, mid, u, env) {
   const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
   const cnt = await getCounter(cid, env);
   await editMsg(cid, mid,
-    `FTT Signal Bot v4.2\n${SEP}\n💱 ${disp(u.pair)} · ${u.interval}min · ${u.fxMode === 'fx' ? 'FX' : u.fxMode === 'both' ? 'BOTH' : 'FTT'}\n🔄 Auto: ${u.autoEnabled ? 'ON ✅' : 'OFF'}\n${SEP}\n📊 Signals: ${cnt}  📈 Win Rate: ${wr}% (${res.length} resolved)`,
+    `FTT Signal Bot v4.3\n${SEP}\n💱 ${disp(u.pair)} · ${u.interval}min · ${u.fxMode === 'fx' ? 'FX' : u.fxMode === 'both' ? 'BOTH' : 'FTT'}\n🔄 Auto: ${u.autoEnabled ? 'ON ✅' : 'OFF'}\n${SEP}\n📊 Signals: ${cnt}  📈 Win Rate: ${wr}% (${res.length} resolved)`,
     env, { reply_markup: mainKb(u) });
 }
 
@@ -1952,23 +1975,55 @@ async function resultCheck(env, log) {
   log(`Results: ${ids.length} pending`);
   const now = Date.now(), keep = [];
 
+  // Is this a fill-pending trade? (entry hit/miss only matters for these)
+  const isPendingFill = t => ['PENDING_ENTRY', 'PENDING'].includes(t.fillStatus);
+  // Has price touched the entry level since logging?
+  const touchedEntry = (t, current) => {
+    const entry = parseFloat(t.entryPrice);
+    if (isNaN(entry) || isNaN(current)) return false;
+    return t.direction === 'BUY' ? current <= entry : current >= entry;
+  };
+  // Record the observation on the pending trade (survives until resolution)
+  const noteEntryTouch = async (t, tid, current) => {
+    if (!isPendingFill(t) || t.entryHit === true || !touchedEntry(t, current)) return false;
+    t.entryHit = true;
+    await kput(`pt:${tid}`, t, env, { expirationTtl: 7200 });
+    return true;
+  };
+
   // Premium result card + risk/milestone bookkeeping
   const finish = async (t, tid, current, result, hitNote, lateMin) => {
     const entry = parseFloat(t.entryPrice);
     const diff  = current - entry;
     const pips  = isCr(t.pair) ? Math.round(Math.abs(diff) * 100) / 100 : Math.round(Math.abs(diff) * 10000 * 10) / 10;
-    const unit  = isCr(t.pair) ? '$' : ' pips';
+    const moveS = isCr(t.pair)
+      ? `${diff > 0 ? '+' : ''}$${pips}`
+      : `${diff > 0 ? '+' : ''}${pips} pips`;
+    const pct   = !isNaN(entry) && entry !== 0 ? ((diff / entry) * 100) : 0;
     await setResult(t.chatId, tid, result, current, pips, env);
     await clearLock(t.chatId, t.pair, env);
     await kdel(`pt:${tid}`, env);
     await delReminder(tid, env);
-    const dE    = t.direction === 'BUY' ? '🟢' : '🔴';
-    const rE    = result === 'WIN' ? '✅ WIN' : '❌ LOSS';
-    const gS    = t.grade ? ` [${esc(t.grade)}]` : '';
-    const lateS = lateMin > 1 ? ` (+${lateMin}min)` : '';
-    const hitS  = hitNote ? ` (${hitNote})` : '';
+    const dE       = t.direction === 'BUY' ? '🟢' : '🔴';
+    const rE       = result === 'WIN' ? '✅ <b>WIN</b>' : '❌ <b>LOSS</b>';
+    const gS       = t.grade ? ` [${esc(t.grade)}]` : '';
+    const notes    = [`#${t.signalNo || tid}`];
+    if (hitNote) notes.push(hitNote);
+    if (lateMin > 1) notes.push(`+${lateMin}min`);
+    // [v4.3] entry hit/miss — INSTANT fills always hit; PENDING_ENTRY judged
+    // by whether price touched entry during the tracking window
+    const entryHit = t.entryHit === true || !isPendingFill(t);
+    const hitLine  = entryHit
+      ? `⚡ Entry hit ✓ — price reached entry`
+      : `⚠️ Entry miss — price never reached entry (result may be misleading)`;
     await sendMsg(t.chatId,
-      `📊 Result — Signal #${t.signalNo || tid}${lateS}${hitS}\n${SEP}\n${rE}  ${dE} ${t.direction} ${disp(t.pair)}${gS}\n${SEP}\n💰 Entry: ${fmtPrice(entry, t.pair)}\n🏁 Exit:  ${fmtPrice(current, t.pair)}\n📏 Move:  ${diff > 0 ? '+' : ''}${pips}${unit}`,
+      `📌 Signal ${notes.join(' · ')}\n` +
+      `${rE} — ${dE} ${esc(disp(t.pair))}${gS}\n` +
+      `${SEP}\n` +
+      `💰 Entry: <code>${esc(fmtPrice(entry, t.pair))}</code> → Exit: <code>${esc(fmtPrice(current, t.pair))}</code>\n` +
+      `🎯 Result: <b>${result}</b> ${moveS} (${diff > 0 ? '+' : ''}${pct.toFixed(2)}%)\n` +
+      `${SEP}\n` +
+      `${hitLine}`,
       env, { reply_markup: afterKb() });
     // Risk alert
     const risk = await updateRisk(t.chatId, result, env);
@@ -2000,6 +2055,8 @@ async function resultCheck(env, log) {
           const cur = await fetchPrice(t.pair, env);
           if (!cur) { keep.push(tid); continue; }
           const current = parseFloat(cur);
+          // [v4.3] observe whether price ever reached the (pending) entry
+          await noteEntryTouch(t, tid, current);
           const sl = parseFloat(t.sl), tp = parseFloat(t.tp);
           if (isNaN(current) || isNaN(sl) || isNaN(tp)) { keep.push(tid); continue; }
           const hitTp = t.direction === 'BUY' ? current >= tp : current <= tp;
@@ -2007,6 +2064,11 @@ async function resultCheck(env, log) {
           if (hitTp)      await finish(t, tid, current, 'WIN',  '🎯 TP hit', 0);
           else if (hitSl) await finish(t, tid, current, 'LOSS', '🛑 SL hit', 0);
           else            keep.push(tid);
+        } else if (isPendingFill(t)) {
+          // [v4.3] FTT pending-entry: watch for the entry level during the window
+          const cur = await fetchPrice(t.pair, env);
+          if (cur) await noteEntryTouch(t, tid, parseFloat(cur));
+          keep.push(tid);
         } else {
           keep.push(tid);
         }
@@ -2019,6 +2081,8 @@ async function resultCheck(env, log) {
       const entry   = parseFloat(t.entryPrice);
       const current = parseFloat(cur);
       if (isNaN(entry) || isNaN(current)) { await skipTrade(t, tid, 'invalid price data'); continue; }
+      // [v4.3] last chance to observe the entry level before judging hit/miss
+      await noteEntryTouch(t, tid, current);
       const diff   = current - entry;
       const result = t.direction === 'BUY' ? (diff > 0 ? 'WIN' : 'LOSS') : (diff < 0 ? 'WIN' : 'LOSS');
       const late   = Math.round((now - t.expiryAt) / 60000);
@@ -2045,7 +2109,21 @@ async function dailySummary(env, log) {
       const res  = th.filter(x => x.result === 'WIN' || x.result === 'LOSS');
       const wins = res.filter(x => x.result === 'WIN').length;
       const wr   = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
-      await sendMsg(cid, `📅 Daily Summary — ${today}\n${SEP}\n📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n⏳ Pending: ${th.filter(x => !x.result).length}`, env, { reply_markup: kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')]]) });
+      const gm = {};
+      for (const x of res) {
+        const g = (x.grade || '?').split(' ')[0];
+        if (!gm[g]) gm[g] = { w:0, l:0 };
+        x.result === 'WIN' ? gm[g].w++ : gm[g].l++;
+      }
+      let sumT = `📅 Daily Summary — ${today}\n${SEP}\n📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n⏳ Pending: ${th.filter(x => !x.result).length}`;
+      if (Object.keys(gm).length) {
+        sumT += `\n${SEP}\nGrades:\n`;
+        for (const [g, s] of Object.entries(gm)) {
+          const tt = s.w + s.l;
+          sumT += `  ${esc(g)}: ${s.w}W/${s.l}L (${Math.round(s.w / tt * 100)}%)\n`;
+        }
+      }
+      await sendMsg(cid, sumT, env, { reply_markup: kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')]]) });
       await kput(`ds:${cid}`, Date.now(), env);
       log(`Summary sent to ${cid}`);
     } catch (e) { log(`Summary ${cid}: ${e.message}`); }

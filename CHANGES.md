@@ -1,8 +1,48 @@
-# CHANGES — v4.1 → v4.2 (Premium UX + Bug Fixes)
+# CHANGES — v4.1 → v4.3 (Premium UX + Bug Fixes)
 
 PR: `arena/019fd2e9-ftt-telegram-bot` → `main` (reviewer must approve before merge; no direct push to main).
 
 ---
+
+## 0. v4.3 — Result/History premium + entryHit (final polish)
+
+### Premium result card
+```
+📌 Signal #12 · 🎯 TP hit · +3min
+✅ WIN — 🟢 EUR/USD [A+ EXCELLENT]
+━━━━━━━━━━━━━━━━━
+💰 Entry: 1.08000 → Exit: 1.08550
+🎯 Result: WIN +55 pips (+0.51%)
+━━━━━━━━━━━━━━━━━
+⚡ Entry hit ✓ — price reached entry
+```
+- WIN ✅ / LOSS ❌ colored, direction + grade on the header line
+- Entry → Exit + pips/percent (`+$186.04` crypto, `+55 pips` FX)
+- Notes line: signal # + hit note (`🎯 TP hit` / `🛑 SL hit` / `⏰ 60min horizon`) + late minutes
+- **Entry hit/miss line** (worker-এর entryHit-এর bot-side equivalent):
+  - `⚡ Entry hit ✓ — price reached entry` (INSTANT fills always hit)
+  - `⚠️ Entry miss — price never reached entry (result may be misleading)` — PENDING_ENTRY fills যেটা entry-তে পৌঁছায়নি → "ভুয়া WIN/LOSS" চেনার উপায়
+- Implementation: `logAndSchedule` now stores `fillStatus`; `resultCheck` observes the entry level on every in-window poll (`noteEntryTouch`, stored on the pending trade) — FX already polls, FTT pending-fills now poll too.
+
+### History / summaries
+- `fmtHist` pending rows show live countdown (`⏳ 3m 41s left`), resolved rows keep date + pips
+- Cron `dailySummary` now includes the grades breakdown (matches interactive /summary)
+- `fmtSignal` AI block leveled: `🤖 AI: ✅ AGREE — BUY (88%)` / `⚠️ DISAGREE` / `🤔 UNCERTAIN`
+- D2 filters as code badges: `🚫 Blocked: <code>D2_CONF_55</code> <code>BLOCK_NEWS</code>`
+- News warning clean 2-line block: `⚠️ High-impact news in 8min` / `📰 US CPI (USD)` (or `3min ago`)
+
+### Verification (v4.3)
+```
+$ node --check src/index.js          → SYNTAX OK
+$ node render-test.mjs               → 🎉 ALL TESTS PASSED (39 checks)
+$ node logic-test.mjs                → 🎉 ALL LOGIC TESTS PASSED (28 checks:
+                                        entry hit/miss, FX TP/SL, pending-fill
+                                        touch tracking, FTT path, SKIP, countdown)
+```
+
+---
+
+## 1. v4.2 — Premium message design
 
 ## 1. Premium message design
 
