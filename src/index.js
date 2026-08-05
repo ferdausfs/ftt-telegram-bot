@@ -670,6 +670,7 @@ function fmtSignal(data, pair, interval, no, opts = {}) {
   const price  = sig.recommendations?.['1min']?.entry?.price
               || sig.recommendations?.['5min']?.entry?.price
               || sig.recommendations?.['15min']?.entry?.price || null;
+  const fill = sig.fillStatus;   // INSTANT | PENDING_ENTRY (2026-08-05)
   const dE = dir === 'BUY' ? '🟢' : dir === 'SELL' ? '🔴' : '⚪';
   const hE = htf === 'BUY' ? '📈' : htf === 'SELL' ? '📉' : '➡️';
   const confNum = parseInt(String(conf).replace('%','')) || 0;
@@ -687,6 +688,8 @@ function fmtSignal(data, pair, interval, no, opts = {}) {
   if (dir === 'BUY' || dir === 'SELL') {
     msg += `${dE} <b>${dir}</b>  <code>${esc(conf)}</code>  ${esc(grade)}\n`;
     msg += `${confColor} <code>${confBar(conf)}</code>\n`;
+    if (fill === 'INSTANT') msg += `⚡ <b>INSTANT</b> — price at entry, take now\n`;
+    else if (fill === 'PENDING_ENTRY') msg += `⏳ <b>PENDING</b> — price away from entry${sig.entryDistancePct != null ? ' (' + esc(String(sig.entryDistancePct)) + '%)' : ''}, wait for fill\n`;
     if (price)  msg += `💰 Entry: <code>${esc(fmtPrice(price, pair))}</code>\n`;
     // FX/BOTH: show ATR-based SL/TP when present
     const hasFx = sig.mode === 'fx' && sig.fxLevels && sig.fxLevels.sl && sig.fxLevels.tp;
