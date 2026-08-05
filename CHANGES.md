@@ -1,10 +1,85 @@
-# CHANGES — v4.1 → v4.3 (Premium UX + Bug Fixes)
+# CHANGES — v4.4 Arena-style Menu Redesign (+ v4.3 Premium UX)
 
-PR: `arena/019fd2e9-ftt-telegram-bot` → `main` (reviewer must approve before merge; no direct push to main).
+PR: `arena/019fd350-ftt-telegram-bot` → `main` (reviewer must approve before merge; no direct push to main).
 
 ---
 
-## 0. v4.3 — Result/History premium + entryHit (final polish)
+## 0. v4.4 — Arena-style menu redesign (Quick Actions + Premium + Settings)
+
+### Main menu (`mainKb`) — grouped like Arena UI
+
+```
+[Quick Actions]          ← most-used, 1-tap
+📊 Signal Now     🔄 Start Auto / 🔕 Stop Auto
+🔍 Scan All       📈 History
+
+[Explore]
+📅 Today    📊 Weekly    🔥 Best Pairs
+📉 Risk     🕐 Heatmap   📒 Journal
+
+[Account]
+👁 Watchlist   ⚙️ Settings   📋 Status
+
+[Premium]
+⭐ Premium     🏆 Stats
+```
+
+- **Top = primary** (Signal / Auto / Scan / History) — user gets a signal in one tap
+- Groups are visual (row order + consistent emoji); Telegram has no section headers on inline keyboards
+- All previous commands still reachable (Stats moved next to Premium; Summary via Settings or `/summary`)
+- Main card text via `fmtMainMenu()` — v4.4 badge + Quick Actions · Explore · Account · ⭐ Premium footer
+
+### Settings (`settingsKb`) — unified + Mode prominent
+
+```
+⚙️ Settings
+━━━ Signal ━━━
+💹 Mode: FTT/FX/BOTH     ← full-width, cycle button
+🎯 Grade Filter          📊 Min Confidence
+⏱ Interval               💱 Pair
+
+━━━ Auto ━━━
+🤖 AI Only               📰 News Block
+🔔 Alerts                🔁 Replay
+📅 Summary               🕐 Time
+
+━━━ Data ━━━
+📡 Channel               ⬇ Export
+🔙 Back
+```
+
+- **settings2 merged into one screen** — `settings2Kb = settingsKb`; `cmd:settings2` still works (redirects)
+- Card text via `fmtSettings()` with Signal / Auto / Data sections + Mode cycle hint
+- Toggle/mode changes re-render the same grouped card (no stale KV re-read)
+
+### Premium placeholder
+
+- ⭐ **Premium** button on main menu → `doPremium`
+- Lists future features (signal priority, more pairs, advanced filters, export, multi-channel…)
+- **Honesty:** informational only — no payment, no unlock; all current features stay free
+- Keyboard: Channel Info + 🔙 Back
+
+### Navigation
+
+- Every submenu keeps **🔙 Back** (settings sub-pickers → Settings; alerts → Settings + Menu; explore → main)
+- ◀ Prev / Next ▶ pagination unchanged (pairs, watchlist, history)
+
+### No regression
+
+- All cmd handlers intact: signal, auto, scan, history, stats, today, weekly, best, risk, heatmap, journal, watchlist, settings, status, alerts, cancelall, replay, channel, manual win/loss
+- New only: `cmd:premium`, `cmd:exportinfo`
+- Signal/auto/scan/history logic untouched
+
+### Verification (v4.4)
+
+```
+$ node --check src/index.js     → SYNTAX OK
+$ node menu-test.mjs            → 🎉 ALL MENU TESTS PASSED (68 checks)
+```
+
+---
+
+## 0b. v4.3 — Result/History premium + entryHit (final polish)
 
 ### Premium result card
 ```
