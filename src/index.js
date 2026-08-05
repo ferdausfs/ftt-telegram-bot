@@ -1,17 +1,49 @@
 /**
- * FTT Signal Telegram Bot — v4.1 (FIXED)
+ * FTT Signal Telegram Bot — v4.2 (PREMIUM UX + BUG FIXES)
  * KV Binding     : BOT_KV
  * Service Binding: SIGNAL_WORKER → asignal.umuhammadiswa.workers.dev
  * Secrets        : BOT_TOKEN, SETUP_SECRET
  *
- * CRITICAL FIXES (v4.1 → v4.1-fixed):
+ * ── v4.2 PREMIUM MESSAGE DESIGN ──────────────────────────────────────────────
+ *  [UX1] fmtSignal rewritten as a leveled premium card: 19-char ━ separators
+ *        between sections, header line (📊 PAIR | TF | mode badge), signal
+ *        line (🟢/🔴 DIR + confidence + [GRADE] in one row), Entry/SL/TP +
+ *        fill-status block, HTF·Regime·Structure block, 📝 reason block,
+ *        AI block, warning block, footer. NO_TRADE / CLOSED states are clean
+ *        empty-state cards. All dynamic text is HTML-escaped.
+ *  [UX2] Fill status (⚡ INSTANT / ⏳ PENDING) is ALWAYS shown — defaults to
+ *        INSTANT when the worker does not send fillStatus.
+ *  [UX3] fmtHist aligned columns + separator; result push card premium
+ *        (✅/❌ big result + entry/exit/move block); /risk esc'd + separators.
+ *
+ * ── v4.2 BUG FIXES ───────────────────────────────────────────────────────────
+ *  [Bug#1] HTML-escape gaps: doAnalyze + all catch-path error messages sent
+ *          raw dynamic content (reason, confluence, ai.concerns, e.message)
+ *          with parse_mode:'HTML' → Telegram 400 when worker data contained
+ *          < > &. Fixed: esc() everywhere dynamic text is injected.
+ *  [Bug#2] disp(null) crashed (legacy v3 history entries with null pair) →
+ *          whole /history /stats /best /weekly /journal failed. Fixed:
+ *          disp() is null-safe, plus NaN-hour guard in fmtHeatmap.
+ *  [Bug#3] Scan All ignored FX mode — fetchSig called without mode param so
+ *          FX/BOTH users got no SL/TP levels. Fixed: mode passed through.
+ *  [Bug#4] Manual WIN/LOSS + Cancel All left stale expiry reminders (rem:*,
+ *          remind_ids) → "⏰ expires in ~30s" fired AFTER resolution. Fixed:
+ *          delReminder() called in doManualResult + doCancelAll.
+ *  [Bug#5] FX trades tracked with 5min default expiry (no bestTimeframe
+ *          expiry in FX payload) → spot trades force-resolved at 5min.
+ *          Fixed: FX trades get 60min horizon + SL/TP hit-check in
+ *          resultCheck (TP hit → WIN, SL hit → LOSS, else keep tracking).
+ *  [Bug#6] fetchSig 20s race covered only the fetch, not res.json() (a slow
+ *          body could still hang). Fixed: json() inside the race.
+ *
+ * CRITICAL FIXES (v4.1 → v4.1-fixed, kept):
  *  [Bug#1] ROOT CAUSE: parse_mode:'MarkdownV2' + esc() was silently breaking
  *          ALL editMsg/sendMsg calls when signal worker data (entryReason,
  *          ai.reason, ai.concerns, newsAlert.title) contained special chars
  *          like ( ) . ! - _ etc. Telegram returned HTTP 400, tg() logged it
  *          but never threw → message never updated → "nothing changes" bug.
- *          FIX: Removed parse_mode and esc() entirely. Plain text is used.
- *          All emojis, separators (━) and line breaks work identically.
+ *          FIX: parse_mode is 'HTML' only (3 chars to escape: & < >) and every
+ *          dynamic value goes through esc(). No MarkdownV2 anywhere.
  *  [Bug#2] cmd:cancelall was used in Risk Dashboard "🗑 Cancel All" button
  *          but had no handler in onCb → clicking it did nothing silently.
  *          FIX: Added handler that calls doCancelAll(cid, mid, env).
@@ -137,12 +169,10 @@ const TG   = env  => `https://api.telegram.org/bot${env.BOT_TOKEN}`;
 const post = body => ({ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
 const json = ()   => ({ headers: { 'Content-Type': 'application/json' } });
 
-// [Bug#1 FIX] Removed parse_mode:'MarkdownV2' and esc() entirely.
-// MarkdownV2 caused silent 400 errors when signal worker data (entryReason,
-// ai.reason, ai.concerns, newsAlert.title) contained special chars like
-// ( ) . ! - _ etc. tg() logged the error but never threw, so editMsg/sendMsg
-// appeared to succeed but the message never updated — "nothing changes" bug.
-// Plain text is safer: all emojis, separators and line breaks work identically.
+// [Bug#1 FIX] No MarkdownV2 anywhere — parse_mode is 'HTML' (only 3 chars
+// to escape: & < >). All dynamic content passes through esc() so special
+// chars in worker data (entryReason, ai.reason, ai.concerns, newsAlert.title)
+// can never produce a Telegram 400 again.
 
 async function tg(method, body, env) {
   if (!env?.BOT_TOKEN) return null;
@@ -160,11 +190,8 @@ async function tg(method, body, env) {
 // HTML escape for dynamic content (safe with parse_mode:'HTML' — only 3 chars)
 const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-// Unicode confidence bar: █████░░░░░
-function confBar(pct) {
-  const n = Math.round((parseInt(String(pct).replace('%','')) || 0) / 10);
-  return '█'.repeat(n) + '░'.repeat(10 - n);
-}
+// Premium card separator (19 chars — consistent across all cards)
+const SEP = '━━━━━━━━━━━━━━━━━';
 
 const sendMsg = (cid, text, env, extra = {}) =>
   tg('sendMessage', { chat_id: cid, text: String(text || ''), disable_web_page_preview: true, parse_mode: 'HTML', ...extra }, env);
@@ -440,9 +467,15 @@ async function setLock(cid, pair, dir, expiryAt, env) {
 
 async function logAndSchedule(cid, pair, sig, env) {
   const dir        = sig.finalSignal;
-  const expMins    = sig.bestTimeframe?.expiry?.totalMinutes || 5;
+  // [Bug#5 FIX] FX trades have no fixed expiry (hold until SL/TP) — use a
+  // 60min tracking horizon and resolve by SL/TP hit in resultCheck.
+  // FTT trades keep the candle-based expiry.
+  const isFx       = sig.mode === 'fx';
+  const expMins    = isFx ? 60 : (sig.bestTimeframe?.expiry?.totalMinutes || 5);
   const expAt      = Date.now() + expMins * 60 * 1000;
   const entry      = sig.recommendations?.['1min']?.entry?.price || sig.recommendations?.['5min']?.entry?.price || null;
+  const sl         = isFx ? (sig.fxLevels?.sl ?? null) : null;
+  const tp         = isFx ? (sig.fxLevels?.tp ?? null) : null;
   const grade      = sig.grade ? `${sig.grade.grade} ${sig.grade.label}` : '';
   const tid        = uid();
   const regime     = sig.marketRegime || 'UNKNOWN';
@@ -452,15 +485,18 @@ async function logAndSchedule(cid, pair, sig, env) {
 
   const no = await addHist(cid, {
     id: tid, pair, direction: dir, confidence: sig.confidence || '0%', grade,
-    entryPrice: entry, expiryMinutes: expMins, expiryAt: expAt,
+    entryPrice: entry, expiryMinutes: expMins, expiryAt: expAt, sl, tp,
     timestamp: new Date().toISOString(), result: null, regime, sessionKey,
   }, env);
 
-  await addPending({ chatId: String(cid), tradeId: tid, pair, direction: dir, entryPrice: entry, expiryAt: expAt, signalNo: no, grade, regime, sessionKey }, env);
+  await addPending({ chatId: String(cid), tradeId: tid, pair, direction: dir, entryPrice: entry, expiryAt: expAt, signalNo: no, grade, regime, sessionKey, sl, tp }, env);
 
-  const remAt = expAt - 30000;
-  if (remAt > Date.now())
-    await addReminder({ tradeId: tid, chatId: String(cid), pair, direction: dir, signalNo: no, remAt }, env);
+  // FX: no "expires in ~30s" reminder — the trade stays open until SL/TP
+  if (!isFx) {
+    const remAt = expAt - 30000;
+    if (remAt > Date.now())
+      await addReminder({ tradeId: tid, chatId: String(cid), pair, direction: dir, signalNo: no, remAt }, env);
+  }
 
   await setLock(cid, pair, dir, expAt, env);
   return no;
@@ -642,147 +678,162 @@ const histNavKb   = (page, total) => {
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-const disp  = p  => (!p.includes('/') && p.length === 6) ? p.slice(0,3) + '/' + p.slice(3) : p;
-const norm  = p  => p.replace('/', '');
+// [Bug#2 FIX] disp(null) used to throw (v3 legacy history can hold null pair),
+// which crashed /history /stats /best /weekly /journal. Now null-safe.
+const disp  = p  => (p ? ((!p.includes('/') && p.length === 6) ? p.slice(0,3) + '/' + p.slice(3) : p) : '?');
+const norm  = p  => String(p ?? '').replace('/', '');
 const uid   = () => Math.random().toString(36).slice(2, 8).toUpperCase();
-const isCr  = p  => CRYPTO.some(b => p.startsWith(b));
+const isCr  = p  => CRYPTO.some(b => String(p || '').startsWith(b));
 const chunk = (arr, n) => arr.reduce((r, x, i) => (i % n === 0 ? r.push([x]) : r[r.length-1].push(x), r), []);
-const fmtPrice = (price, pair) => isCr(pair) ? parseFloat(price).toFixed(2) : parseFloat(price).toFixed(5);
+const fmtPrice = (price, pair) => {
+  const v = parseFloat(price);
+  if (isNaN(v)) return '?';
+  return isCr(pair) ? v.toFixed(2) : v.toFixed(5);
+};
 
 // ─── FORMATTERS ───────────────────────────────────────────────────────────────
 
 function fmtSignal(data, pair, interval, no, opts = {}) {
-  if (data.marketStatus === 'CLOSED')
-    return `📊 <b>${esc(disp(pair))}</b> | ${interval}min\n━━━━━━━━━━━━━━\n🔴 <b>Forex Market CLOSED</b>\n💡 Try <b>BTC/USD</b> (24/7)`;
-
   const sig = data.signal;
-  if (!sig) return `📊 <b>${esc(disp(pair))}</b> | ${interval}min\n━━━━━━━━━━━━━━\nNo signal data`;
+  const m   = normMode(opts.mode);
+  const tf  = (sig?.bestTimeframe?.timeframe) || `${interval || 5}min`;
+  const modeBadge = m === 'both' ? '🔄 <b>BOTH</b>' : (m === 'fx' || sig?.mode === 'fx') ? '💹 <b>FX</b>' : '⏱ <b>FTT</b>';
+  const header = `📊 <b>${esc(disp(pair))}</b> | ${esc(tf)} | ${modeBadge}`;
 
-  const dir    = sig.finalSignal   || 'NO_TRADE';
-  const conf   = sig.confidence    || '0%';
+  // ── Empty states (clean, not dingy) ──────────────────────────────────────
+  if (data.marketStatus === 'CLOSED')
+    return `${header}\n${SEP}\n🔴 <b>Forex Market CLOSED</b>\n💡 Try <b>BTC/USD</b> (24/7)`;
+  if (!sig)
+    return `${header}\n${SEP}\n⚪ <b>No signal data</b>\n💡 Try again at the next candle close.`;
+
+  const dir    = sig.finalSignal || 'NO_TRADE';
+  const conf   = sig.confidence  || '0%';
   const grade  = sig.grade ? `${sig.grade.grade} ${sig.grade.label}` : '';
   const htf    = sig.higherTFTrend || 'NEUTRAL';
   const reason = sig.entryReason   || '';
   const best   = sig.bestTimeframe;
-  const tf     = best?.timeframe || `${interval}min`;
   const expiry = best?.expiry?.humanReadable || null;
   const cd     = best?.expiry?.countdown?.label || null;
   const price  = sig.recommendations?.['1min']?.entry?.price
               || sig.recommendations?.['5min']?.entry?.price
               || sig.recommendations?.['15min']?.entry?.price || null;
-  const fill = sig.fillStatus;   // INSTANT | PENDING_ENTRY (2026-08-05)
   const dE = dir === 'BUY' ? '🟢' : dir === 'SELL' ? '🔴' : '⚪';
   const hE = htf === 'BUY' ? '📈' : htf === 'SELL' ? '📉' : '➡️';
-  const confNum = parseInt(String(conf).replace('%','')) || 0;
-  const confColor = confNum >= 85 ? '🟢' : confNum >= 70 ? '🟡' : '🔴';
+  const regimeE = { TRENDING:'🔵', RANGING:'🟡', BREAKOUT:'🟠', VOLATILE:'🔴' };
 
   let msg = '';
   if (opts.replay) msg += `🔄 <i>REPLAY — not logged</i>\n`;
-  if (no) msg += `📌 Signal No. <b>${no}</b>\n`;
-  // Mode badge: FX / FTT / BOTH
-  const m = opts.mode || 'ftt';
-  const modeBadge = m === 'both' ? '🔄 <b>BOTH</b>' : (m === 'fx' || sig.mode === 'fx') ? '💹 <b>FX</b>' : '⏱ <b>FTT</b>';
-  msg += `📊 <b>${esc(disp(pair))}</b> | ${esc(tf)} | ${modeBadge}\n`;
-  msg += `<b>━━━━━━━━━━━━━━</b>\n`;
+  if (no)          msg += `📌 Signal No. <b>${no}</b>\n`;
+  msg += header + '\n' + SEP + '\n';
 
   if (dir === 'BUY' || dir === 'SELL') {
-    msg += `${dE} <b>${dir}</b>  <code>${esc(conf)}</code>  ${esc(grade)}\n`;
-    msg += `${confColor} <code>${confBar(conf)}</code>\n`;
-    if (fill === 'INSTANT') msg += `⚡ <b>INSTANT</b> — price at entry, take now\n`;
-    else if (fill === 'PENDING_ENTRY') msg += `⏳ <b>PENDING</b> — price away from entry${sig.entryDistancePct != null ? ' (' + esc(String(sig.entryDistancePct)) + '%)' : ''}, wait for fill\n`;
-    if (price)  msg += `💰 Entry: <code>${esc(fmtPrice(price, pair))}</code>\n`;
-    // FX/BOTH: show ATR-based SL/TP when present
+    // ── Signal line: direction + confidence + grade in one row ─────────────
+    const confNum = parseInt(String(conf).replace('%', '')) || 0;
+    const confDot = confNum >= 85 ? '🟢' : confNum >= 70 ? '🟡' : '🔴';
+    msg += `${dE} <b>${dir}</b> ${confDot} ${esc(conf)}${grade ? `  [${esc(grade)}]` : ''}\n`;
+    msg += SEP + '\n';
+
+    // ── Levels block: Entry + SL/TP (FX/BOTH) or Expiry (FTT) + fill status ─
+    if (price) msg += `💰 Entry: <code>${esc(fmtPrice(price, pair))}</code>\n`;
     const hasFx = sig.mode === 'fx' && sig.fxLevels && sig.fxLevels.sl && sig.fxLevels.tp;
     if (hasFx) {
       msg += `🛑 SL: <code>${esc(fmtPrice(sig.fxLevels.sl, pair))}</code>\n`;
       msg += `🎯 TP: <code>${esc(fmtPrice(sig.fxLevels.tp, pair))}</code>  (1:${esc(sig.fxLevels.rr || '2.5')})\n`;
-      if (m === 'fx') {
-        msg += `💹 <i>FX mode — hold until SL/TP (spot). Fixed expiry নয়।</i>\n`;
-      }
     }
-    // FTT / BOTH: show expiry lines
     if (m !== 'fx') {
       if (expiry) msg += `⏰ Expiry: <b>${esc(expiry)}</b>\n`;
       if (cd)     msg += `🕐 Candle closes: <code>${esc(cd)}</code>\n`;
     }
-    msg += `${hE} HTF: <b>${esc(htf)}</b>\n`;
-
-    const regime = sig.marketRegime, regimeAdvice = sig.regimeAdvice;
-    if (regime) {
-      const rE = { TRENDING:'🔵', RANGING:'🟡', BREAKOUT:'🟠', VOLATILE:'🔴' }[regime] || '⚪';
-      msg += `${rE} Regime: <b>${esc(regime)}</b>\n`;
-      if (regimeAdvice) msg += `💡 <i>${esc(regimeAdvice)}</i>\n`;
+    // [UX2] Fill status ALWAYS shown — default INSTANT when worker omits it
+    const fill = sig.fillStatus || 'INSTANT';
+    if (fill === 'PENDING_ENTRY' || fill === 'PENDING') {
+      const dist = sig.entryDistancePct != null ? ` (${esc(String(sig.entryDistancePct))}%)` : '';
+      msg += `⏳ <b>PENDING</b> — price away from entry${dist}, wait for fill\n`;
+    } else {
+      msg += `⚡ <b>INSTANT</b> — take now\n`;
     }
+    if (m === 'fx' && !hasFx)
+      msg += `💹 <i>FX mode — worker sent no SL/TP levels yet</i>\n`;
+    msg += SEP + '\n';
 
-    // Structure verdict (B5)
+    // ── Context block: HTF · Regime · Structure ────────────────────────────
+    const regime = sig.marketRegime;
+    let ctx = `${hE} HTF: <b>${esc(htf)}</b>`;
+    if (regime) ctx += ` · ${regimeE[regime] || '⚪'} Regime: <b>${esc(regime)}</b>`;
+    msg += ctx + '\n';
+
     const sv = sig.structureVerdict;
     if (sv && sv.overall && sv.overall !== 'N/A') {
       const sE = sv.overall === 'ALIGNED' ? '✅' : sv.overall === 'AGAINST' ? '⚠️' : sv.overall === 'MIXED' ? '🔀' : '➡️';
-      msg += `${sE} Structure: <b>${esc(sv.overall)}</b>`;
-      if (sv.direction && sv.direction !== 'NEUTRAL') msg += ` (${esc(sv.direction)} ${esc(sv.strength || '')})`;
-      msg += `\n`;
+      let s = `${sE} Structure: <b>${esc(sv.overall)}</b>`;
+      if (sv.direction && sv.direction !== 'NEUTRAL')
+        s += ` (${esc(sv.direction)}${sv.strength ? ' ' + esc(sv.strength) : ''})`;
+      msg += s + '\n';
     }
+    if (sig.regimeAdvice) msg += `💡 <i>${esc(sig.regimeAdvice)}</i>\n`;
+    msg += SEP + '\n';
 
-    // Filters (D2 transparency)
-    const filters = sig.filtersApplied || [];
-    if (filters.length > 0) {
-      const d2 = filters.filter(f => f.includes('D2_') || f.includes('BLOCK'));
-      if (d2.length > 0) msg += `🚫 <i>Blocked: ${esc(d2.join(' · '))}</i>\n`;
-    }
+    // ── Reason block ───────────────────────────────────────────────────────
+    if (reason) msg += `📝 <i>${esc(reason)}</i>\n`;
 
-    if (reason) msg += `\n📝 <i>${esc(reason)}</i>\n`;
-
+    // ── AI block (compact) ─────────────────────────────────────────────────
     const ai = sig.aiValidation;
     if (ai && ai.status === 'OK') {
-      msg += `\n🤖 <b>AI Validation</b>\n`;
       if (ai.agrees === true) {
-        msg += `✅ Agrees: <b>${esc(ai.signal)}</b> <code>${esc(ai.confidence)}%</code>\n`;
-        if (ai.reason) msg += `💬 <i>${esc(ai.reason)}</i>\n`;
+        msg += `🤖 AI: ✅ Agrees — <b>${esc(ai.signal)}</b> (${esc(ai.confidence)}%)\n`;
       } else if (ai.agrees === false && ai.signal !== 'NO_TRADE') {
-        msg += `⚠️ Disagrees: AI says <b>${esc(ai.signal)}</b> <code>${esc(ai.confidence)}%</code>\n`;
-        if (ai.reason) msg += `💬 <i>${esc(ai.reason)}</i>\n`;
+        msg += `🤖 AI: ⚠️ Disagrees — says <b>${esc(ai.signal)}</b> (${esc(ai.confidence)}%)\n`;
       } else {
-        msg += `🤔 Uncertain: <code>NO_TRADE ${esc(ai.confidence)}%</code>\n`;
+        msg += `🤖 AI: 🤔 Uncertain — <b>NO_TRADE</b> (${esc(ai.confidence)}%)\n`;
       }
+      if (ai.reason)   msg += `💬 <i>${esc(ai.reason)}</i>\n`;
       if (ai.concerns) msg += `🔍 <i>${esc(ai.concerns)}</i>\n`;
     }
 
-    // [F03] News warning
+    // ── Blocked filters (D2 transparency) ──────────────────────────────────
+    const filters = sig.filtersApplied || [];
+    const d2 = filters.filter(f => f.includes('D2_') || f.includes('BLOCK'));
+    if (d2.length) msg += `🚫 <i>Blocked: ${esc(d2.join(' · '))}</i>\n`;
+
+    if (reason || (ai && ai.status === 'OK')) msg += SEP + '\n';
+
+    // ── Warnings block (news / correlation) ────────────────────────────────
     if (opts.newsAlert) {
       const sign = opts.newsAlert.minsAway >= 0 ? 'in' : 'ago';
-      msg += `\n⚠️ <b>News ${sign} ${Math.abs(opts.newsAlert.minsAway)}min</b>: ${esc(opts.newsAlert.title)} (${esc(opts.newsAlert.currency)})\n`;
+      msg += `⚠️ <b>News ${sign} ${Math.abs(opts.newsAlert.minsAway)}min</b>: ${esc(opts.newsAlert.title)} (${esc(opts.newsAlert.currency)})\n`;
     }
-    // [F01] Correlated warning
     if (opts.correlated && opts.correlated.length) {
-      msg += `\n⚠️ <b>Correlated open:</b> ${esc(opts.correlated.join(', '))}\n`;
+      msg += `⚠️ <b>Correlated open:</b> ${esc(opts.correlated.join(', '))}\n`;
     }
 
-    if (opts.replay) {
-      msg += `\n🔄 <i>Replay only — result not tracked</i>`;
-    } else {
-      msg += `\n⏳ <i>Result will be tracked automatically</i>`;
-    }
+    // ── Footer ─────────────────────────────────────────────────────────────
+    msg += opts.replay
+      ? `🔄 <i>Replay only — result not tracked</i>`
+      : `⏳ <i>Result tracked automatically</i>`;
   } else {
+    // ── NO_TRADE empty state (clean, informative) ─────────────────────────
     const filters = sig.filtersApplied || [];
     msg += `⚪ <b>NO TRADE</b>\n`;
     msg += filters.length
-      ? `🔕 <i>${esc(filters.join(' · '))}</i>`
-      : `🔕 <i>${sig.alignment === 'MIXED' ? 'Timeframes mixed' : 'Setup not clear'}</i>`;
+      ? `🔕 <i>${esc(filters.join(' · '))}</i>\n`
+      : `🔕 <i>${sig.alignment === 'MIXED' ? 'Timeframes mixed — no clear setup' : 'Setup not clear yet'}</i>\n`;
+    msg += `💡 Next check at the next ${esc(tf)} candle close`;
   }
   return msg;
 }
 
 function fmtHist(hist, page = 0) {
   const per = 10, slice = hist.slice(page * per, page * per + per);
-  if (!slice.length) return 'No signals yet.';
-  let msg = `📈 History (${page * per + 1}-${page * per + slice.length} of ${hist.length})\n━━━━━━━━━━━━━━\n`;
+  if (!hist.length) return `📈 History\n${SEP}\nNo signals yet.\n\n💡 Tap 📊 Signal Now to get your first signal.`;
+  if (!slice.length) return `📈 History\n${SEP}\nNo more signals on this page.`;
+  let msg = `📈 History (${page * per + 1}-${page * per + slice.length} of ${hist.length})\n${SEP}\n`;
   for (const h of slice) {
     const dE = h.direction === 'BUY' ? '🟢' : '🔴';
     const rE = h.result === 'WIN' ? '✅' : h.result === 'LOSS' ? '❌' : h.result === 'SKIP' ? '⏭' : h.result === 'CANCEL' ? '🗑' : '⏳';
-    const g  = h.grade  ? ` ${h.grade.split(' ')[0]}` : '';
+    const g  = h.grade  ? ` [${esc(h.grade.split(' ')[0])}]` : '';
     const p  = h.pips != null ? ` ${h.pips > 0 ? '+' : ''}${h.pips}` : '';
     const t  = new Date(h.timestamp).toUTCString().slice(5, 17);
-    msg += `${rE} #${h.no || '?'} ${dE} ${disp(h.pair)}${g} ${h.confidence}${p}  ${t}\n`;
+    msg += `${rE} #${String(h.no || '?').padStart(3)} ${dE} ${disp(h.pair).padEnd(8)} ${esc(h.confidence || '').padStart(4)}${g}${p.padStart(6)}  ${t}\n`;
   }
   return msg;
 }
@@ -818,7 +869,7 @@ function fmtStats(hist, regimeStats, sessionStats) {
   // [F07] Drawdown
   const { maxDd, maxLoss } = calcDrawdown(resolved);
 
-  let msg = `🏆 Win/Loss Stats\n━━━━━━━━━━━━━━\n`;
+  let msg = `🏆 Win/Loss Stats\n${SEP}\n`;
   msg += `✅ Wins: ${wins}  ❌ Losses: ${losses}\n`;
   msg += `📊 Win Rate: ${wr}% (${resolved.length} trades)\n`;
   msg += `⏳ Pending: ${pending}`;
@@ -860,7 +911,7 @@ function fmtStats(hist, regimeStats, sessionStats) {
     msg += `\nGrade:\n`;
     for (const [g, s] of Object.entries(gm)) {
       const t = s.w + s.l;
-      msg += `  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)\n`;
+      msg += `  ${esc(g)}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)\n`;
     }
   }
   if (Object.keys(pm).length) {
@@ -874,18 +925,18 @@ function fmtStats(hist, regimeStats, sessionStats) {
 function fmtJournal(hist, date) {
   const today = date || new Date().toISOString().slice(0, 10);
   const th = hist.filter(x => x.timestamp?.startsWith(today));
-  if (!th.length) return `📒 Journal — ${today}\n\nNo signals today.`;
+  if (!th.length) return `📒 Journal — ${today}\n${SEP}\nNo signals today.`;
   const res  = th.filter(x => x.result === 'WIN' || x.result === 'LOSS');
   const wins = res.filter(x => x.result === 'WIN').length;
   const wr   = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
-  let msg = `📒 Trade Journal — ${today}\n━━━━━━━━━━━━━━\n`;
+  let msg = `📒 Trade Journal — ${today}\n${SEP}\n`;
   msg += `📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L  📈 ${wr}%\n\n`;
   for (const x of th.slice(0, 10)) {
     const dE = x.direction === 'BUY' ? '🟢' : '🔴';
     const rE = x.result === 'WIN' ? '✅' : x.result === 'LOSS' ? '❌' : x.result === 'CANCEL' ? '🗑' : '⏳';
-    const rg = x.regime ? ` [${x.regime.slice(0,3)}]` : '';
-    const sk = x.sessionKey ? ` ${x.sessionKey.replace('_','-')}` : '';
-    msg += `${rE} #${x.no} ${dE} ${disp(x.pair)} ${x.confidence}${rg}${sk}\n`;
+    const rg = x.regime ? ` [${esc(x.regime.slice(0,3))}]` : '';
+    const sk = x.sessionKey ? ` ${esc(x.sessionKey.replace('_','-'))}` : '';
+    msg += `${rE} #${x.no} ${dE} ${disp(x.pair)} ${esc(x.confidence || '')}${rg}${sk}\n`;
   }
   if (th.length > 10) msg += `...+${th.length - 10} more\n`;
   const regToday = {};
@@ -916,7 +967,7 @@ function fmtWeekly(hist, weekLabel) {
   const res = wh.filter(x => x.result === 'WIN' || x.result === 'LOSS');
   const wins = res.filter(x => x.result === 'WIN').length;
   const wr = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
-  let msg = `📅 Weekly Report — ${label}\n━━━━━━━━━━━━━━\n`;
+  let msg = `📅 Weekly Report — ${label}\n${SEP}\n`;
   msg += `📊 ${wh.length} signals  ✅ ${wins}W ❌ ${res.length-wins}L\n📈 Win Rate: ${wr}%\n`;
   const rm = {};
   for (const x of res) {
@@ -955,9 +1006,9 @@ function fmtWeekly(hist, weekLabel) {
 function fmtRisk(hist) {
   // [Bug#2 FIX] filter out entries with null pair to avoid getCurrencyExposure crash
   const pending = hist.filter(x => !x.result && (x.direction === 'BUY' || x.direction === 'SELL') && x.pair);
-  if (!pending.length) return `📉 Open Risk Dashboard\n━━━━━━━━━━━━━━\nNo open trades`;
+  if (!pending.length) return `📉 Open Risk Dashboard\n${SEP}\nNo open trades — nice and clean. ✅`;
   const now = Date.now();
-  let msg = `📉 Open Risk Dashboard\n━━━━━━━━━━━━━━\n${pending.length} open trade(s)\n\n`;
+  let msg = `📉 Open Risk Dashboard\n${SEP}\n${pending.length} open trade(s)\n`;
   const exposure = {};
   for (const t of pending) {
     const exp = getCurrencyExposure(t.pair, t.direction);
@@ -968,11 +1019,11 @@ function fmtRisk(hist) {
   }
   for (const t of pending) {
     const dE      = t.direction === 'BUY' ? '🟢' : '🔴';
-    const g       = t.grade ? ` ${t.grade.split(' ')[0]}` : '';
+    const g       = t.grade ? ` [${esc(t.grade.split(' ')[0])}]` : '';
     const rem     = t.expiryAt ? msToHuman(t.expiryAt - now) : '?';
     const expired = t.expiryAt && t.expiryAt < now;
-    msg += `${dE} #${t.no} ${t.direction} ${disp(t.pair)}${g} ${t.confidence || ''}\n`;
-    msg += `   Entry: ${t.entryPrice ? fmtPrice(t.entryPrice, t.pair) : '?'}  ${expired ? 'Result pending' : `${rem} left`}\n`;
+    msg += `${dE} #${t.no} ${t.direction} ${disp(t.pair)}${g} ${esc(t.confidence || '')}\n`;
+    msg += `   Entry: ${t.entryPrice ? fmtPrice(t.entryPrice, t.pair) : '?'}  ${expired ? '⏳ Result pending' : `⏱ ${rem} left`}\n`;
   }
   const multi = Object.entries(exposure).filter(([, v]) => (v.long + v.short) > 1 && v.long > 0 && v.short === 0);
   if (multi.length) msg += `\nConcentrated exposure: ${multi.map(([c,v]) => `${c} x${v.long}`).join(', ')}`;
@@ -982,10 +1033,13 @@ function fmtRisk(hist) {
 // [F05] Hourly Heatmap
 function fmtHeatmap(hist) {
   const resolved = hist.filter(x => x.result === 'WIN' || x.result === 'LOSS');
-  if (!resolved.length) return `🕐 Hourly Heatmap\n━━━━━━━━━━━━━━\nNo resolved trades yet.`;
+  if (!resolved.length) return `🕐 Hourly Heatmap\n${SEP}\nNo resolved trades yet.`;
   const hmap = {};
   for (const h of resolved) {
-    const hour = new Date(h.timestamp).getUTCHours();
+    // [Bug#2 FIX] skip entries with invalid timestamps (legacy data)
+    const ts = new Date(h.timestamp).getTime();
+    if (isNaN(ts)) continue;
+    const hour = new Date(ts).getUTCHours();
     if (!hmap[hour]) hmap[hour] = { w:0, l:0 };
     h.result === 'WIN' ? hmap[hour].w++ : hmap[hour].l++;
   }
@@ -994,7 +1048,7 @@ function fmtHeatmap(hist) {
     return { hr: parseInt(hr), w:s.w, l:s.l, t, pct: Math.round(s.w/t*100) };
   }).sort((a,b) => a.hr - b.hr);
 
-  let msg = `🕐 Win Rate by Hour (UTC)\n━━━━━━━━━━━━━━\n`;
+  let msg = `🕐 Win Rate by Hour (UTC)\n${SEP}\n`;
   for (const e of entries) {
     const bar   = '█'.repeat(Math.round(e.pct / 10)) + '░'.repeat(10 - Math.round(e.pct / 10));
     const icon  = e.pct >= 60 ? '✅' : e.pct >= 45 ? '⚠️' : '❌';
@@ -1011,9 +1065,10 @@ function fmtHeatmap(hist) {
 // [F06] Best Pairs Leaderboard
 function fmtBest(hist) {
   const resolved = hist.filter(x => x.result === 'WIN' || x.result === 'LOSS');
-  if (!resolved.length) return `🔥 Best Pairs\n━━━━━━━━━━━━━━\nNo resolved trades yet.`;
+  if (!resolved.length) return `🔥 Best Pairs\n${SEP}\nNo resolved trades yet.`;
   const pm = {};
   for (const h of resolved) {
+    if (!h.pair) continue;
     if (!pm[h.pair]) pm[h.pair] = { w:0, l:0 };
     h.result === 'WIN' ? pm[h.pair].w++ : pm[h.pair].l++;
   }
@@ -1022,10 +1077,10 @@ function fmtBest(hist) {
     .filter(x => x.t >= 3)
     .sort((a,b) => b.pct - a.pct || b.t - a.t);
 
-  if (!ranked.length) return `🔥 Best Pairs\n━━━━━━━━━━━━━━\nNeed at least 3 trades per pair.`;
+  if (!ranked.length) return `🔥 Best Pairs\n${SEP}\nNeed at least 3 trades per pair.`;
 
   const medals = ['🥇','🥈','🥉','4️⃣','5️⃣'];
-  let msg = `🔥 Best Pairs Leaderboard\n━━━━━━━━━━━━━━\n`;
+  let msg = `🔥 Best Pairs Leaderboard\n${SEP}\n`;
   ranked.slice(0, 7).forEach((x, i) => {
     const bar  = '█'.repeat(Math.round(x.pct/10)) + '░'.repeat(10-Math.round(x.pct/10));
     const icon = x.pct >= 60 ? '✅' : x.pct >= 45 ? '⚠️' : '❌';
@@ -1053,7 +1108,7 @@ async function onMessage(msg, env) {
   const u    = await getUser(cid, env);
   const R    = (t, kboard) => sendMsg(cid, t, env, kboard ? { reply_markup: kboard } : {});
 
-  if (text.startsWith('/start'))     return R(`👋 <b>Welcome to FTT Signal Bot</b>\n\n📊 <b>Professional Trading Signals</b>\n🤖 AI-validated · Multi-timeframe · Real-time\n\n━━━━━━━━━━━━━━\n💱 Pair: <b>${esc(disp(u.pair))}</b>  ${u.interval}min\n🔄 Auto: <b>${u.autoEnabled ? 'ON ✅' : 'OFF'}</b>\n🎯 Grade: <b>${u.gradeFilter || 'ALL'}</b>  Conf: <b>${u.minConfidence || 0}%+</b>\n━━━━━━━━━━━━━━\n\n<b>Quick Start:</b>\n📊 <b>Signal Now</b> — instant signal\n🔄 <b>Start Auto</b> — hands-free alerts\n🔍 <b>Scan All</b> — multi-pair scan\n\n💡 <i>Tap buttons below to navigate</i>`, mainKb(u));
+  if (text.startsWith('/start'))     return R(`👋 <b>Welcome to FTT Signal Bot</b>\n\n📊 <b>Professional Trading Signals</b>\n🤖 AI-validated · Multi-timeframe · Real-time\n\n${SEP}\n💱 Pair: <b>${esc(disp(u.pair))}</b> · ${u.interval}min\n💹 Mode: <b>${u.fxMode === 'fx' ? 'FX' : u.fxMode === 'both' ? 'BOTH' : 'FTT'}</b>\n🔄 Auto: <b>${u.autoEnabled ? 'ON ✅' : 'OFF'}</b>\n🎯 Grade: <b>${u.gradeFilter || 'ALL'}</b> · Conf: <b>${u.minConfidence || 0}%+</b>\n${SEP}\n\n<b>Quick Start:</b>\n📊 <b>Signal Now</b> — instant signal\n🔄 <b>Start Auto</b> — hands-free alerts\n🔍 <b>Scan All</b> — multi-pair scan\n\n💡 <i>Tap buttons below to navigate</i>`, mainKb(u));
   if (text.startsWith('/signal'))    return doSignal(cid, null, env);
   if (text.startsWith('/scan'))      return doScanAll(cid, null, env);
   if (text.startsWith('/auto'))      return doToggle(cid, null, env);
@@ -1137,7 +1192,7 @@ async function onCb(cb, env) {
   } catch (e) {
     console.error('onCb [' + data + ']:', e.message);
     try {
-      await editMsg(cid, mid, `⚠️ Error: ${e.message.slice(0, 100)}\n\nTap menu to continue.`, env, { reply_markup: mainKb(u) });
+      await editMsg(cid, mid, `⚠️ Error: ${esc(e.message.slice(0, 100))}\n\nTap menu to continue.`, env, { reply_markup: mainKb(u) });
     } catch {
       await sendMsg(cid, `⚠️ Something went wrong. Use /start to reset.`, env, { reply_markup: mainKb(u) });
     }
@@ -1152,7 +1207,7 @@ async function _handleCb(cid, mid, data, u, env) {
     const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
     const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
     const cnt = await getCounter(cid, env);
-    return R(`FTT Signal Bot v4.1\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nWatchlist: ${u.watchlist.length} pairs  Grade: ${u.gradeFilter || 'ALL'}\nAI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}  News Block: ${u.blockNews !== false ? 'ON' : 'OFF'}\n\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`, mainKb(u));
+    return R(`FTT Signal Bot v4.2\n${SEP}\n💱 ${disp(u.pair)} · ${u.interval}min · ${u.fxMode === 'fx' ? 'FX' : u.fxMode === 'both' ? 'BOTH' : 'FTT'}\n🔄 Auto: ${u.autoEnabled ? 'ON ✅' : 'OFF'}  👁 Watchlist: ${u.watchlist.length} pairs\n🎯 Grade: ${u.gradeFilter || 'ALL'}  🤖 AI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}\n📰 News Block: ${u.blockNews !== false ? 'ON' : 'OFF'}\n${SEP}\n📊 Signals: ${cnt}  📈 Win Rate: ${wr}% (${res.length} resolved)`, mainKb(u));
   }
 
   if (data === 'cmd:signal')      return doSignal(cid, mid, env);
@@ -1210,7 +1265,7 @@ async function _handleCb(cid, mid, data, u, env) {
   // [F10] Channel info
   if (data === 'cmd:channelinfo') {
     const chanInfo = u.channelId
-      ? `📡 Channel Mode\n\nChannel: ${u.channelId}\n\nSignals are auto-posted there.\n\nTo change: /setchannel <id>\nTo remove: /clearchannel`
+      ? `📡 Channel Mode\n\nChannel: ${esc(u.channelId)}\n\nSignals are auto-posted there.\n\nTo change: /setchannel <id>\nTo remove: /clearchannel`
       : `📡 Channel Mode\n\nNo channel set.\n\nTo enable:\n1. Add bot as admin to your channel\n2. Send /setchannel @yourchannel\n   or /setchannel -100123456789`;
     return R(chanInfo, settings2Kb(u));
   }
@@ -1307,7 +1362,7 @@ async function restoreMainMsg(cid, mid, u, env) {
   const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
   const cnt = await getCounter(cid, env);
   await editMsg(cid, mid,
-    `FTT Signal Bot v4.1\n\n${disp(u.pair)}  ${u.interval}min  ${u.autoEnabled ? 'Auto ON' : 'Auto OFF'}\nSignals: ${cnt}  Win Rate: ${wr}% (${res.length} resolved)`,
+    `FTT Signal Bot v4.2\n${SEP}\n💱 ${disp(u.pair)} · ${u.interval}min · ${u.fxMode === 'fx' ? 'FX' : u.fxMode === 'both' ? 'BOTH' : 'FTT'}\n🔄 Auto: ${u.autoEnabled ? 'ON ✅' : 'OFF'}\n${SEP}\n📊 Signals: ${cnt}  📈 Win Rate: ${wr}% (${res.length} resolved)`,
     env, { reply_markup: mainKb(u) });
 }
 
@@ -1347,10 +1402,12 @@ async function doSignal(cid, mid, env) {
         await sendMsg(cid, `📉 Confidence Dropping — last 3: ${ct.vals[2]}% → ${ct.vals[1]}% → ${ct.vals[0]}%\n\nConsider waiting for a stronger setup.`, env, { reply_markup: kb([[btn('🏆 Stats', 'cmd:stats'), btn('🔙 Menu', 'cmd:main')]]) });
     }
   } catch (e) {
-    if (mid) await editMsg(cid, mid, `❌ Signal fetch failed\n${e.message.slice(0,150)}`, env, { reply_markup: mainKb(u) });
+    // [Bug#1 FIX] esc() the error text — worker HTTP errors may contain < > &
+    const err = `❌ Signal fetch failed\n\n${SEP}\n⚠️ ${esc(e.message.slice(0, 150))}\n${SEP}\n\n💡 Try again in a few seconds.`;
+    if (mid) await editMsg(cid, mid, err, env, { reply_markup: mainKb(u) });
     else {
       if (loadingMid) await deleteMsg(cid, loadingMid, env);
-      await sendMsg(cid, `❌ Signal fetch failed\n${e.message.slice(0,200)}`, env, { reply_markup: mainKb(u) });
+      await sendMsg(cid, err, env, { reply_markup: mainKb(u) });
     }
   }
 }
@@ -1389,10 +1446,11 @@ async function doQuickSignal(cid, mid, pair, env) {
         await sendMsg(cid, `📉 Confidence Dropping — last 3: ${ct.vals[2]}% → ${ct.vals[1]}% → ${ct.vals[0]}%\n\nConsider waiting for a stronger setup.`, env, { reply_markup: kb([[btn('🏆 Stats', 'cmd:stats'), btn('🔙 Menu', 'cmd:main')]]) });
     }
   } catch (e) {
-    if (mid) await editMsg(cid, mid, `❌ Failed: ${e.message.slice(0,150)}`, env, { reply_markup: mainKb(u) });
+    const err = `❌ Failed: ${esc(e.message.slice(0, 150))}`;
+    if (mid) await editMsg(cid, mid, err, env, { reply_markup: mainKb(u) });
     else {
       if (loadingMid) await deleteMsg(cid, loadingMid, env);
-      await sendMsg(cid, `❌ Failed: ${e.message.slice(0,150)}`, env, { reply_markup: mainKb(u) });
+      await sendMsg(cid, err, env, { reply_markup: mainKb(u) });
     }
   }
 }
@@ -1410,7 +1468,8 @@ async function doScanAll(cid, mid, env) {
   let found = 0;
   for (const pair of list) {
     try {
-      const data = await fetchSig(pair, env);
+      // [Bug#3 FIX] pass mode so FX/BOTH users get SL/TP levels in Scan All too
+      const data = await fetchSig(pair, env, { mode: normMode(u.fxMode) });
       const sig  = data.signal;
       const dir  = sig?.finalSignal;
       if ((dir === 'BUY' || dir === 'SELL') && passGrade(sig, u.gradeFilter) && passConf(sig, u.minConfidence) && passAI(sig, u.aiOnlyMode)) {
@@ -1517,8 +1576,8 @@ async function doAlerts(cid, mid, env) {
   const alerts = await getAlerts(cid, env);
   const count  = Object.keys(alerts).length;
   const t = count
-    ? `🔔 Custom Alerts (${count})\n━━━━━━━━━━━━━━\nYou get notified when these pairs hit your threshold, even if they'd normally be filtered.\n`
-    : `🔔 Custom Alerts\n━━━━━━━━━━━━━━\nNo alerts set.\n\nAdd a pair + confidence threshold to get notified.`;
+    ? `🔔 Custom Alerts (${count})\n${SEP}\nYou get notified when these pairs hit your threshold, even if they'd normally be filtered.\n`
+    : `🔔 Custom Alerts\n${SEP}\nNo alerts set.\n\nAdd a pair + confidence threshold to get notified.`;
   return reply(cid, mid, t, env, alertsKb(alerts));
 }
 
@@ -1538,7 +1597,7 @@ async function doReplay(cid, mid, pairRaw, env) {
     ]) });
     await restoreMainMsg(cid, mid, u, env);
   } catch (e) {
-    await sendMsg(cid, `❌ Replay failed: ${e.message}`, env, { reply_markup: mainKb(u) });
+    await sendMsg(cid, `❌ Replay failed: ${esc(e.message)}`, env, { reply_markup: mainKb(u) });
   }
 }
 
@@ -1555,28 +1614,29 @@ async function doAnalyze(cid, mid, pairRaw, env) {
     const dE    = dir === 'BUY' ? '🟢' : dir === 'SELL' ? '🔴' : '⚪';
     const rg    = sig.marketRegime || 'UNKNOWN';
     const rIcon = { TRENDING:'🔵', RANGING:'🟡', BREAKOUT:'🟠', VOLATILE:'🔴' };
-    let msg = `🔍 Analysis: ${disp(pair)}\n━━━━━━━━━━━━━━\n`;
-    msg += `${dE} ${dir}  ${conf}  ${sig.grade?.grade||''}\n`;
-    msg += `${rIcon[rg]||'⚪'} Regime: ${rg}\n`;
-    msg += `📈 HTF: ${sig.higherTFTrend||'NEUTRAL'}\n`;
-    msg += `🔗 Alignment: ${sig.alignment||'MIXED'}\n\n`;
+    // [Bug#1 FIX] every dynamic value escaped (HTML parse_mode is on)
+    let msg = `🔍 Analysis: ${esc(disp(pair))}\n${SEP}\n`;
+    msg += `${dE} <b>${esc(dir)}</b>  ${esc(conf)}  ${sig.grade?.grade ? `[${esc(sig.grade.grade)} ${esc(sig.grade.label || '')}]` : ''}\n`;
+    msg += `${rIcon[rg]||'⚪'} Regime: <b>${esc(rg)}</b>\n`;
+    msg += `📈 HTF: <b>${esc(sig.higherTFTrend||'NEUTRAL')}</b>\n`;
+    msg += `🔗 Alignment: <b>${esc(sig.alignment||'MIXED')}</b>\n${SEP}\n`;
     for (const tf of ['1min','5min','15min']) {
       const r = sig.recommendations?.[tf];
       if (!r) continue;
       const td = r.direction === 'BUY' ? '🟢' : r.direction === 'SELL' ? '🔴' : '⚪';
-      msg += `${td} ${tf}: ${r.direction} ${r.score?.diff?.toFixed(1)||0} diff (${r.confluence})\n`;
+      msg += `${td} ${tf}: <b>${esc(r.direction)}</b> ${r.score?.diff?.toFixed(1)||0} diff (${esc(r.confluence || '')})\n`;
     }
-    if (sig.entryReason)  msg += `\n📝 ${sig.entryReason}\n`;
-    if (sig.regimeAdvice) msg += `💡 ${sig.regimeAdvice}\n`;
+    if (sig.entryReason)  msg += `\n📝 <i>${esc(sig.entryReason)}</i>\n`;
+    if (sig.regimeAdvice) msg += `💡 <i>${esc(sig.regimeAdvice)}</i>\n`;
     const ai = sig.aiValidation;
     if (ai?.status === 'OK') {
-      msg += `\n🤖 AI: ${ai.signal} ${ai.confidence}%`;
-      if (ai.concerns) msg += ` ⚠️ ${ai.concerns}`;
+      msg += `\n🤖 AI: <b>${esc(ai.signal)}</b> ${esc(ai.confidence)}%`;
+      if (ai.concerns) msg += ` ⚠️ ${esc(ai.concerns)}`;
       msg += '\n';
     }
     await sendMsg(cid, msg, env, { reply_markup: kb([[btn('📊 Get Signal', `qs:${norm(pair)}`), btn('🔄 Replay', `cmd:replayhelp`), btn('🔙 Menu', 'cmd:main')]]) });
   } catch (e) {
-    await sendMsg(cid, `❌ Analysis failed: ${e.message}`, env, { reply_markup: mainKb(u) });
+    await sendMsg(cid, `❌ Analysis failed: ${esc(e.message)}`, env, { reply_markup: mainKb(u) });
   }
 }
 
@@ -1594,11 +1654,11 @@ async function doToday(cid, mid, env) {
   const res  = th.filter(x => x.result === 'WIN' || x.result === 'LOSS');
   const wins = res.filter(x => x.result === 'WIN').length;
   const wr   = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
-  let t = `📅 Today — ${today}\n━━━━━━━━━━━━━━\n📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n\n`;
+  let t = `📅 Today — ${today}\n${SEP}\n📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n\n`;
   for (const x of th.slice(0, 8)) {
     const dE = x.direction === 'BUY' ? '🟢' : '🔴';
     const rE = x.result === 'WIN' ? '✅' : x.result === 'LOSS' ? '❌' : x.result === 'CANCEL' ? '🗑' : '⏳';
-    t += `${rE} #${x.no} ${dE} ${disp(x.pair)}${x.grade ? ' ' + x.grade.split(' ')[0] : ''} ${x.confidence}\n`;
+    t += `${rE} #${x.no} ${dE} ${disp(x.pair)}${x.grade ? ' [' + esc(x.grade.split(' ')[0]) + ']' : ''} ${esc(x.confidence || '')}\n`;
   }
   return reply(cid, mid, t, env, kb([[btn('📈 History', 'cmd:history:0'), btn('📉 Risk', 'cmd:risk'), btn('🔙 Back', 'cmd:main')]]));
 }
@@ -1620,12 +1680,12 @@ async function doSummary(cid, mid, env) {
     if (!gm[g]) gm[g] = { w:0, l:0 };
     x.result === 'WIN' ? gm[g].w++ : gm[g].l++;
   }
-  let t = `📅 Daily Summary — ${today}\n━━━━━━━━━━━━━━\n📊 ${th.length} signals  Resolved: ${res.length}\n✅ ${wins}W  ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n`;
+  let t = `📅 Daily Summary — ${today}\n${SEP}\n📊 ${th.length} signals  Resolved: ${res.length}\n✅ ${wins}W  ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n`;
   if (Object.keys(gm).length) {
     t += `\nGrades:\n`;
     for (const [g, s] of Object.entries(gm)) {
       const tt = s.w + s.l;
-      t += `  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w / tt * 100)}%)\n`;
+      t += `  ${esc(g)}: ${s.w}W/${s.l}L (${Math.round(s.w / tt * 100)}%)\n`;
     }
   }
   t += `\n${trend} (all-time: ${allWR}%)`;
@@ -1643,6 +1703,8 @@ async function doCancelAll(cid, mid, env) {
     await setResult(cid, trade.id, 'CANCEL', null, null, env);
     await clearLock(cid, trade.pair, env);
     await kdel(`pt:${trade.id}`, env);
+    // [Bug#4 FIX] drop the stale "expires in ~30s" reminder for cancelled trades
+    await delReminder(trade.id, env);
   }
   await savePendingIds(allIds.filter(id => !myTids.includes(id)), env);
   return reply(cid, mid, `🗑 Cancelled ${pend.length} pending trade(s).`, env, mainKb(u));
@@ -1659,11 +1721,15 @@ async function doManualResult(cid, mid, no, result, env) {
   await setResult(cid, trade.id, result, null, null, env);
   await clearLock(cid, trade.pair, env);
   await kdel(`pt:${trade.id}`, env);
+  // [Bug#4 FIX] drop the stale "expires in ~30s" reminder for resolved trades
+  await delReminder(trade.id, env);
   const ids = await getPendingIds(env);
   await savePendingIds(ids.filter(id => id !== trade.id), env);
   const dE = trade.direction === 'BUY' ? '🟢' : '🔴';
   const rE = result === 'WIN' ? '✅ WIN' : '❌ LOSS';
-  return reply(cid, mid, `${rE} manually set\n\n#${no} ${dE} ${trade.direction} ${disp(trade.pair)}\n${trade.grade || ''}`, env, afterKb());
+  return reply(cid, mid,
+    `${rE} — manually set\n${SEP}\n${dE} #${no} ${trade.direction} ${disp(trade.pair)}${trade.grade ? ` [${esc(trade.grade)}]` : ''}`,
+    env, afterKb());
 }
 
 // ─── SIGNAL FETCH ─────────────────────────────────────────────────────────────
@@ -1678,15 +1744,24 @@ const normMode = (m) => { if (m === 'fx' || m === 'both') return m; return 'ftt'
 async function fetchSig(pair, env, opts = {}) {
   const WORKER_URL = 'https://fttotcv6.umuhammadiswa.workers.dev';
   const mode = workerModeParam(opts.mode);
-  const req = new Request(`${WORKER_URL}/api/signal?pair=${pair}${mode}`, { headers: { Accept: 'application/json' } });
+  const url  = `${WORKER_URL}/api/signal?pair=${pair}${mode}`;
+  // [Bug#6 FIX] the 20s race now covers fetch AND res.json(), so a slow or
+  // hanging response body can never leave the user's message stuck on
+  // "⏳ Fetching…" — the caller always gets a rejection to render.
+  const withTimeout = async (p, label) => {
+    let timer;
+    const timeoutP = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(label)), 20000); });
+    try { return await Promise.race([p, timeoutP]); }
+    finally {
+      clearTimeout(timer);
+      p.catch(() => {}); // swallow late rejection of the losing promise
+    }
+  };
   const res = env.SIGNAL_WORKER
-    ? await Promise.race([
-        env.SIGNAL_WORKER.fetch(req),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('Service binding timeout 20s')), 20000)),
-      ])
-    : await fetch(`${WORKER_URL}/api/signal?pair=${pair}${mode}`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
+    ? await withTimeout(env.SIGNAL_WORKER.fetch(new Request(url, { headers: { Accept: 'application/json' } })), 'Service binding timeout 20s')
+    : await fetch(url, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text().catch(() => '')).slice(0, 150)}`);
-  return res.json();
+  return withTimeout(res.json(), 'Signal worker response timeout 20s');
 }
 
 async function fetchPrice(pair, env) {
@@ -1762,7 +1837,7 @@ async function autoScan(env, log) {
         // Only notify once (when the event starts, minsAway close to 0)
         if (Math.abs(newsAlert.minsAway) <= intervalMin) {
           const sign = newsAlert.minsAway >= 0 ? 'in' : 'ago';
-          await sendMsg(cid, `🚫 Auto scan paused\n${newsAlert.title} (${newsAlert.currency}) ${sign} ${Math.abs(newsAlert.minsAway)}min\n\nSignals resume after the news window.`, env);
+          await sendMsg(cid, `🚫 Auto scan paused\n${SEP}\n⚠️ ${esc(newsAlert.title)} (${esc(newsAlert.currency)}) ${sign} ${Math.abs(newsAlert.minsAway)}min\n${SEP}\n\nSignals resume after the news window.`, env);
         }
         continue;
       }
@@ -1805,7 +1880,7 @@ async function autoScan(env, log) {
             if (passesAlert && !passesMain) {
               // Alert-triggered signal (bypassed normal filter)
               await sendMsg(cid,
-                `🔔 Custom Alert: ${disp(pair)} hit ${sig.confidence}% (your threshold: ${alertConf}%)\n\n` +
+                `🔔 Custom Alert: ${esc(disp(pair))} hit ${esc(sig.confidence)}% (your threshold: ${alertConf}%)\n\n` +
                 fmtSignal(data, pair, intervalMin, no, msgOpts),
                 env, { reply_markup: signalKb(no) });
             } else {
@@ -1876,52 +1951,78 @@ async function resultCheck(env, log) {
   if (!ids.length) return;
   log(`Results: ${ids.length} pending`);
   const now = Date.now(), keep = [];
+
+  // Premium result card + risk/milestone bookkeeping
+  const finish = async (t, tid, current, result, hitNote, lateMin) => {
+    const entry = parseFloat(t.entryPrice);
+    const diff  = current - entry;
+    const pips  = isCr(t.pair) ? Math.round(Math.abs(diff) * 100) / 100 : Math.round(Math.abs(diff) * 10000 * 10) / 10;
+    const unit  = isCr(t.pair) ? '$' : ' pips';
+    await setResult(t.chatId, tid, result, current, pips, env);
+    await clearLock(t.chatId, t.pair, env);
+    await kdel(`pt:${tid}`, env);
+    await delReminder(tid, env);
+    const dE    = t.direction === 'BUY' ? '🟢' : '🔴';
+    const rE    = result === 'WIN' ? '✅ WIN' : '❌ LOSS';
+    const gS    = t.grade ? ` [${esc(t.grade)}]` : '';
+    const lateS = lateMin > 1 ? ` (+${lateMin}min)` : '';
+    const hitS  = hitNote ? ` (${hitNote})` : '';
+    await sendMsg(t.chatId,
+      `📊 Result — Signal #${t.signalNo || tid}${lateS}${hitS}\n${SEP}\n${rE}  ${dE} ${t.direction} ${disp(t.pair)}${gS}\n${SEP}\n💰 Entry: ${fmtPrice(entry, t.pair)}\n🏁 Exit:  ${fmtPrice(current, t.pair)}\n📏 Move:  ${diff > 0 ? '+' : ''}${pips}${unit}`,
+      env, { reply_markup: afterKb() });
+    // Risk alert
+    const risk = await updateRisk(t.chatId, result, env);
+    if (risk.type === 'LOSS' && risk.streak >= 3) {
+      await sendMsg(t.chatId,
+        `⚠️ Risk Alert — ${risk.streak} Consecutive Losses\n\nConsider taking a break or reducing trade size.`,
+        env, { reply_markup: kb([[btn('🏆 Check Stats', 'cmd:stats'), btn('🔕 Stop Auto', 'cmd:toggle_auto')],[btn('🔙 Continue', 'cmd:main')]]) });
+    }
+    await checkMilestone(t.chatId, env);
+  };
+
+  const skipTrade = async (t, tid, reason) => {
+    await setResult(t.chatId, tid, 'SKIP', null, null, env);
+    await clearLock(t.chatId, t.pair, env);
+    await kdel(`pt:${tid}`, env);
+    await delReminder(tid, env);
+    await sendMsg(t.chatId, `⏭ Tracking #${t.signalNo || tid} — ${reason}`, env, { reply_markup: afterKb() });
+  };
+
   for (const tid of ids) {
     try {
       const t = await kget(`pt:${tid}`, env);
       if (!t) continue;
-      if (t.expiryAt > now) { keep.push(tid); continue; }
-      const cur = await fetchPrice(t.pair, env);
-      if (!cur || !t.entryPrice) {
-        await setResult(t.chatId, tid, 'SKIP', null, null, env);
-        await clearLock(t.chatId, t.pair, env);
-        await kdel(`pt:${tid}`, env);
-        await sendMsg(t.chatId, `⏭ Tracking No. ${t.signalNo || tid} — price unavailable`, env, { reply_markup: afterKb() });
+      const isFx = !!(t.sl && t.tp);
+
+      // [Bug#5 FIX] FX trade inside its 60min horizon: resolve only on SL/TP hit
+      if (t.expiryAt > now) {
+        if (isFx) {
+          const cur = await fetchPrice(t.pair, env);
+          if (!cur) { keep.push(tid); continue; }
+          const current = parseFloat(cur);
+          const sl = parseFloat(t.sl), tp = parseFloat(t.tp);
+          if (isNaN(current) || isNaN(sl) || isNaN(tp)) { keep.push(tid); continue; }
+          const hitTp = t.direction === 'BUY' ? current >= tp : current <= tp;
+          const hitSl = t.direction === 'BUY' ? current <= sl : current >= sl;
+          if (hitTp)      await finish(t, tid, current, 'WIN',  '🎯 TP hit', 0);
+          else if (hitSl) await finish(t, tid, current, 'LOSS', '🛑 SL hit', 0);
+          else            keep.push(tid);
+        } else {
+          keep.push(tid);
+        }
         continue;
       }
+
+      // Horizon expired → resolve by price direction (FTT) / fallback (FX)
+      const cur = await fetchPrice(t.pair, env);
+      if (!cur || !t.entryPrice) { await skipTrade(t, tid, 'price unavailable'); continue; }
       const entry   = parseFloat(t.entryPrice);
       const current = parseFloat(cur);
-      if (isNaN(entry) || isNaN(current)) {
-        await setResult(t.chatId, tid, 'SKIP', null, null, env);
-        await clearLock(t.chatId, t.pair, env);
-        await kdel(`pt:${tid}`, env);
-        await sendMsg(t.chatId, `⏭ Tracking No. ${t.signalNo || tid} — invalid price data`, env, { reply_markup: afterKb() });
-        continue;
-      }
+      if (isNaN(entry) || isNaN(current)) { await skipTrade(t, tid, 'invalid price data'); continue; }
       const diff   = current - entry;
       const result = t.direction === 'BUY' ? (diff > 0 ? 'WIN' : 'LOSS') : (diff < 0 ? 'WIN' : 'LOSS');
-      const pips   = isCr(t.pair) ? Math.round(Math.abs(diff) * 100) / 100 : Math.round(Math.abs(diff) * 10000 * 10) / 10;
-      const unit   = isCr(t.pair) ? '$' : ' pips';
-      await setResult(t.chatId, tid, result, current, pips, env);
-      await clearLock(t.chatId, t.pair, env);
-      await kdel(`pt:${tid}`, env);
-      await delReminder(tid, env);
-      const late  = Math.round((now - t.expiryAt) / 60000);
-      const lateS = late > 1 ? ` (+${late}min)` : '';
-      const dE    = t.direction === 'BUY' ? '🟢' : '🔴';
-      const rE    = result === 'WIN' ? '✅ WIN' : '❌ LOSS';
-      const gS    = t.grade ? `  ${t.grade}` : '';
-      await sendMsg(t.chatId,
-        `📊 Tracking No. ${t.signalNo || tid}${lateS}\n━━━━━━━━━━━━━━\n${rE}  ${dE} ${t.direction} ${disp(t.pair)}${gS}\n💰 Entry:  ${fmtPrice(entry, t.pair)}\n🏁 Exit:   ${fmtPrice(current, t.pair)}\n📏 Move:   ${diff > 0 ? '+' : ''}${pips}${unit}`,
-        env, { reply_markup: afterKb() });
-      // Risk alert
-      const risk = await updateRisk(t.chatId, result, env);
-      if (risk.type === 'LOSS' && risk.streak >= 3) {
-        await sendMsg(t.chatId,
-          `⚠️ Risk Alert — ${risk.streak} Consecutive Losses\n\nConsider taking a break or reducing trade size.`,
-          env, { reply_markup: kb([[btn('🏆 Check Stats', 'cmd:stats'), btn('🔕 Stop Auto', 'cmd:toggle_auto')],[btn('🔙 Continue', 'cmd:main')]]) });
-      }
-      await checkMilestone(t.chatId, env);
+      const late   = Math.round((now - t.expiryAt) / 60000);
+      await finish(t, tid, current, result, isFx ? '⏰ 60min horizon' : null, late);
     } catch (e) { log(`Result ${tid}: ${e.message}`); keep.push(tid); }
   }
   await savePendingIds(keep, env);
@@ -1944,7 +2045,7 @@ async function dailySummary(env, log) {
       const res  = th.filter(x => x.result === 'WIN' || x.result === 'LOSS');
       const wins = res.filter(x => x.result === 'WIN').length;
       const wr   = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
-      await sendMsg(cid, `📅 Daily Summary — ${today}\n━━━━━━━━━━━━━━\n📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n⏳ Pending: ${th.filter(x => !x.result).length}`, env, { reply_markup: kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')]]) });
+      await sendMsg(cid, `📅 Daily Summary — ${today}\n${SEP}\n📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n⏳ Pending: ${th.filter(x => !x.result).length}`, env, { reply_markup: kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')]]) });
       await kput(`ds:${cid}`, Date.now(), env);
       log(`Summary sent to ${cid}`);
     } catch (e) { log(`Summary ${cid}: ${e.message}`); }
@@ -1961,7 +2062,7 @@ async function expiryReminder(env, log) {
       if (!r) continue;
       if (r.remAt > now) { remaining.push(tid); continue; }
       const dE = r.direction === 'BUY' ? '🟢' : '🔴';
-      await sendMsg(r.chatId, `⏰ Signal #${r.signalNo} expires in ~30s\n${dE} ${r.direction} ${disp(r.pair)}`, env);
+      await sendMsg(r.chatId, `⏰ Signal #${r.signalNo} expires in ~30s\n${SEP}\n${dE} <b>${esc(r.direction)}</b> ${esc(disp(r.pair))}`, env);
       await kdel(`rem:${tid}`, env);
       log(`Reminder sent #${r.signalNo}`);
     } catch (e) { log(`Reminder ${tid}: ${e.message}`); remaining.push(tid); }
@@ -2007,8 +2108,8 @@ async function checkMilestone(cid, env) {
       if (!pm[x.pair]) pm[x.pair] = { w:0, l:0 };
       x.result === 'WIN' ? pm[x.pair].w++ : pm[x.pair].l++;
     }
-    let t = `🏁 ${MILESTONE}-Signal Report (#${batch[batch.length-1]?.no||'?'} to #${batch[0]?.no||'?'})\n━━━━━━━━━━━━━━\n✅ ${wins}W  ❌ ${batch.length - wins}L\n📊 Win Rate: ${wr}%\n\nGrades:\n`;
-    for (const [g,s] of Object.entries(gm)) { const tt=s.w+s.l; t += `  ${g}: ${s.w}W/${s.l}L (${Math.round(s.w/tt*100)}%)\n`; }
+    let t = `🏁 ${MILESTONE}-Signal Report (#${batch[batch.length-1]?.no||'?'} to #${batch[0]?.no||'?'})\n${SEP}\n✅ ${wins}W  ❌ ${batch.length - wins}L\n📊 Win Rate: ${wr}%\n\nGrades:\n`;
+    for (const [g,s] of Object.entries(gm)) { const tt=s.w+s.l; t += `  ${esc(g)}: ${s.w}W/${s.l}L (${Math.round(s.w/tt*100)}%)\n`; }
     t += `\nTop Pairs:\n`;
     Object.entries(pm).sort((a,b)=>(b[1].w+b[1].l)-(a[1].w+a[1].l)).slice(0,4)
       .forEach(([p,s]) => { const tt=s.w+s.l; t += `  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w/tt*100)}%)\n`; });
