@@ -4,80 +4,61 @@ PR: `arena/019fd350-ftt-telegram-bot` → `main` (reviewer must approve before m
 
 ---
 
-## 0. v4.4 — Arena-style menu redesign (Quick Actions + Premium + Settings)
+## 0. v4.4 — Arena hub menu (matches Arena screenshot)
 
-### Main menu (`mainKb`) — grouped like Arena UI
+Main menu is a **clean 2×3 category grid** like Arena's attachment menu — not a long list of every feature.
+
+### Main hub (`mainKb`) — Arena layout
 
 ```
-[Quick Actions]          ← most-used, 1-tap
+📊 Signal Now          👁 Watchlist
+🚀 Premium             ⚡ Quick actions
+📈 History             ⚙️ Settings
+```
+
+Maps to Arena slots:
+| Arena | FTT Bot |
+|-------|---------|
+| New chat | 📊 Signal Now |
+| Photo Styles | 👁 Watchlist |
+| Premium | 🚀 Premium |
+| Quick actions | ⚡ Quick actions |
+| Chat history | 📈 History |
+| Settings | ⚙️ Settings |
+
+### ⚡ Quick actions submenu (`quickKb`)
+
+```
 📊 Signal Now     🔄 Start Auto / 🔕 Stop Auto
-🔍 Scan All       📈 History
-
-[Explore]
-📅 Today    📊 Weekly    🔥 Best Pairs
-📉 Risk     🕐 Heatmap   📒 Journal
-
-[Account]
-👁 Watchlist   ⚙️ Settings   📋 Status
-
-[Premium]
-⭐ Premium     🏆 Stats
+🔍 Scan All       📋 Status
+📅 Today   📊 Weekly   🔥 Best
+📉 Risk    🕐 Heatmap  📒 Journal
+🏆 Stats   📋 Summary
+🔙 Back → main hub
 ```
 
-- **Top = primary** (Signal / Auto / Scan / History) — user gets a signal in one tap
-- Groups are visual (row order + consistent emoji); Telegram has no section headers on inline keyboards
-- All previous commands still reachable (Stats moved next to Premium; Summary via Settings or `/summary`)
-- Main card text via `fmtMainMenu()` — v4.4 badge + Quick Actions · Explore · Account · ⭐ Premium footer
+- Auto toggle stays on Quick actions
+- Explore screens Back → Quick actions + 🏠 Menu
 
-### Settings (`settingsKb`) — unified + Mode prominent
+### Settings — unified + Mode prominent
 
-```
-⚙️ Settings
-━━━ Signal ━━━
-💹 Mode: FTT/FX/BOTH     ← full-width, cycle button
-🎯 Grade Filter          📊 Min Confidence
-⏱ Interval               💱 Pair
+Mode full-width cycle · Grade/Conf/Interval/Pair · AI Only/News/Alerts/Replay/Summary · Channel/Export · Back
 
-━━━ Auto ━━━
-🤖 AI Only               📰 News Block
-🔔 Alerts                🔁 Replay
-📅 Summary               🕐 Time
+### 🚀 Premium placeholder
 
-━━━ Data ━━━
-📡 Channel               ⬇ Export
-🔙 Back
-```
-
-- **settings2 merged into one screen** — `settings2Kb = settingsKb`; `cmd:settings2` still works (redirects)
-- Card text via `fmtSettings()` with Signal / Auto / Data sections + Mode cycle hint
-- Toggle/mode changes re-render the same grouped card (no stale KV re-read)
-
-### Premium placeholder
-
-- ⭐ **Premium** button on main menu → `doPremium`
-- Lists future features (signal priority, more pairs, advanced filters, export, multi-channel…)
-- **Honesty:** informational only — no payment, no unlock; all current features stay free
-- Keyboard: Channel Info + 🔙 Back
-
-### Navigation
-
-- Every submenu keeps **🔙 Back** (settings sub-pickers → Settings; alerts → Settings + Menu; explore → main)
-- ◀ Prev / Next ▶ pagination unchanged (pairs, watchlist, history)
+Future features list. **Honesty:** informational only — no payment.
 
 ### No regression
 
-- All cmd handlers intact: signal, auto, scan, history, stats, today, weekly, best, risk, heatmap, journal, watchlist, settings, status, alerts, cancelall, replay, channel, manual win/loss
-- New only: `cmd:premium`, `cmd:exportinfo`
-- Signal/auto/scan/history logic untouched
+All cmds intact. New: `cmd:quick`, `cmd:premium`, `cmd:exportinfo`.
 
-### Verification (v4.4)
+### Verification
 
 ```
 $ node --check src/index.js     → SYNTAX OK
-$ node menu-test.mjs            → 🎉 ALL MENU TESTS PASSED (68 checks)
+$ node menu-test.mjs            → 🎉 ALL MENU TESTS PASSED
 ```
 
----
 
 ## 0b. v4.3 — Result/History premium + entryHit (final polish)
 
