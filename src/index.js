@@ -1,8 +1,14 @@
 /**
- * FTT Signal Telegram Bot — v4.4 (ARENA-STYLE MENU + PREMIUM UX)
+ * FTT Signal Telegram Bot — v4.4.1 (ROUND-2 BUGFIX: A+ grade + dual-AI + OTC fillStatus)
  * KV Binding     : BOT_KV
  * Service Binding: SIGNAL_WORKER → asignal.umuhammadiswa.workers.dev
  * Secrets        : BOT_TOKEN, SETUP_SECRET
+ *
+ * ── v4.4.1 BUGFIXES (this round) ─────────────────────────────────────────────
+ *  [B1] passGrade drops A+ for grade-filtered users → now includes A+ in A and AB (mirror worker F3-03)
+ *  [B2] passAI dead with dual-combiner shape → now handles {combined,status,combinedAgreed} (mirror worker CHECK-A)
+ *  [INT] fmtSignal/doAnalyze AI block now handles dual-combiner so AI badge still shows
+ *  [INT] fillStatus/entryDistancePct verified for OTC too (bot already rendered it)
  *
  * ── v4.4 ARENA-STYLE MENU (hub like Arena screenshot) ────────────────────────
  *  [M1] mainKb = clean 2×3 grid (Arena pattern):
@@ -180,7 +186,7 @@ export default {
         },
       });
     }
-    return new Response('FTT Signal Bot v4.4');
+    return new Response('FTT Signal Bot v4.4.1');
   },
 
   async scheduled(e, env, ctx) {
@@ -533,20 +539,28 @@ async function logAndSchedule(cid, pair, sig, env) {
 // ─── FILTERS ──────────────────────────────────────────────────────────────────
 
 // [Fix#3] 'AB'.includes('') was true — fixed with ['A','B'].includes(g)
+// BUG-B1 (High) FIX v4.4.1 — mirror worker F3-03: include A+ in A and AB filters
 const passGrade = (sig, f) => {
   if (!f || f === 'ALL') return true;
   const g = sig.grade?.grade || '';
   if (!g) return false;
-  return f === 'A' ? g === 'A' : f === 'AB' ? ['A', 'B'].includes(g) : true;
+  return f === 'A' ? ['A+', 'A'].includes(g) : f === 'AB' ? ['A+', 'A', 'B'].includes(g) : true;
 };
 const passConf = (sig, min) => {
   if (!min) return true;
   return parseInt((sig.confidence || '0%').replace('%', ''), 10) >= min;
 };
 // [F02] AI-Only filter
+// BUG-B2 (High) FIX v4.4.1 — mirror worker CHECK-A/Bug-006: dual-combiner shape
+// worker standard-engine now returns { cerebras, groq, combined, combinedAgreed, agrees }
+// with NO top-level status; OTC still returns { status, agrees }.
 const passAI = (sig, aiOnly) => {
   if (!aiOnly) return true;
-  return sig.aiValidation?.status === 'OK' && sig.aiValidation?.agrees === true;
+  const v = sig?.aiValidation;
+  if (!v) return false;
+  const status = v.status || (v.combined && v.combined.status);
+  const agreed = v.agrees !== undefined ? v.agrees : v.combinedAgreed;
+  return status === 'OK' && agreed === true;
 };
 
 // ─── CANDLE HELPERS ───────────────────────────────────────────────────────────
@@ -747,7 +761,7 @@ const modeLabel = m => m === 'fx' ? 'FX' : m === 'both' ? 'BOTH' : 'FTT';
 
 // Arena hub card (status + 6-button grid below)
 function fmtMainMenu(u, cnt, wr, resolvedN) {
-  return `FTT Signal Bot v4.4\n${SEP}\n` +
+  return `FTT Signal Bot v4.4.1\n${SEP}\n` +
     `💱 ${esc(disp(u.pair))} · ${u.interval}min · ${modeLabel(u.fxMode)}\n` +
     `🔄 Auto: ${u.autoEnabled ? 'ON ✅' : 'OFF'}  👁 Watchlist: ${u.watchlist.length} pairs\n` +
     `🎯 Grade: ${esc(u.gradeFilter || 'ALL')}  🤖 AI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}\n` +
@@ -878,18 +892,28 @@ function fmtSignal(data, pair, interval, no, opts = {}) {
     if (reason) msg += `📝 <i>${esc(reason)}</i>\n`;
 
     // ── AI block (compact, leveled status) ─────────────────────────────────
-    const ai = sig.aiValidation;
-    if (ai && ai.status === 'OK') {
-      const st = ai.agrees === true
-        ? '✅ <b>AGREE</b>'
-        : (ai.agrees === false && ai.signal !== 'NO_TRADE')
-          ? '⚠️ <b>DISAGREE</b>'
-          : '🤔 <b>UNCERTAIN</b>';
-      const aiSig = (ai.agrees === true || (ai.agrees === false && ai.signal !== 'NO_TRADE'))
-        ? `<b>${esc(ai.signal)}</b>` : '<b>NO_TRADE</b>';
-      msg += `🤖 AI: ${st} — ${aiSig} (${esc(ai.confidence)}%)\n`;
-      if (ai.reason)   msg += `💬 <i>${esc(ai.reason)}</i>\n`;
-      if (ai.concerns) msg += `🔍 <i>${esc(ai.concerns)}</i>\n`;
+    // v4.4.1 INTEGRATION FIX: worker now returns dual-combiner { cerebras, groq, combined, combinedAgreed, agrees }
+    // for standard engine, and { status, agrees } for OTC. Extract from combined fallback so AI block still shows.
+    const aiRaw = sig.aiValidation;
+    if (aiRaw) {
+      const aiStatus = aiRaw.status || (aiRaw.combined && aiRaw.combined.status);
+      if (aiStatus === 'OK') {
+        const aiAgrees = aiRaw.agrees !== undefined ? aiRaw.agrees : aiRaw.combinedAgreed;
+        const aiSignal = aiRaw.signal || (aiRaw.combined && aiRaw.combined.signal);
+        const aiConf   = aiRaw.confidence ?? (aiRaw.combined && aiRaw.combined.confidence);
+        const aiReason = aiRaw.reason || (aiRaw.combined && aiRaw.combined.reason);
+        const aiConcerns = aiRaw.concerns || (aiRaw.combined && aiRaw.combined.concerns);
+        const st = aiAgrees === true
+          ? '✅ <b>AGREE</b>'
+          : (aiAgrees === false && aiSignal !== 'NO_TRADE')
+            ? '⚠️ <b>DISAGREE</b>'
+            : '🤔 <b>UNCERTAIN</b>';
+        const aiSig = (aiAgrees === true || (aiAgrees === false && aiSignal !== 'NO_TRADE'))
+          ? `<b>${esc(aiSignal)}</b>` : '<b>NO_TRADE</b>';
+        msg += `🤖 AI: ${st} — ${aiSig} (${esc(aiConf)}%)\n`;
+        if (aiReason)   msg += `💬 <i>${esc(aiReason)}</i>\n`;
+        if (aiConcerns) msg += `🔍 <i>${esc(aiConcerns)}</i>\n`;
+      }
     }
 
     // ── Blocked filters (D2 transparency, badge style) ─────────────────────
@@ -897,7 +921,9 @@ function fmtSignal(data, pair, interval, no, opts = {}) {
     const d2 = filters.filter(f => f.includes('D2_') || f.includes('BLOCK'));
     if (d2.length) msg += `🚫 <b>Blocked:</b> ${d2.map(f => `<code>${esc(f)}</code>`).join(' ')}\n`;
 
-    if (reason || (ai && ai.status === 'OK')) msg += SEP + '\n';
+    // v4.4.1: use aiRaw for sep check (dual-combiner)
+    const aiForSep = aiRaw ? (aiRaw.status || (aiRaw.combined && aiRaw.combined.status)) : null;
+    if (reason || aiForSep === 'OK') msg += SEP + '\n';
 
     // ── Warnings block (news / correlation) ────────────────────────────────
     if (opts.newsAlert) {
@@ -1757,11 +1783,18 @@ async function doAnalyze(cid, mid, pairRaw, env) {
     }
     if (sig.entryReason)  msg += `\n📝 <i>${esc(sig.entryReason)}</i>\n`;
     if (sig.regimeAdvice) msg += `💡 <i>${esc(sig.regimeAdvice)}</i>\n`;
-    const ai = sig.aiValidation;
-    if (ai?.status === 'OK') {
-      msg += `\n🤖 AI: <b>${esc(ai.signal)}</b> ${esc(ai.confidence)}%`;
-      if (ai.concerns) msg += ` ⚠️ ${esc(ai.concerns)}`;
-      msg += '\n';
+    // v4.4.1 INTEGRATION FIX: dual-combiner support for doAnalyze too
+    const aiA = sig.aiValidation;
+    if (aiA) {
+      const aiAStatus = aiA.status || (aiA.combined && aiA.combined.status);
+      if (aiAStatus === 'OK') {
+        const aiASig = aiA.signal || (aiA.combined && aiA.combined.signal);
+        const aiAConf = aiA.confidence ?? (aiA.combined && aiA.combined.confidence);
+        const aiAConc = aiA.concerns || (aiA.combined && aiA.combined.concerns);
+        msg += `\n🤖 AI: <b>${esc(aiASig)}</b> ${esc(aiAConf)}%`;
+        if (aiAConc) msg += ` ⚠️ ${esc(aiAConc)}`;
+        msg += '\n';
+      }
     }
     await sendMsg(cid, msg, env, { reply_markup: kb([[btn('📊 Get Signal', `qs:${norm(pair)}`), btn('🔄 Replay', `cmd:replayhelp`), btn('🔙 Menu', 'cmd:main')]]) });
   } catch (e) {
