@@ -2039,24 +2039,12 @@ async function autoScan(env, log) {
 
             // Build message options
             const msgOpts = { correlated: corrWarnings, mode: normMode(u.fxMode) };
-            if (passesAlert && !passesMain) {
-              // Alert-triggered signal (bypassed normal filter)
-              await sendMsg(cid,
-                `🔔 Custom Alert: ${esc(disp(pair))} hit ${esc(sig.confidence)}% (your threshold: ${alertConf}%)\n\n` +
-                fmtSignal(data, pair, intervalMin, no, msgOpts),
-                env, { reply_markup: signalKb(no) });
-            } else {
-              await sendMsg(cid, fmtSignal(data, pair, intervalMin, no, msgOpts), env, { reply_markup: signalKb(no) });
-            }
+            // [B3] Dropped custom-alert / fmtSignal pushes from bot autoScan — worker delivers; see PR note.
+            // Custom Alerts (F09) disabled for signal delivery; /alerts UI kept for future worker integration.
 
-            // [F10] Mirror to channel
-            if (u.channelId) {
-              await sendMsg(u.channelId, fmtSignal(data, pair, intervalMin, no, { mode: normMode(u.fxMode) }), env, { reply_markup: channelKb() })
-                .catch(e => log(`Channel ${u.channelId}: ${e.message}`));
-            }
-
+            // [B3] Signal delivery now handled by worker push only; bot keeps analytics
             await kput(scKey, currentCandle, env, { expirationTtl: intervalMin * 60 + 60 });
-            log(`Sent #${no} ${pair} ${dir}`);
+            log(`Analysed #${no} ${pair} ${dir}`);
             anySignalSent = true;
 
             // [Fix#2] Confidence trend alert
