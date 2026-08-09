@@ -66,7 +66,7 @@ ok('Settings: Interval', setBody.includes('cmd:intervals'));
 ok('Settings: Pair', setBody.includes('pairpage:0'));
 ok('Settings: AI Only', setBody.includes('cmd:aionly'));
 ok('Settings: News Block', setBody.includes('cmd:blocknews'));
-ok('Settings: Alerts', setBody.includes('cmd:alerts'));
+ok('Settings: Alerts removed (F09 dead UI dropped in BUG-B3)', !setBody.includes('cmd:alerts'));
 ok('Settings: Replay', setBody.includes('cmd:replayhelp'));
 ok('Settings: Channel', setBody.includes('cmd:channelinfo'));
 ok('Settings: Export', setBody.includes('cmd:exportinfo'));
@@ -92,10 +92,12 @@ ok('settings2Kb alias', /const settings2Kb = settingsKb/.test(src));
 const core = [
   'cmd:signal', 'cmd:toggle_auto', 'cmd:scanall', 'cmd:status', 'cmd:stats',
   'cmd:watchlist', 'cmd:today', 'cmd:summary', 'cmd:settings', 'cmd:journal',
-  'cmd:weekly', 'cmd:risk', 'cmd:heatmap', 'cmd:best', 'cmd:alerts',
+  'cmd:weekly', 'cmd:risk', 'cmd:heatmap', 'cmd:best',
   'cmd:cancelall', 'cmd:premium', 'cmd:exportinfo', 'cmd:quick',
 ];
 for (const c of core) ok(`handler: ${c}`, src.includes(`'${c}'`));
+// F09 removed under BUG-B3 — no dead alerts callback may remain
+ok('no alert callback handlers remain (F09 dropped)', !src.includes("'alertpage:") && !src.includes("'alertset:") && !src.includes("'alertdel:"));
 
 // Auto toggle returns to quickKb (not main clutter)
 ok('doToggle uses quickKb', /async function doToggle[\s\S]{0,2000}quickKb\(u\)/.test(src));

@@ -99,6 +99,53 @@ ok('fmtSignal uses worker provided countdown label (not local calc)', src.includ
 ok('fmtSignal AI block handles dual-combiner (aiRaw + combined fallback)', src.includes("aiRaw") && src.includes("combined") && src.includes("aiStatus"));
 ok('doAnalyze AI block handles dual-combiner', src.includes("aiA") && src.includes("combined"));
 
+console.log('\n═══ BUG-B3: duplicate signal pushes eliminated (Option A) ═══\n');
+
+// Extract just the autoScan body so the assertions target only the cron-driven
+// scan (doSignal/doQuickSignal/doScanAll are manual triggers and MUST keep sends).
+const a0 = src.indexOf('async function autoScan');
+const a1 = src.indexOf('async function resultCheck');
+const autoScanSrc = src.slice(a0, a1);
+
+// autoScan keeps bot-side analytics + bookkeeping
+ok('autoScan keeps logAndSchedule (bot history/pending/lock)', autoScanSrc.includes('await logAndSchedule(cid, pair, sig, env)'));
+ok('autoScan keeps candle-dedup bookkeeping (kput scKey)', autoScanSrc.includes('await kput(scKey, currentCandle, env'));
+ok('autoScan keeps anySignalSent / noTradeStreak bookkeeping', autoScanSrc.includes('anySignalSent = true'));
+ok('autoScan keeps confidence-trend tracker', autoScanSrc.includes('updateConfTrend'));
+ok('autoScan keeps same-candle gate (lc:)', autoScanSrc.includes('`lc:${cid}`'));
+ok('autoScan keeps lock check (lock:)', autoScanSrc.includes('getLock(cid, pair, env)'));
+
+// autoScan must NOT send signal cards — worker push is the single source
+ok('autoScan has NO sendMsg(cid, fmtSignal( — bot signal push removed', !autoScanSrc.includes('sendMsg(cid, fmtSignal('));
+ok('autoScan has NO custom-alert delivery (getAlerts/passesAlert gone)', !autoScanSrc.includes('getAlerts') && !autoScanSrc.includes('passesAlert') && !autoScanSrc.includes('Custom Alert'));
+ok('autoScan has NO channel mirror send (fmtSignal via channel)', !autoScanSrc.includes('sendMsg(u.channelId'));
+ok('autoScan has no OTHER fmtSignal(message) send', !autoScanSrc.includes('fmtSignal(data, pair, intervalMin'));
+
+// Bot-only analytics crons are all preserved
+ok('resultCheck kept (bot-only analytics)', src.includes('async function resultCheck'));
+ok('expiryReminder kept (bot-only analytics)', src.includes('async function expiryReminder'));
+ok('dailySummary kept (bot-only analytics)', src.includes('async function dailySummary'));
+ok('weeklyReport kept (bot-only analytics)', src.includes('async function weeklyReport'));
+
+// Custom Alerts (F09) dead UI removed — no half-working feature left behind
+ok('dead /alerts menu handler removed (no doAlerts)', !src.includes('async function doAlerts'));
+ok('dead alert KV helpers removed (no getAlerts/setAlert/delAlert)', !src.includes('async function getAlerts') && !src.includes('async function setAlert') && !src.includes('async function delAlert'));
+ok('no cmd:alerts callback routing', !src.includes("data === 'cmd:alerts'"));
+ok('no /alerts command', !src.includes("text.startsWith('/alerts')"));
+ok('no alert keyboards left (alertsKb/alertPairsKb/alertConfKb)', !src.includes('const alertsKb') && !src.includes('const alertPairsKb') && !src.includes('const alertConfKb'));
+
+// No NEW duplication introduced: only the 3 manual triggers still send signal cards
+ok('manual signal sends preserved (doSignal/doQuickSignal/doScanAll = 3 sites)', (src.match(/sendMsg\(cid, fmtSignal\(/g) || []).length === 3);
+
+console.log('\n═══ BUG-B4: permanent Cloudflare 1042 fix in repo ═══\n');
+
+const toml = readFileSync('./wrangler.toml', 'utf8');
+ok('wrangler.toml has compatibility_flags', toml.includes('compatibility_flags'));
+ok('wrangler.toml flag = global_fetch_strictly_public', toml.includes('global_fetch_strictly_public'));
+ok('wrangler.toml keeps BOT_KV binding', toml.includes('BOT_KV') && toml.includes('39653d1f9b5147259cf3791658f131d7'));
+ok('wrangler.toml keeps SIGNAL_WORKER service binding → fttotcv6', toml.includes('SIGNAL_WORKER') && toml.includes('fttotcv6'));
+ok('wrangler.toml keeps cron trigger', toml.includes('[triggers]') && toml.includes('*/5 * * * *'));
+
 console.log(`\n═══ Result: ${pass} passed, ${fail} failed ═══\n`);
 if (fail>0) process.exit(1);
 console.log('🎉 ALL BUGFIX + INTEGRATION TESTS PASSED\n');

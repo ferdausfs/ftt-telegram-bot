@@ -1,6 +1,10 @@
 name = "ftt-telegram-bot"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
+# BUG-B4: global_fetch_strictly_public prevents Cloudflare error 1042 on the
+# bot→worker service-binding fetch (SIGNAL_WORKER). Must stay in the repo so
+# GitHub-Actions deploys carry it (previously only patched at runtime).
+compatibility_flags = ["global_fetch_strictly_public"]
 
 [triggers]
 crons = ["*/5 * * * *"]
@@ -13,4 +17,3 @@ id = "39653d1f9b5147259cf3791658f131d7"
 [[services]]
 binding = "SIGNAL_WORKER"
 service = "fttotcv6"
-

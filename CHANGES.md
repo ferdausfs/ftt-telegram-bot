@@ -1,3 +1,51 @@
+# CHANGES — v4.4.2 Round-2 Bugfix (no-duplicate signals + permanent 1042 fix)
+
+PR: `arena/019fe4bb-ftt-telegram-bot` → `main` (reviewer must approve before merge; no direct push to main).
+
+---
+
+## Round-2 bugfix — BUG-B3 (duplicate signals) + BUG-B4 (permanent 1042 fix)
+
+### BUG-B3 — eliminate duplicate signal pushes (Option A: worker push is the single source)
+
+**Root cause:** two independent push paths were sending the same signal to the same Telegram users:
+- **Worker** `*/2` cron → `pushSignalToSubscribers` → sendMessage (has `claimPushLock` + pushLog dedup).
+- **Bot** `*/5` cron → `cronLite` → `autoScan` → `sendMsg(cid, fmtSignal(...))` per user per pair.
+
+After worker BUG-001 was fixed (push now fires reliably), the bot's autoScan send became a redundant **second** sender.
+
+**Fix (Option A — chosen):** `autoScan` no longer sends any signal card. It keeps only bot-side analytics and bookkeeping:
+- `logAndSchedule` (history `h:`, pending `pt:`, lock, reminder) so result tracking / daily summary / weekly report / stats keep working.
+- candle-dedup keys `sc:` + `lc:`, `lock:` check, `errcnt:`/`noTradeStreak` bookkeeping, and the confidence-trend tracker.
+- **Removed from autoScan:** the `sendMsg(cid, fmtSignal(...))` signal push, the custom-alert push, and the channel mirror (`sendMsg(u.channelId, fmtSignal(...))`).
+
+Result: **exactly ONE Telegram signal per trigger** (worker push). Manual triggers (`doSignal` / `doQuickSignal` / `doScanAll`) are untouched and still send — those are user-initiated, not duplicates.
+
+**Custom Alerts (F09) — removed (not left half-working):** alerts could only fire on bot push, and bot push is now gone. The dead `/alerts` UI, callback handlers, keyboards and alert KV helpers were stripped rather than leaving users able to configure alerts that never fire. Worker-side alert thresholds are tracked as a **separate worker PR**.
+
+**Channel mode (F10):** the autoScan channel mirror was removed with the other cron-driven sends (it would duplicate worker push to the channel). `/setchannel` + `/clearchannel` config UI is kept; channel delivery now rides on worker push.
+
+**Preserved (bot-only analytics, no worker equivalent):** `resultCheck`, `expiryReminder`, `dailySummary`, `weeklyReport` — all untouched.
+
+### BUG-B4 — permanent Cloudflare 1042 fix in repo
+
+`wrangler.toml` now carries:
+
+```toml
+compatibility_flags = ["global_fetch_strictly_public"]
+```
+
+This stops the bot→worker service-binding fetch (SIGNAL_WORKER) from regressing with Cloudflare `error 1042` on GitHub-Actions deploys (previously only patched at runtime via the Cloudflare API). `[triggers]`, `[[kv_namespaces]] BOT_KV`, and `[[services]] SIGNAL_WORKER → fttotcv6` are unchanged.
+
+### Verification
+
+- `node --check src/index.js` → pass
+- `node round2-bugfix-test.mjs` → **60/60** (35 original + 25 new BUG-B3/B4 asserts)
+- `node menu-test.mjs` → **74/74** (updated for the removed Alerts button)
+- `sendMsg(cid, fmtSignal(` now appears **only** in `doSignal`/`doQuickSignal`/`doScanAll` (3 sites — manual, correct).
+
+---
+
 # CHANGES — v4.4 Arena-style Menu Redesign (+ v4.3 Premium UX)
 
 PR: `arena/019fd350-ftt-telegram-bot` → `main` (reviewer must approve before merge; no direct push to main).

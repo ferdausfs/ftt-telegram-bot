@@ -1,10 +1,25 @@
 /**
- * FTT Signal Telegram Bot — v4.4.1 (ROUND-2 BUGFIX: A+ grade + dual-AI + OTC fillStatus)
+ * FTT Signal Telegram Bot — v4.4.2 (ROUND-2 BUGFIX R2: no-duplicate signals + permanent 1042 fix)
  * KV Binding     : BOT_KV
  * Service Binding: SIGNAL_WORKER → asignal.umuhammadiswa.workers.dev
  * Secrets        : BOT_TOKEN, SETUP_SECRET
  *
- * ── v4.4.1 BUGFIXES (this round) ─────────────────────────────────────────────
+ * ── v4.4.2 BUGFIXES (this round) ─────────────────────────────────────────────
+ *  [B3] Duplicate signal pushes eliminated. Worker push (Phase 10, BUG-001 fixed)
+ *       is now the SINGLE source of auto signal delivery. autoScan no longer sends
+ *       fmtSignal messages (nor custom-alert sends, nor the channel mirror) — it
+ *       only maintains bot-side analytics: logAndSchedule, candle/lock dedup (sc:,
+ *       lc:, lock:), errcnt/noTradeStreak bookkeeping, and the confidence-trend
+ *       tracker. Result is exactly ONE Telegram signal per trigger (worker push).
+ *       Custom Alerts (F09) are REMOVED from the bot because they can only fire on
+ *       bot push (which is gone) — the dead /alerts UI + alert KV helpers were
+ *       stripped rather than left half-working. Worker-side alert thresholds are
+ *       tracked as a separate worker PR.
+ *  [B4] wrangler.toml now carries compatibility_flags = ["global_fetch_strictly_public"]
+ *       so the bot→worker service-binding fetch does not regress with Cloudflare
+ *       error 1042 on GitHub-Actions deploys (previously only patched at runtime).
+ *
+ * ── v4.4.1 BUGFIXES ──────────────────────────────────────────────────────────
  *  [B1] passGrade drops A+ for grade-filtered users → now includes A+ in A and AB (mirror worker F3-03)
  *  [B2] passAI dead with dual-combiner shape → now handles {combined,status,combinedAgreed} (mirror worker CHECK-A)
  *  [INT] fmtSignal/doAnalyze AI block now handles dual-combiner so AI badge still shows
@@ -109,8 +124,15 @@
  *        Great for analysis without polluting trade history.
  *  [F09] Custom Alerts — /alerts menu; set per-pair confidence threshold alerts.
  *        Alert fires even if the pair is normally filtered out.
+ *        ⚠ REMOVED in v4.4.2 (BUG-B3): alerts could only fire on bot push, and bot
+ *        push is gone (worker push is the single delivery path). The dead /alerts
+ *        UI, callback handlers and alert KV helpers were removed. Worker-side
+ *        alert thresholds are a separate worker-repo PR.
  *  [F10] Telegram Channel Mode — /setchannel <id>; auto-posts signals to a channel
  *        (bot must be admin). /clearchannel to remove.
+ *        ⚠ v4.4.2 (BUG-B3): the autoScan channel mirror was removed with the other
+ *        cron-driven signal sends (it would duplicate worker push to the channel).
+ *        Channel config UI is kept; channel delivery now rides on worker push.
  */
 
 const PAIR_PAGES = [
@@ -186,7 +208,7 @@ export default {
         },
       });
     }
-    return new Response('FTT Signal Bot v4.4.1');
+    return new Response('FTT Signal Bot v4.4.2');
   },
 
   async scheduled(e, env, ctx) {
@@ -302,19 +324,6 @@ async function updateConfTrend(cid, confStr, env) {
   if (trimmed.length >= 3 && trimmed[0] < trimmed[1] && trimmed[1] < trimmed[2])
     return { alert: true, vals: trimmed.slice(0, 3) };
   return { alert: false };
-}
-
-// [F09] Custom Alerts KV
-async function getAlerts(cid, env) { return (await kget(`alerts:${cid}`, env)) || {}; }
-async function setAlert(cid, pair, minConf, env) {
-  const a = await getAlerts(cid, env);
-  a[norm(pair)] = minConf;
-  await kput(`alerts:${cid}`, a, env);
-}
-async function delAlert(cid, pair, env) {
-  const a = await getAlerts(cid, env);
-  delete a[norm(pair)];
-  await kput(`alerts:${cid}`, a, env);
 }
 
 // ─── [F03] ECONOMIC CALENDAR ──────────────────────────────────────────────────
@@ -591,8 +600,6 @@ const signalKb = (no = null) => {
   return kb(rows);
 };
 
-const channelKb = () => kb([[{ text: '📈 Trade on Quotex', url: QUOTEX_URL }]]);
-
 const afterKb = () => kb([
   [btn('🔁 New Signal', 'cmd:signal'), btn('📈 History', 'cmd:history:0'), btn('🔙 Menu', 'cmd:main')],
 ]);
@@ -627,7 +634,7 @@ const settingsKb = u => {
     [btn(`⏱ Interval: ${u.interval}min`, 'cmd:intervals'), btn(`💱 Pair: ${disp(u.pair)}`, 'pairpage:0')],
     // ── Auto ────────────────────────────────────────────────────────────────
     [btn(`🤖 AI Only: ${u.aiOnlyMode ? 'ON ✅' : 'OFF'}`, 'cmd:aionly'), btn(`📰 News Block: ${u.blockNews !== false ? 'ON ✅' : 'OFF'}`, 'cmd:blocknews')],
-    [btn('🔔 Alerts', 'cmd:alerts'), btn('🔁 Replay', 'cmd:replayhelp')],
+    [btn('🔁 Replay', 'cmd:replayhelp')],
     [btn(`📅 Summary: ${u.dailySummary ? 'ON' : 'OFF'}`, 'cmd:togglesummary'), btn(`🕐 ${u.summaryHour ?? 20}:00 UTC`, 'cmd:summarytime')],
     // ── Data ────────────────────────────────────────────────────────────────
     [btn(`📡 Channel: ${u.channelId ? '✅ Set' : 'None'}`, 'cmd:channelinfo'), btn('⬇ Export', 'cmd:exportinfo')],
@@ -678,40 +685,6 @@ const wlAddKb = (page, wl) => {
   return kb(rows);
 };
 
-// [F09] Alert keyboards
-const alertsKb = (alerts) => {
-  const rows = Object.entries(alerts).map(([pair, conf]) => [
-    btn(`🔔 ${disp(pair)} ≥${conf}%`, `alertpair:${pair}:0`),
-    btn('🗑', `alertdel:${pair}:0`),
-  ]);
-  rows.push([btn('➕ Add/Edit Alert', 'alertpage:0')]);
-  rows.push([btn('🔙 Back', 'cmd:settings'), btn('🏠 Menu', 'cmd:main')]);
-  return kb(rows);
-};
-
-const alertPairsKb = (page, alerts) => {
-  page = Math.max(0, Math.min(page, PAIR_PAGES.length - 1));
-  const rows = chunk(PAIR_PAGES[page], 2).map(row =>
-    row.map(p => {
-      const code = norm(p);
-      const has  = alerts[code];
-      return btn(has ? `🔔 ${p} (${has}%)` : p, `alertpair:${code}:${page}`);
-    })
-  );
-  const nav = [];
-  if (page > 0)                     nav.push(btn('◀ Prev', `alertpage:${page - 1}`));
-  if (page < PAIR_PAGES.length - 1) nav.push(btn('Next ▶', `alertpage:${page + 1}`));
-  if (nav.length) rows.push(nav);
-  rows.push([btn('🔙 Back', 'cmd:alerts')]);
-  return kb(rows);
-};
-
-const alertConfKb = (pair, page) => kb([
-  [btn('65%', `alertset:${pair}:65:${page}`), btn('70%', `alertset:${pair}:70:${page}`), btn('75%', `alertset:${pair}:75:${page}`)],
-  [btn('80%', `alertset:${pair}:80:${page}`), btn('85%', `alertset:${pair}:85:${page}`), btn('90%', `alertset:${pair}:90:${page}`)],
-  [btn('◀ Back', `alertpage:${page}`)],
-]);
-
 const intervalKb  = () => kb([
   [btn('⚡ 1min', 'interval:1'), btn('📊 5min', 'interval:5'), btn('🕐 15min', 'interval:15')],
   [btn('🔙 Back', 'cmd:settings')],
@@ -761,7 +734,7 @@ const modeLabel = m => m === 'fx' ? 'FX' : m === 'both' ? 'BOTH' : 'FTT';
 
 // Arena hub card (status + 6-button grid below)
 function fmtMainMenu(u, cnt, wr, resolvedN) {
-  return `FTT Signal Bot v4.4.1\n${SEP}\n` +
+  return `FTT Signal Bot v4.4.2\n${SEP}\n` +
     `💱 ${esc(disp(u.pair))} · ${u.interval}min · ${modeLabel(u.fxMode)}\n` +
     `🔄 Auto: ${u.autoEnabled ? 'ON ✅' : 'OFF'}  👁 Watchlist: ${u.watchlist.length} pairs\n` +
     `🎯 Grade: ${esc(u.gradeFilter || 'ALL')}  🤖 AI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}\n` +
@@ -1257,7 +1230,6 @@ async function onMessage(msg, env) {
   if (text.startsWith('/risk'))      return doRisk(cid, null, env);
   if (text.startsWith('/heatmap'))   return doHeatmap(cid, null, env);
   if (text.startsWith('/best'))      return doBest(cid, null, env);
-  if (text.startsWith('/alerts'))    return doAlerts(cid, null, env);
   if (text.startsWith('/replay'))    return doReplay(cid, null, text.slice(7).trim() || null, env);
 
   // [F10] Channel commands
@@ -1293,7 +1265,7 @@ async function onMessage(msg, env) {
     return R('❌ Use: 1, 5, or 15', mainKb(u));
   }
   if (text.startsWith('/help'))
-    return R(`<b>FTT Signal Bot — Commands</b>\n\n📊 <b>Core:</b>\n/signal — get signal\n/scan — scan all pairs\n/auto — toggle auto scan\n\n📈 <b>Analytics:</b>\n/history — trade history\n/stats — win rate stats\n/today — today's performance\n/summary — daily summary\n/best — best pairs leaderboard\n/risk — risk dashboard\n/heatmap — win rate by hour\n\n⚙️ <b>Settings:</b>\n/pair EURUSD — set pair\n/interval 5 — set interval\n/watchlist — manage watchlist\n/alerts — custom pair alerts\n/replay EURUSD — analyze without logging\n/setchannel — mirror to channel\n/cancelall — cancel pending\n/win <no> /loss <no> — manual override\n\n💡 <i>Just type a pair name to scan instantly</i>`, mainKb(u));
+    return R(`<b>FTT Signal Bot — Commands</b>\n\n📊 <b>Core:</b>\n/signal — get signal\n/scan — scan all pairs\n/auto — toggle auto scan\n\n📈 <b>Analytics:</b>\n/history — trade history\n/stats — win rate stats\n/today — today's performance\n/summary — daily summary\n/best — best pairs leaderboard\n/risk — risk dashboard\n/heatmap — win rate by hour\n\n⚙️ <b>Settings:</b>\n/pair EURUSD — set pair\n/interval 5 — set interval\n/watchlist — manage watchlist\n/replay EURUSD — analyze without logging\n/setchannel — mirror to channel\n/cancelall — cancel pending\n/win <no> /loss <no> — manual override\n\n💡 <i>Just type a pair name to scan instantly</i>`, mainKb(u));
 
   // Auto pair detect
   const rawPair = text.toUpperCase().replace(/[\s\/\-_.]/g, '');
@@ -1316,7 +1288,7 @@ async function onCb(cb, env) {
   const u = await getUser(cid, env);
 
   // [Bug#1 FIX] Global try/catch: every button handler is now wrapped.
-  // Previously, if doRisk/doBest/doHeatmap/doAlerts threw (e.g. from a
+  // Previously, if doRisk/doBest/doHeatmap threw (e.g. from a
   // null pair in history), dispatch() caught it silently. User saw
   // "button does nothing". Now they always get an error message + working menu.
   try {
@@ -1358,7 +1330,6 @@ async function _handleCb(cid, mid, data, u, env) {
   if (data === 'cmd:risk')        return doRisk(cid, mid, env);
   if (data === 'cmd:heatmap')     return doHeatmap(cid, mid, env);
   if (data === 'cmd:best')        return doBest(cid, mid, env);
-  if (data === 'cmd:alerts')      return doAlerts(cid, mid, env);
   if (data === 'cmd:premium')     return doPremium(cid, mid, env);
   if (data === 'cmd:exportinfo')  return doExportInfo(cid, mid, env);
   if (data === 'cmd:replayhelp')  return R(`🔄 Signal Replay\n${SEP}\nType <code>/replay EURUSD</code> to get a live signal without logging it.\n\nGreat for analysis before committing to a trade.`, settingsKb(u));
@@ -1444,29 +1415,6 @@ async function _handleCb(cid, mid, data, u, env) {
     const parts = data.split(':'), pair = parts[2], page = parseInt(parts[3]||'0', 10);
     u.watchlist = u.watchlist.filter(p => p !== pair); await saveUser(cid, u, env);
     return R(`👁 Add to Watchlist (${u.watchlist.length}/${MAX_WL}):`, wlAddKb(page, u.watchlist));
-  }
-
-  // [F09] Alert callbacks
-  if (data.startsWith('alertpage:')) {
-    const page    = parseInt(data.split(':')[1], 10);
-    const alerts  = await getAlerts(cid, env);
-    return R(`🔔 Select pair for alert:`, alertPairsKb(page, alerts));
-  }
-  if (data.startsWith('alertpair:')) {
-    const parts = data.split(':'), pair = parts[1], page = parseInt(parts[2]||'0', 10);
-    return R(`🔔 Alert for ${disp(pair)}\nSet min confidence threshold:`, alertConfKb(pair, page));
-  }
-  if (data.startsWith('alertset:')) {
-    const parts = data.split(':'), pair = parts[1], conf = parseInt(parts[2], 10), page = parseInt(parts[3]||'0', 10);
-    await setAlert(cid, pair, conf, env);
-    const alerts = await getAlerts(cid, env);
-    return R(`✅ Alert set: ${disp(pair)} ≥${conf}%\n\nYou'll be notified when this pair hits ${conf}%+ confidence.`, alertPairsKb(page, alerts));
-  }
-  if (data.startsWith('alertdel:')) {
-    const parts = data.split(':'), pair = parts[1], page = parseInt(parts[2]||'0', 10);
-    await delAlert(cid, pair, env);
-    const alerts = await getAlerts(cid, env);
-    return R(`🗑 Alert removed for ${disp(pair)}`, alertPairsKb(page, alerts));
   }
 
   // [Bug#2 FIX] cmd:cancelall was used in Risk Dashboard button but had no handler
@@ -1726,15 +1674,6 @@ async function doBest(cid, mid, env) {
   return reply(cid, mid, fmtBest(h), env, kb([[btn('🕐 Heatmap', 'cmd:heatmap'), btn('🏆 Stats', 'cmd:stats')], backQuick()]));
 }
 
-// [F09] Custom Alerts menu
-async function doAlerts(cid, mid, env) {
-  const alerts = await getAlerts(cid, env);
-  const count  = Object.keys(alerts).length;
-  const t = count
-    ? `🔔 Custom Alerts (${count})\n${SEP}\nYou get notified when these pairs hit your threshold, even if they'd normally be filtered.\n`
-    : `🔔 Custom Alerts\n${SEP}\nNo alerts set.\n\nAdd a pair + confidence threshold to get notified.`;
-  return reply(cid, mid, t, env, alertsKb(alerts));
-}
 
 // [F08] Signal Replay
 async function doReplay(cid, mid, pairRaw, env) {
@@ -1945,9 +1884,10 @@ async function cronLite(env) {
   log(`CronLite ${new Date().toISOString()}`);
   if (!env?.BOT_TOKEN) { log('ERROR: BOT_TOKEN missing'); return; }
   if (!env?.BOT_KV)    { log('ERROR: BOT_KV missing');    return; }
-  // AutoScan re-enabled (2026-08-05): worker push alone was not delivering
-  // reliably for all users; the bot's own scan uses the same gates and also
-  // honors each user's fxMode (FX/BOTH get SL/TP levels).
+  // BUG-B3 (Option A): worker push is the single source of signal delivery.
+  // autoScan now only maintains bot-side analytics (logAndSchedule, dedup keys,
+  // errcnt/noTradeStreak, confidence trend) — it no longer sends fmtSignal
+  // messages, so no duplicate Telegram signal from the bot.
   await autoScan(env, log).catch(e => log('ScanErr: ' + e.message));
   await resultCheck(env, log).catch(e => log('ResultErr: ' + e.message));
   await expiryReminder(env, log).catch(e => log('ReminderErr: ' + e.message));
@@ -2007,9 +1947,6 @@ async function autoScan(env, log) {
       const list = [u.pair, ...u.watchlist].filter((p,i,a) => a.indexOf(p) === i);
       let anySignalSent = false, pairErrors = 0;
 
-      // [F09] Fetch custom alerts for this user
-      const userAlerts = await getAlerts(cid, env);
-
       for (const pair of list) {
         try {
           // Same-candle dedup
@@ -2022,44 +1959,27 @@ async function autoScan(env, log) {
           const dir  = sig?.finalSignal;
 
           if (dir === 'BUY' || dir === 'SELL') {
-            const normPair = norm(pair);
-            const alertConf = userAlerts[normPair];
-
-            // Check if passes main filters OR custom alert threshold
-            const passesMain  = passGrade(sig, u.gradeFilter) && passConf(sig, u.minConfidence) && passAI(sig, u.aiOnlyMode);
-            const passesAlert = alertConf && parseInt((sig.confidence||'0%').replace('%',''), 10) >= alertConf;
-
-            if (!passesMain && !passesAlert) { log(`Filtered ${pair}`); continue; }
+            // BUG-B3 (Option A): worker push (Phase 10, BUG-001 fixed) is the
+            // SINGLE source of auto signal delivery. autoScan must NOT send
+            // fmtSignal messages (nor custom alerts / channel mirror) or users
+            // would get the same signal twice. We keep the same gates + bot-side
+            // bookkeeping (logAndSchedule, sc:/lc:/lock:, errcnt/noTradeStreak,
+            // confidence trend) so resultCheck/dailySummary/weeklyReport/stats
+            // still have data to work from.
+            const passesMain = passGrade(sig, u.gradeFilter) && passConf(sig, u.minConfidence) && passAI(sig, u.aiOnlyMode);
+            if (!passesMain) { log(`Filtered ${pair}`); continue; }
 
             const lock = await getLock(cid, pair, env);
             if (lock?.direction === dir && lock?.expiryAt > now) { log(`Locked ${pair}`); continue; }
 
-            const corrWarnings = await checkCorrelated(cid, pair, dir, env);
+            // Log the signal for bot analytics (history, pending, lock, reminder).
+            // Delivery to the user is handled by worker push — no sendMsg here.
             const no = await logAndSchedule(cid, pair, sig, env);
-
-            // Build message options
-            const msgOpts = { correlated: corrWarnings, mode: normMode(u.fxMode) };
-            if (passesAlert && !passesMain) {
-              // Alert-triggered signal (bypassed normal filter)
-              await sendMsg(cid,
-                `🔔 Custom Alert: ${esc(disp(pair))} hit ${esc(sig.confidence)}% (your threshold: ${alertConf}%)\n\n` +
-                fmtSignal(data, pair, intervalMin, no, msgOpts),
-                env, { reply_markup: signalKb(no) });
-            } else {
-              await sendMsg(cid, fmtSignal(data, pair, intervalMin, no, msgOpts), env, { reply_markup: signalKb(no) });
-            }
-
-            // [F10] Mirror to channel
-            if (u.channelId) {
-              await sendMsg(u.channelId, fmtSignal(data, pair, intervalMin, no, { mode: normMode(u.fxMode) }), env, { reply_markup: channelKb() })
-                .catch(e => log(`Channel ${u.channelId}: ${e.message}`));
-            }
-
             await kput(scKey, currentCandle, env, { expirationTtl: intervalMin * 60 + 60 });
-            log(`Sent #${no} ${pair} ${dir}`);
+            log(`Logged #${no} ${pair} ${dir}`);
             anySignalSent = true;
 
-            // [Fix#2] Confidence trend alert
+            // [Fix#2] Confidence trend (bot analytics — kept)
             if (sig.confidence) {
               const ct = await updateConfTrend(cid, sig.confidence, env);
               if (ct.alert)
