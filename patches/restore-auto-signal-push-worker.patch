@@ -1,0 +1,317 @@
+From 1fa8240f81510eb1288b342a56d0e2222a3037e0 Mon Sep 17 00:00:00 2001
+From: ferdausfs <umuhammadiswa@outlook.com>
+Date: Mon, 10 Aug 2026 10:28:07 +0000
+Subject: [PATCH] fix(push): restore auto signal delivery from the */5 scanner
+ (F3-14 revert)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Root cause: F3-14 added noPush:true to scanOnePair while the bot still had
+its own autoScan; bot v4.5.0 then removed autoScan (worker = single source
+of truth), leaving pushSignalToSubscribers with exactly one call site — the
+manual /api/signal path. The scanner saved history rows but never delivered
+them: auto signals stopped reaching Telegram subscribers.
+
+Fix (Option B): drop noPush:true so the scanner rides the existing
+handleSignalRaw -> saveAndPush chain. Push fires exactly when a NEW
+tradeable row lands in history (30-min setup dedup), and claimPushLock
+(30-min per subscriber/pair/direction) makes manual/scanner double-push
+impossible in both orders. Scanner still writes only the latest: cache —
+no double save.
+
+Tests: T27 rewritten from the F3-14 grep contract to a behavioral test
+(scanOnePair -> real engine -> Telegram stub): fresh tradeable signal
+pushed once; re-scan not re-pushed; manual-after-scanner not re-pushed;
+manual-first-then-scanner not re-pushed; pushLog/pushLock/history verified.
+fix_tests 281/0; phase10 19/19; phase7 36/0 (+smoke 68/0); d2 39/39;
+probe 34/34; entry_hit 7/7; fx_mode 20/20; r71 117/0. Bot repo untouched.
+---
+ AGENT_LOG.md                  | 57 +++++++++++++++++++++
+ scripts/fix_tests.mjs         | 94 ++++++++++++++++++++++++++++++++---
+ src/handlers/health.js        |  2 +-
+ src/handlers/scheduledScan.js | 33 ++++++++++--
+ src/index.js                  |  4 +-
+ 5 files changed, 176 insertions(+), 14 deletions(-)
+
+diff --git a/AGENT_LOG.md b/AGENT_LOG.md
+index 8193536..28bdf4b 100644
+--- a/AGENT_LOG.md
++++ b/AGENT_LOG.md
+@@ -1,5 +1,62 @@
+ # Ftt-Otc-v6 — Agent Log
+ 
++## 2026-08-10 — RESTORE AUTO SIGNAL PUSH (worker = single source; v6.10.0)
++
++**Base:** `bad7140c` (main, incl. PR #15 edge features). 4 files: 3 modified +
++fix_tests. 119 insertions / 14 deletions. Bot repo untouched (R4).
++
++### Root cause (two earlier changes collided)
++1. **F3-14 (BUG-028)** made the `*/5` scanner call `handleSignalRaw(..., { noPush: true })`
++   so scanner runs would not duplicate pushes while the BOT still had its own autoScan.
++2. **Bot v4.5.0** removed autoScan entirely (worker = single source of truth; bot = thin client).
++3. Result: `pushSignalToSubscribers` had exactly ONE call site — `signal.js` `saveAndPush`
++   (`if (!noPush)`) — which only fired on manual HTTP `/api/signal` calls without `nopush`.
++   The scanner saved history rows but never delivered them. **Auto signals never reached
++   Telegram subscribers.** Manual `/signal` still worked (bot → worker → push + display).
++
++### Fix — Option B (simplest correct, chosen)
++Remove `noPush: true` from `scanOnePair` so the scanner rides the SAME `handleSignalRaw`
++-> `saveAndPush` chain the manual path uses. No new push code: `saveAndPush` already
++persists via `saveSignalToHistory` and only pushes when the row is genuinely NEW
++(30-min setup dedup: same pair+direction+nearby entry), and `pushSignalToSubscribers`
++adds `claimPushLock` (30-min TTL per subscriber/pair/direction). The scanner still
++writes only the `latest:` cache — no double save (handleSignalRaw persists; the
++scanner's job of warming the cache is unchanged).
++
++Why not Option A (scanner calls pushSignalToSubscribers directly): it would push on
++every scan of a setup unless the scanner re-implements the history-dedup decision,
++which `saveAndPush` already owns. Option B keeps ONE save+push path for every caller.
++
++### Dedup verification (R2) — scanner ↔ manual cannot double-push
++- Scanner pushes first → manual `/api/signal` for the same setup: history guard returns
++  `{deduped:true}` → no push. Even if a re-poll slips past the entry tolerance,
++  `claimPushLock` (same chatId+pair+direction, 30 min) returns false → skipped 'locked'.
++- Manual pushes first → scanner re-scan: identical reasoning, symmetric.
++- Residual (pre-existing, documented in pushToSubscribers.js header): a genuinely NEW
++  same-direction setup inside the 30-min lock window is not pushed (lock wins over
++  history); KV has no CAS so a true concurrent race could deliver one duplicate. Both
++  bounded, both acceptable per the Phase 10 design.
++
++### Verification — 682 assertions, 0 failures
++- `node --check` on all changed files → pass.
++- `fix_tests` **281/0** (was 266/0). T27 rewritten from the F3-14 grep contract to a
++  behavioral test: real `scanOnePair` → `handleSignalRaw` → `saveAndPush` → Telegram
++  (network stubbed): fresh tradeable signal pushed exactly once to the matching
++  subscriber; pushLog + pushLock written; history exactly one row (no double save);
++  re-scan of the same setup → NOT re-pushed; manual `/api/signal` after scanner push →
++  NOT re-pushed; manual first, then scanner → NOT re-pushed; call site no longer
++  forces `noPush:true`.
++- `phase10_integration` 19/19 · `phase7_integration` 36/0 · `phase7_smoke` 68/0 ·
++  `phase10_smoke` 61/0 · `d2_tests` 39/39 · `probe_tests` 34/34 · `entry_hit_tests` 7/7 ·
++  `fx_mode_tests` 20/20 · `r71_tests` 117P/0F (frozen baseline untouched).
++
++### Deploy note
++Manual bundle as usual: rebuild `worker.js` from this tree → `bash redeploy.sh`
++(filename check!) → live-verify: a fresh auto signal arrives from the `*/5` tick
++without anyone pressing a button, exactly once (watch Telegram / `pushLog:<id>` KV).
++
++---
++
+ ## 2026-07-29 — Phase 10: real-time cross-surface push (NOT deployed)
+ 
+ **Base:** `24985da` (Phase 7.1). 7 files: 3 modified + wrangler.toml, 1 new module,
+diff --git a/scripts/fix_tests.mjs b/scripts/fix_tests.mjs
+index 3e7ee0e..8d91be6 100644
+--- a/scripts/fix_tests.mjs
++++ b/scripts/fix_tests.mjs
+@@ -32,7 +32,10 @@
+  *   T24 F3-11  RANGING middle-zone RSI trend-following scores removed
+  *   T25 F3-12  HIGHEST-session +3 bonus removed
+  *   T26 F3-13  crypto pairs skip forex session weights
+- *   T27 F3-14  scheduledScan passes noPush:true
++ *   T27 F3-14  scheduledScan pushes fresh tradeable signals (v6.10 revert of
++ *              the noPush:true contract) — scanner push once, re-scan no-op,
++ *              manual /api/signal after scanner no double-push, and the
++ *              reverse order (manual first, then scanner)
+  *   T28 F3-15  AI never called on D2-blocked signals
+  *   T29 F3-16  session injection makes engine fixtures time-invariant
+  *   T30 F3-17  /api/history excludes cbShadow rows from decided/pending
+@@ -50,6 +53,7 @@ import { classifyOutcome, fetchExpiryPrice, scheduledTracker, saveSignalToHistor
+ import { passAI, passGrade, pushSignalToSubscribers } from '../src/handlers/pushToSubscribers.js';
+ import { handleReport, handleHistory } from '../src/handlers/health.js';
+ import { handleSignalRaw, handleSignal } from '../src/handlers/signal.js';
++import { __scanTest } from '../src/handlers/scheduledScan.js';
+ import { buildMultiTimeframeSignal } from '../src/signal/engine.js';
+ import { buildMultiTimeframeSignalOTC } from '../src/signal/otcEngine.js';
+ import { analyzeOTCPatterns } from '../src/analysis/otc.js';
+@@ -894,15 +898,89 @@ console.log('\n── T26: crypto skips forex session weights (F3-13) ───
+   ok('T26d: no SESSION_WEIGHT filter on crypto', !(sig.filtersApplied || []).some(f => f.includes('SESSION_WEIGHT')), JSON.stringify(sig.filtersApplied));
+ }
+ 
+-console.log('\n── T27: scheduledScan pushes nothing (F3-14) ──────────');
++console.log('\n── T27: scanner pushes fresh tradeable signals, deduped (F3-14 revert) ─');
+ {
++  // Real pipeline: scanOnePair -> handleSignalRaw -> saveAndPush -> Telegram,
++  // network stubbed (same pattern as T4 / phase10_integration). Subscriber
++  // 111 watches BTCUSD with every filter open. This proves the auto-push
++  // wiring end-to-end, not just the call-site options (the old grep contract
++  // could not have caught a broken saveAndPush chain).
++  const scanEnvOf = () => {
++    const seed = { 'u:111': { pair: 'BTCUSD', watchlist: [], autoEnabled: true, gradeFilter: 'ALL', minConfidence: 0, aiOnlyMode: false, channelId: null } };
++    seed['auto_users'] = ['111'];
++    return { SIGNAL_CACHE: makeKV(), BOT_KV: makeKV(seed), BOT_TOKEN: 'tok', TWELVEDATA_API_KEY_1: 'k', CEREBRAS_API_KEY: 'c', GROQ_API_KEY: 'g' };
++  };
++  let tg = [];
++  const installNet = () => {
++    tg = [];
++    globalThis.fetch = async (url, init) => {
++      const u = String(url);
++      if (u.includes('api.telegram.org')) {
++        const b = JSON.parse(init.body);
++        tg.push({ chatId: String(b.chat_id), text: b.text });
++        return { ok: true, status: 200, json: async () => ({ ok: true }), text: async () => '' };
++      }
++      if (u.includes('twelvedata')) {
++        const interval = new URL(u).searchParams.get('interval');
++        let values;
++        if (interval === '15min') values = seriesFastSin(100, 100, 0.4);
++        else if (interval === '5min') values = series(100, 100, 0.1);
++        else values = series(100, 100, 0.02);
++        return { ok: true, status: 200, json: async () => ({ values }), text: async () => '' };
++      }
++      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: JSON.stringify({ signal: 'BUY', confidence: 85, reason: 'stub', concerns: null }) } }] }), text: async () => '' };
++    };
++  };
++  const pushLogIds = (env) => [...env.SIGNAL_CACHE._m.keys()].filter(k => k.startsWith('pushLog:')).map(k => k.slice('pushLog:'.length));
++  const lockKeys = (env) => [...env.SIGNAL_CACHE._m.keys()].filter(k => k.startsWith('pushLock:'));
++
++  // ── 1) scanner delivers a fresh tradeable signal exactly once ──
++  installNet();
++  const env1 = scanEnvOf(); const sink1 = [];
++  const q1 = quiet();
++  const scan1 = await __scanTest.scanOnePair('BTC/USD', 'gen_t27', env1, ctxOf(sink1), EDGE_OFF);
++  await drain(sink1); q1();
++  ok('T27a: scanOnePair returned a cached result', !!scan1 && scan1.pair === 'BTC/USD', JSON.stringify(scan1));
++  eq('T27a: fresh scanner signal pushed exactly one message', tg.length, 1);
++  eq('T27a: delivered to the matching subscriber', tg[0].chatId, '111');
++  ok('T27a: message names the pair', tg[0].text.includes('BTC/USD'));
++  eq('T27a: pushLog written for the scanner-minted id', pushLogIds(env1).length, 1);
++  eq('T27a: pushLock claimed for the subscriber/pair/direction', lockKeys(env1).length, 1);
++  const hist1 = await env1.SIGNAL_CACHE.get('sig:BTC_USD', 'json');
++  eq('T27a: history holds exactly one row (no double save)', hist1.length, 1);
++
++  // ── 2) re-scan of the same setup: cache warmed again, NOT re-pushed ──
++  const q2 = quiet();
++  const scan2 = await __scanTest.scanOnePair('BTC/USD', 'gen_t27b', env1, ctxOf(sink1), EDGE_OFF);
++  await drain(sink1); q2();
++  ok('T27b: re-scan still returns a cache write', !!scan2, JSON.stringify(scan2));
++  eq('T27b: re-scan of same setup does NOT re-push (history dedup)', tg.length, 1);
++  const hist2 = await env1.SIGNAL_CACHE.get('sig:BTC_USD', 'json');
++  eq('T27b: history still exactly one row', hist2.length, 1);
++
++  // ── 3) manual /api/signal for the same setup right after the scanner ──
++  const q3 = quiet();
++  const manual1 = await handleSignalRaw('BTC/USD', env1, ctxOf(sink1), EDGE_OFF);
++  await drain(sink1); q3();
++  ok('T27c: manual call still produced a signal response', !!manual1 && !!manual1.signal, '');
++  eq('T27c: manual call after scanner push does NOT double-push', tg.length, 1);
++
++  // ── 4) reverse order: manual push first, then the scanner sees it ──
++  installNet();
++  const env2 = scanEnvOf(); const sink2 = [];
++  const q4 = quiet();
++  await handleSignalRaw('BTC/USD', env2, ctxOf(sink2), EDGE_OFF);
++  await drain(sink2);
++  eq('T27d: manual push delivered once', tg.length, 1);
++  const scan3 = await __scanTest.scanOnePair('BTC/USD', 'gen_t27c', env2, ctxOf(sink2), EDGE_OFF);
++  await drain(sink2); q4();
++  ok('T27d: scanner still warmed the cache after a manual push', !!scan3, JSON.stringify(scan3));
++  eq('T27d: scanner does NOT re-push what the manual call pushed', tg.length, 1);
++
++  // ── 5) call-site contract: noPush is no longer forced by the scanner ──
+   const ss = fs.readFileSync(fileURLToPath(new URL('../src/handlers/scheduledScan.js', import.meta.url)), 'utf8');
+-  // F3-14 contract: the scanner's handleSignalRaw call always carries
+-  // noPush:true. Phase F round 2 (edge features) added test-determinism hook
+-  // forwarding ({ noPush: true, ...opts }) — production cron passes no opts,
+-  // so noPush:true is still unconditional at the call site.
+-  ok('T27: scanner calls handleSignalRaw with noPush:true',
+-    ss.includes('handleSignalRaw(pair, env, ctx, { noPush: true') && !/noPush:\s*(false|!!opts\.noPush)/.test(ss));
++  ok('T27e: scanner no longer forces noPush:true at the call site',
++    !ss.includes('noPush: true') && ss.includes('handleSignalRaw(pair, env, ctx, opts)'));
+ }
+ 
+ console.log('\n── T28: no AI calls on D2-blocked signals (F3-15) ─────');
+diff --git a/src/handlers/health.js b/src/handlers/health.js
+index bfe38b8..2cd3b67 100644
+--- a/src/handlers/health.js
++++ b/src/handlers/health.js
+@@ -27,7 +27,7 @@ export async function handleHealth(env) {
+   const phase10        = await getPushStats(env);        // Phase 10 push
+ 
+   return jsonResponse({
+-    status: 'healthy', version: '6.9.2', timestamp: new Date().toISOString(),
++    status: 'healthy', version: '6.10.0', timestamp: new Date().toISOString(),
+     apiKeys: { configured: keyCount, source: keySource, status: keyCount > 0 ? 'ready' : 'NO KEYS' },
+     apiKeysLoaded: keyCount,
+     quotaUsedToday,
+diff --git a/src/handlers/scheduledScan.js b/src/handlers/scheduledScan.js
+index 891cad5..3a61e02 100644
+--- a/src/handlers/scheduledScan.js
++++ b/src/handlers/scheduledScan.js
+@@ -5,6 +5,20 @@
+  * Bot can read one shared, already-computed signal instead of each triggering
+  * their own engine run.
+  *
++ * ── Auto-signal delivery (v6.10, F3-14 revert) ───────────────────────────
++ * The scanner is ALSO the auto-push path. The worker is the single source of
++ * truth (ledger + subscribers) and the bot v4.5.0 removed its own autoScan,
++ * so this every-5-minutes cron tick is the ONLY place fresh signals are
++ * generated with no
++ * human pressing a button — if it does not push, auto signals never reach
++ * Telegram subscribers. Push is NOT done here directly: it rides
++ * handleSignalRaw -> saveAndPush, which saves the history row first and only
++ * pushes when the row is genuinely new (30-min setup dedup), and
++ * pushSignalToSubscribers adds the per-(subscriber,pair,direction) pushLock
++ * (30-min window). Re-scans and manual /api/signal calls therefore cannot
++ * double-deliver. NO_TRADE and circuit-breaker-suppressed signals never mint
++ * an id, so they never push. See AGENT_LOG.md (RESTORE AUTO SIGNAL PUSH).
++ *
+  * ── Engine reuse (spec §5) ──────────────────────────────────────────────────
+  * The spec expected to import `generateSignalCore` from signal/engine.js and
+  * warned a refactor might be needed. No refactor was required: the request path
+@@ -110,11 +124,20 @@ async function scanOnePair(pair, generationId, env, ctx, opts = {}) {
+   try {
+     // Same entry point /api/signal uses — including circuit-breaker checks and
+     // the existing history write via ctx.waitUntil.
+-    // F3-14 (BUG-028): the cron scanner must never push to Telegram — its job
+-    // is warming the latest: cache. User-triggered calls still push.
++    // ── Push contract (v6.10, reverts F3-14/BUG-028) ─────────────────────
++    // F3-14 added noPush:true here to stop scanner-push duplication while the
++    // BOT still had its own autoScan. Bot v4.5.0 removed autoScan (worker =
++    // single source), so noPush would now make auto signals die here: the
++    // */5 scanner would save history rows but never deliver them. We therefore
++    // do NOT pass noPush — handleSignalRaw's saveAndPush chain pushes exactly
++    // when a NEW tradeable row lands in history (30-min setup dedup), and
++    // claimPushLock (30-min per subscriber/pair/direction) makes a manual
++    // /api/signal call for the same setup a no-op, and vice versa. The scanner
++    // itself never double-saves: handleSignalRaw persists, scanOnePair only
++    // writes the latest: cache.
+     // opts.edgeFeatures / opts.now are test-determinism hooks (production cron
+     // omits them → edge features ON, live clock).
+-    const result = await handleSignalRaw(pair, env, ctx, { noPush: true, ...opts });
++    const result = await handleSignalRaw(pair, env, ctx, opts);
+ 
+     if (!result || result.error) {
+       console.warn('scanOnePair ' + pair + ' error: '
+@@ -150,3 +173,7 @@ async function scanOnePair(pair, generationId, env, ctx, opts = {}) {
+ function sleep(ms) {
+   return new Promise(resolve => setTimeout(resolve, ms));
+ }
++
++// Test-only export (not used at runtime) so fix_tests can drive scanOnePair
++// directly on a single pair (repo convention: __dedupTest / __pushTest).
++export const __scanTest = { scanOnePair };
+diff --git a/src/index.js b/src/index.js
+index 35d4ddc..a6e1665 100644
+--- a/src/index.js
++++ b/src/index.js
+@@ -1,5 +1,5 @@
+ /**
+- * FTT Signal Worker v6.9.2
++ * FTT Signal Worker v6.10.0
+  * Cloudflare Worker Entry Point
+  */
+ 
+@@ -117,7 +117,7 @@ export default {
+       } else {
+         response = jsonResponse({
+           status: 'ok',
+-          message: 'FTT Signal Worker v6.9.2 — Forex + Crypto + OTC + History Tracking',
++          message: 'FTT Signal Worker v6.10.0 — Forex + Crypto + OTC + History Tracking',
+           endpoints: {
+             health:    '/',
+             signal:    '/api/signal?pair=EUR/USD',
+-- 
+2.39.5
+
