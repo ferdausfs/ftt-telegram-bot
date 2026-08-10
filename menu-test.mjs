@@ -1,5 +1,7 @@
 /**
- * v4.4 Arena hub menu — structural tests (matches Arena screenshot pattern)
+ * v4.5 Arena hub menu — structural tests (matches Arena screenshot pattern)
+ * v4.5.0: cmd:cancelall removed (bot ledger gone) + version bumped to v4.5.
+ * Total stays 74 assertions.
  * Run: node menu-test.mjs
  */
 import { readFileSync } from 'fs';
@@ -93,22 +95,24 @@ const core = [
   'cmd:signal', 'cmd:toggle_auto', 'cmd:scanall', 'cmd:status', 'cmd:stats',
   'cmd:watchlist', 'cmd:today', 'cmd:summary', 'cmd:settings', 'cmd:journal',
   'cmd:weekly', 'cmd:risk', 'cmd:heatmap', 'cmd:best',
-  'cmd:cancelall', 'cmd:premium', 'cmd:exportinfo', 'cmd:quick',
+  'cmd:history:0', 'cmd:premium', 'cmd:exportinfo', 'cmd:quick',
 ];
 for (const c of core) ok(`handler: ${c}`, src.includes(`'${c}'`));
 // F09 removed under BUG-B3 — no dead alerts callback may remain
 ok('no alert callback handlers remain (F09 dropped)', !src.includes("'alertpage:") && !src.includes("'alertset:") && !src.includes("'alertdel:"));
+// v4.5.0: Cancel All removed with the bot ledger (worker owns the ledger; the
+// worker has no cancel endpoint — a bot-side cancel would be a parallel ledger).
+ok('no cmd:cancelall handler remains (bot ledger cancel removed)', !src.includes("'cmd:cancelall'"));
 
 // Auto toggle returns to quickKb (not main clutter)
 ok('doToggle uses quickKb', /async function doToggle[\s\S]{0,2000}quickKb\(u\)/.test(src));
 
-// Explore backs go to quick
-ok('doStats backQuick', /async function doStats[\s\S]{0,400}backQuick/.test(src));
-ok('doRisk backQuick', /async function doRisk[\s\S]{0,400}backQuick/.test(src));
-ok('doToday backQuick', /async function doToday[\s\S]{0,800}backQuick/.test(src));
+// Explore backs go to quick (worker-backed bodies are longer now)
+ok('doStats backQuick', /async function doStats[\s\S]{0,2000}backQuick/.test(src));
+ok('doRisk backQuick', /async function doRisk[\s\S]{0,2000}backQuick/.test(src));
+ok('doToday backQuick', /async function doToday[\s\S]{0,1200}backQuick/.test(src));
 
-ok('v4.4 header', /v4\.4/.test(src.slice(0, 900)));
-ok('v4.4 main card', /FTT Signal Bot v4\.4/.test(src));
+ok('v4.5 header + main card', /v4\.5/.test(src.slice(0, 900)) && /FTT Signal Bot v4\.5/.test(src));
 
 console.log(`\n═══ Result: ${pass} passed, ${fail} failed ═══\n`);
 if (fail > 0) process.exit(1);

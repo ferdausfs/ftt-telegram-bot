@@ -1,3 +1,56 @@
+# CHANGES — v4.5.0 WORKER = SINGLE SOURCE OF TRUTH (bot = thin Telegram client)
+
+PR: `arena/019fe9d6-ftt-telegram-bot` → `main` (reviewer must approve before merge; no direct push to main).
+
+---
+
+## v4.5.0 — kill the parallel ledger, mirror the worker
+
+**Core principle:** the worker (Ftt-Otc-v6) is the SINGLE SOURCE OF TRUTH for ALL trading data. The bot writes NO trade records; it only displays worker data and forwards user actions to worker endpoints. The same pattern is the template for the App later.
+
+### What changed (bot function → worker endpoint / removed)
+
+| Bot function | v4.4.2 (before) | v4.5.0 (after) |
+|---|---|---|
+| `/history` (`doHist`) | bot KV `h:${cid}` ledger | `GET /api/history?pair=X&limit=N` — worker per-pair global stream, rendered 1:1 |
+| `/stats` (`doStats`) | bot `h:` + `rs:`/`ss:` accumulators | `GET /api/stats?pair=X` (winRate windowed, sampleSize, bySession/byTF/byRegime) + `GET /api/history` window for pending/streak/drawdown/grade |
+| `/best` (`doBest`) | computed from bot `h:` | `GET /api/stats` (all pairs, worker-ranked) + `GET /api/signals/latest` (per-pair direction) |
+| `/heatmap` (`doHeatmap`) | computed from bot `h:` | aggregated `GET /api/history` per pair (UTC timestamps → hour) |
+| `/risk` (`doRisk`) | bot `h:` pending + Cancel All | worker pending rows (`result === null`) from pair+watchlist history; Cancel All REMOVED (worker owns ledger, no cancel endpoint) |
+| `/win` `/loss` + ✅/❌ buttons | bot ledger `no` → `setResult` on `h:`/`pt:` | WORKER signal id (`sig_...`) → `POST /api/report?id=<sigId>&result=WIN|LOSS` (idempotent, FIX-4 guard) |
+| `/today` `/summary` `/journal` `/weekly` `/status` | bot `h:` | worker `/api/history` stream for the user's pair |
+| main menu card (`fmtMainMenu`) | bot `cnt:`/`h:` | worker `/api/history` (total/decided/winRate), degrades to "—" |
+| `/export` (admin) | bot `h:` CSV | worker `/api/history` CSV (pair stream) |
+| `logAndSchedule` | wrote `h:` + `pt:` + `rem:` + `lock:` per signal | REMOVED — signals exist only in the worker |
+| `autoScan` | bot cron scan + bot ledger bookkeeping | REMOVED from `cronLite` and deleted — worker push (Phase 10) is the single delivery + single ledger |
+| `resultCheck` | bot-side `pt:` resolution + result cards | REMOVED — worker `*/2` cron resolves results and Phase 10 pushes WIN/LOSS |
+| `expiryReminder` | bot `rem:`/`remind_ids` "expires in ~30s" | REMOVED — worker push covers delivery + result push lands in the tracking window |
+| `checkMilestone` / `updateRisk` / `updateRegimeStats` / `updateSessionStats` | bot `ms:`/`risk:`/`rs:`/`ss:` | REMOVED — all fed the bot ledger; worker stats are the analytics surface |
+| locks/dedup (`lock:`, `sc:`, `lc:`, `errcnt:`) | bot-side signal dedup bookkeeping | REMOVED — worker dedups its own history |
+
+### Removed-code inventory
+- KV trade keys deleted from the bot: `h:`, `cnt:`, `pt:`, `pending_ids`, `rem:`, `remind_ids`, `lock:`, `sc:`, `lc:`, `rs:`, `ss:`, `risk:`, `ms:`, `errcnt:`.
+- Functions deleted: `logAndSchedule`, `getHist`, `addHist`, `setResult`, `getCounter`, `addPending`, `getPendingIds`, `savePendingIds`, `getLock`/`setLock`/`clearLock`, `getPendingReminders`/`addReminder`/`delReminder`, `autoScan`, `resultCheck`, `expiryReminder`, `checkMilestone`, `updateRisk`/`getRisk`, `updateRegimeStats`/`getSessionStats`, `doCancelAll`, `fetchPrice`, `uid`.
+- Remaining bot KV is settings/UX state only: `u:`, `auto_users`, `summary_users`, `econ_cal` (news cache), `ct:` (confidence-trend alert window), `ds:`/`wr:` (last-summary timestamps).
+
+### Manual-override flow (changed)
+1. Signal cards (`/signal`, `/scan`, watchlist, replay) show `#<last6 of worker id>` and the ✅/❌ buttons carry the FULL worker `sig_...` id (fits in Telegram's 64-byte callback payload).
+2. Tapping ✅/❌ (or `/win <id>` / `/loss <id>`) → bot POSTs `worker /api/report?id=<sigId>&result=WIN|LOSS`.
+3. The worker is idempotent (FIX-4): a second report returns `alreadyRecorded` and never double-counts stats. The bot surfaces that in the reply.
+4. A short tag (`/win ab1b2c`) is resolved against the worker's history stream — the only lookup table; no bot ledger.
+
+### Per-pair-global history (INTENDED — not a bug)
+Worker `/api/history` is the pair's full signal stream (all users), not a per-user ledger. The user sees the pair's REAL stream — single source, no duplication. Per-user history would be a separate worker feature (future worker PR if ever wanted; not bundled here per R5).
+
+### Verification
+- `node --check src/index.js` → pass
+- `node round2-bugfix-test.mjs` → **60/60** (B3 section rewritten for the ledger removal)
+- `node menu-test.mjs` → **74/74** (cmd:cancelall removed, v4.5 version)
+- `node single-source-test.mjs` → **71/71** (NEW: T1 history-from-worker, T2 stats-from-worker, T3 /api/report override, T4 no-ledger audit, T5 best/heatmap/risk, T6 worker-backed cron)
+- Grep audit: `kput(\`h:` / `kput(\`pt:` → **0 matches**; `addPending`/`logAndSchedule`/`autoScan`/`resultCheck` → only historical header-comment mentions.
+
+---
+
 # CHANGES — v4.4.2 Round-2 Bugfix (no-duplicate signals + permanent 1042 fix)
 
 PR: `arena/019fe4bb-ftt-telegram-bot` → `main` (reviewer must approve before merge; no direct push to main).
