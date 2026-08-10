@@ -74,7 +74,7 @@ ok('dual shape OK + agrees true (both present, agrees wins) → true',
 console.log('\n═══ Integration re-verify (worker round-3 shapes) ═══\n');
 
 // 1. fillStatus on OTC: bot's signal message line ~ fillStatus || 'INSTANT' and fill badge in fmtSignal
-ok('logAndSchedule stores fillStatus || INSTANT', src.includes("fillStatus: sig.fillStatus || 'INSTANT'"));
+ok('thin-client: no bot ledger fillStatus store (worker single source)', !src.includes("getHist(") && !src.includes("addHist") && !src.includes("kput(`pt:"));
 ok('fmtSignal fill badge uses sig.fillStatus || INSTANT', src.includes("const fill = sig.fillStatus || 'INSTANT'"));
 ok('fmtSignal handles PENDING_ENTRY', src.includes("PENDING_ENTRY") && src.includes("entryDistancePct"));
 ok('fmtSignal fill badge shows distance', src.includes("entryDistancePct"));
@@ -84,7 +84,7 @@ ok('fmtSignal fill badge shows distance', src.includes("entryDistancePct"));
 ok('logAndSchedule called only for BUY/SELL in doSignal', /if \(dir === 'BUY' \|\| dir === 'SELL'\)/.test(src));
 ok('fmtSignal grade N/A cannot appear in pushed BUY/SELL path (NO_TRADE branch separate)',
    src.includes("if (dir === 'BUY' || dir === 'SELL')") && src.includes("⚪ <b>NO TRADE</b>"));
-ok('history only contains BUY/SELL (logAndSchedule only for BUY/SELL)', src.includes("direction: dir"));
+ok('thin-client: history from worker (no bot h: ledger)', !src.includes("getHist(") && src.includes("fetchWorkerHistory"));
 
 // 3. mode=fx: worker mode=fx now forces fresh (never cached) — bot fx fetch still works and SL/TP chips show
 ok('workerModeParam maps fx/both to &mode=fx', src.includes("workerModeParam") && src.includes("&mode=fx"));
@@ -108,12 +108,12 @@ const a1 = src.indexOf('async function resultCheck');
 const autoScanSrc = src.slice(a0, a1);
 
 // autoScan keeps bot-side analytics + bookkeeping
-ok('autoScan keeps logAndSchedule (bot history/pending/lock)', autoScanSrc.includes('await logAndSchedule(cid, pair, sig, env)'));
-ok('autoScan keeps candle-dedup bookkeeping (kput scKey)', autoScanSrc.includes('await kput(scKey, currentCandle, env'));
-ok('autoScan keeps anySignalSent / noTradeStreak bookkeeping', autoScanSrc.includes('anySignalSent = true'));
-ok('autoScan keeps confidence-trend tracker', autoScanSrc.includes('updateConfTrend'));
-ok('autoScan keeps same-candle gate (lc:)', autoScanSrc.includes('`lc:${cid}`'));
-ok('autoScan keeps lock check (lock:)', autoScanSrc.includes('getLock(cid, pair, env)'));
+ok('thin-client: autoScan does NOT keep logAndSchedule (no ledger)', !autoScanSrc.includes('logAndSchedule'));
+ok('thin-client: autoScan does NOT keep scKey dedup (worker is source)', !autoScanSrc.includes('scKey'));
+ok('thin-client: autoScan does NOT keep anySignalSent (no ledger)', !autoScanSrc.includes('anySignalSent'));
+ok('thin-client: autoScan does NOT keep conf trend (worker)', !autoScanSrc.includes('updateConfTrend'));
+ok('thin-client: autoScan does NOT keep lc: gate (worker)', !autoScanSrc.includes('`lc:${cid}`'));
+ok('thin-client: autoScan does NOT keep lock check (worker)', !autoScanSrc.includes('getLock'));
 
 // autoScan must NOT send signal cards — worker push is the single source
 ok('autoScan has NO sendMsg(cid, fmtSignal( — bot signal push removed', !autoScanSrc.includes('sendMsg(cid, fmtSignal('));

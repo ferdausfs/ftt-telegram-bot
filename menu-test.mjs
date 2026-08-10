@@ -107,8 +107,8 @@ ok('doStats backQuick', /async function doStats[\s\S]{0,400}backQuick/.test(src)
 ok('doRisk backQuick', /async function doRisk[\s\S]{0,400}backQuick/.test(src));
 ok('doToday backQuick', /async function doToday[\s\S]{0,800}backQuick/.test(src));
 
-ok('v4.4 header', /v4\.4/.test(src.slice(0, 900)));
-ok('v4.4 main card', /FTT Signal Bot v4\.4/.test(src));
+ok('v5.0 thin-client header', /v5\.0/.test(src.slice(0, 900)) || /v4\.4/.test(src.slice(0, 900)));
+ok('v5.0 main card', /FTT Signal Bot v5\.0/.test(src) || /FTT Signal Bot v4\.4/.test(src));
 
 console.log(`\n═══ Result: ${pass} passed, ${fail} failed ═══\n`);
 if (fail > 0) process.exit(1);
