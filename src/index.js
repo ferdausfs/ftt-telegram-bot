@@ -497,7 +497,7 @@ const btn = (text, cb) => ({ text, callback_data: cb });
 const signalKb = (sigId = null) => {
   const rows = [[{ text: '📈 Trade on Quotex', url: QUOTEX_URL }]];
   if (sigId) {
-    const tag = `#${String(sigId).slice(-6)}`;
+    const tag = `#${shortId(sigId)}`;
     rows.push([btn(`✅ WIN ${tag}`, `res:win:${sigId}`), btn(`❌ LOSS ${tag}`, `res:loss:${sigId}`)]);
   }
   rows.push([btn('🔁 New Signal', 'cmd:signal'), btn('📈 History', 'cmd:history:0'), btn('🔙 Menu', 'cmd:main')]);
@@ -635,8 +635,14 @@ const fmtPrice = (price, pair) => {
 };
 const modeLabel = m => m === 'fx' ? 'FX' : m === 'both' ? 'BOTH' : 'FTT';
 
-// Worker signal id → short display tag (sig_<ts>_<abcde> → last 6 chars)
-const shortId = id => String(id ?? '?').slice(-6);
+// Worker signal id → short display tag. Live ids look like
+// "sig_1786334140086_zq2es" → strip the "sig_<ts>_" prefix, keep the suffix
+// (or the last 6 chars for defensive fallback). Same transform is used for the
+// /win|/loss short-tag lookup, so display and resolution always agree.
+const shortId = id => {
+  const s = String(id ?? '');
+  return (s.includes('_') ? s.slice(s.lastIndexOf('_') + 1) : s).slice(-6);
+};
 
 // Worker history row → human session label (record.session is an array, e.g.
 // ['LONDON','NEWYORK']); sessionQuality is a fallback label.
@@ -1836,7 +1842,7 @@ async function doManualResult(cid, mid, sigIdRaw, result, env) {
     try {
       const d = await fetchWorker(`/api/history?pair=${u.pair}&limit=200`, env);
       const rows = Array.isArray(d?.signals) ? d.signals : [];
-      const matches = rows.filter(s => s.id && String(s.id).slice(-6) === raw);
+      const matches = rows.filter(s => s.id && shortId(s.id) === raw);
       if (matches.length === 0)
         return reply(cid, mid, `❌ No signal matching "<code>${esc(raw)}</code>" in worker history for ${esc(disp(u.pair))}.\n\nTap ✅/❌ on a signal card, or use the full id from 📈 History.`, env, mainKb(u));
       if (matches.length > 1)

@@ -39,7 +39,8 @@ const disp    = p => (p ? ((!p.includes('/') && p.length === 6) ? p.slice(0,3) +
 const isCr    = p => ['BTC','ETH','BNB','XRP','SOL','ADA','DOGE','AVAX','DOT','LINK'].some(b => String(p||'').startsWith(b));
 const fmtPrice = (price, pair) => { const v = parseFloat(price); if (isNaN(v)) return '?'; return isCr(pair) ? v.toFixed(2) : v.toFixed(5); };
 const msToHuman = ms => { if (ms <= 0) return 'expired'; const m = Math.floor(ms/60000); const s = Math.floor((ms%60000)/1000); return m > 0 ? `${m}m ${s}s` : `${s}s`; };
-const shortId = id => String(id ?? '?').slice(-6);
+// mirror src: strip "sig_<ts>_" prefix, keep suffix (or last 6 chars)
+const shortId = id => { const s = String(id ?? ''); return (s.includes('_') ? s.slice(s.lastIndexOf('_') + 1) : s).slice(-6); };
 const loadFn = (name, deps) => {
   const body = extractFn(src, name);
   if (!body) return null;
@@ -71,10 +72,11 @@ if (fmtHistWorker) {
   }));
   const out = fmtHistWorker(rows, 0, { total: 10 });
   ok('renders header with worker total', out.includes('of 10'));
+  ok('renders live-style short tag (sig_<ts>_abcde → #abcde)', out.includes('#ab0'));
   // R2: a single worker signal appears EXACTLY ONCE in the rendered page
   let dups = 0;
   for (const r of rows) {
-    const tag = '#' + r.id.slice(-6);
+    const tag = '#' + shortId(r.id);
     const n = out.split(tag).length - 1;
     if (n !== 1) dups++;
   }
@@ -129,7 +131,7 @@ ok('signalKb embeds worker sig id in button payloads',
 ok('res: callbacks slice the full worker sig id',
   src.includes("data.slice('res:win:'.length)") && src.includes("data.slice('res:loss:'.length)"));
 ok('short tag is resolved via worker history (single lookup, no bot ledger)',
-  src.includes("String(s.id).slice(-6) === raw"));
+  src.includes("shortId(s.id) === raw"));
 ok('idempotency note surfaced to user (alreadyRecorded)', src.includes('alreadyRecorded'));
 
 const doManualResult = loadFn('doManualResult', { fetchWorker: null, getUser: null, reply: null, esc, SEP, disp, shortId, afterKb: () => ({}), mainKb: () => ({}) });
