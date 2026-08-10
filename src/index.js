@@ -1,10 +1,37 @@
 /**
- * FTT Signal Telegram Bot — v4.4.2 (ROUND-2 BUGFIX R2: no-duplicate signals + permanent 1042 fix)
+ * FTT Signal Telegram Bot — v4.5.0 (WORKER = SINGLE SOURCE OF TRUTH)
  * KV Binding     : BOT_KV
  * Service Binding: SIGNAL_WORKER → asignal.umuhammadiswa.workers.dev
  * Secrets        : BOT_TOKEN, SETUP_SECRET
  *
- * ── v4.4.2 BUGFIXES (this round) ─────────────────────────────────────────────
+ * ── v4.5.0 ARCHITECTURE (this round) ─────────────────────────────────────────
+ *  The worker (Ftt-Otc-v6) is the SINGLE SOURCE OF TRUTH for ALL trading data.
+ *  The bot is a THIN Telegram client: it only DISPLAYS worker data and forwards
+ *  user actions to worker endpoints. The bot writes NO trade records.
+ *
+ *  [S1] Bot-side ledger REMOVED. logAndSchedule / addHist (h:, cnt:) / addPending
+ *       (pt:, pending_ids) / locks (lock:) / reminders (rem:, remind_ids) /
+ *       bot stats accumulators (rs:, ss:, risk:, ms:) are deleted. Signals exist
+ *       only in the worker's per-pair history stream.
+ *  [S2] /history, /stats, /best, /heatmap, /risk, /today, /summary, /journal,
+ *       /weekly, /status + main-menu card all READ the worker
+ *       (/api/history, /api/stats, /api/signals/latest). Nothing is computed
+ *       from a bot ledger.
+ *  [S3] Manual override reworked: /win <id> / /loss <id> and the ✅/❌ buttons
+ *       on signal cards carry the WORKER signal id (sig_...) and POST to the
+ *       worker's idempotent /api/report?id=…&result=WIN|LOSS (FIX-4 guard).
+ *  [S4] autoScan, resultCheck, expiryReminder, checkMilestone removed. Worker
+ *       every-2-min cron resolves results, Phase 10 push is the single delivery
+ *       + single result push. Bot cron only sends user-facing daily/weekly
+ *       summaries computed from worker endpoints.
+ *  [S5] Per-pair GLOBAL history (intended): the user sees the pair's real
+ *       signal stream from the worker — single source, no duplication.
+ *  [S6] Kept bot-side (non-trade UX only): user settings u:, auto_users /
+ *       summary_users lists, news-calendar cache, confidence-trend alert state
+ *       (ct: — a rolling per-user UX alert, not a ledger), ds:/wr: last-sent
+ *       summary timestamps.
+ *
+ * ── v4.4.2 BUGFIXES (previous round) ─────────────────────────────────────────
  *  [B3] Duplicate signal pushes eliminated. Worker push (Phase 10, BUG-001 fixed)
  *       is now the SINGLE source of auto signal delivery. autoScan no longer sends
  *       fmtSignal messages (nor custom-alert sends, nor the channel mirror) — it
@@ -143,9 +170,6 @@ const PAIR_PAGES = [
   ['XRP/USD','ADA/USD','DOGE/USD','AVAX/USD'],
 ];
 const MAX_WL       = 6;
-const MAX_HIST     = 100;
-const MILESTONE    = 50;
-const MAX_ERRORS   = 3;
 const NEWS_WINDOW  = 15; // ±minutes around high-impact news
 const CRYPTO       = ['BTC','ETH','BNB','XRP','SOL','ADA','DOGE','AVAX','DOT','LINK'];
 const QUOTEX_URL   = 'https://quotex.com/trade';
@@ -190,17 +214,23 @@ export default {
       return new Response('OK', json());
     }
     if (url.pathname === '/export' && secret()) {
+      // v4.5.0: exports the WORKER history stream for the chat's pair (single
+      // source). No bot ledger exists anymore.
       const id = url.searchParams.get('chat');
       if (!id) return new Response('?chat= required', { status: 400 });
-      const h = await getHist(id, env);
+      const u = await getUser(id, env);
+      const pair = u.pair || 'EURUSD';
+      const d = await fetchWorker(`/api/history?pair=${pair}&limit=500`, env).catch(() => null);
+      const h = Array.isArray(d?.signals) ? d.signals : [];
       if (!h.length) return new Response('No data', { status: 404 });
-      const hdr  = 'No,Pair,Dir,Grade,Conf,Entry,Exit,Pips,Result,Expiry,Time,ResolvedAt';
+      const hdr  = 'Id,Pair,Dir,Grade,Conf,Entry,Exit,Result,Expiry,Time,ResolvedAt,FillStatus,EntryHit';
       const rows = h.map(x => [
-        x.no||'', x.pair||'', x.direction||'', x.grade||'', x.confidence||'',
-        x.entryPrice||'', x.exitPrice||'', x.pips||'', x.result||'PENDING',
-        x.expiryMinutes||'', x.timestamp||'', x.resolvedAt||''
+        x.id||'', x.pair||'', x.direction||'', x.grade||'', x.confidence||'',
+        x.entryPrice||'', x.exitPrice||'', x.result||'PENDING',
+        x.expiryTime||'', x.timestamp||'', x.checkedAt||'',
+        x.fillStatus||'', x.entryHit ?? ''
       ].join(','));
-      const fname = `ftt-${id}-${new Date().toISOString().slice(0,10)}.csv`;
+      const fname = `ftt-${pair}-${new Date().toISOString().slice(0,10)}.csv`;
       return new Response([hdr, ...rows].join('\n'), {
         headers: {
           'Content-Type': 'text/csv',
@@ -208,12 +238,13 @@ export default {
         },
       });
     }
-    return new Response('FTT Signal Bot v4.4.2');
+    return new Response('FTT Signal Bot v4.5.0');
   },
 
   async scheduled(e, env, ctx) {
-    // Worker push (Phase 10) now handles all auto signal delivery + result push.
-    // Bot cron only handles: result tracking (for bot analytics), reminders, summaries.
+    // v4.5.0: worker owns ALL trading data (signal generation, result resolution,
+    // Phase 10 push). Bot cron only sends user-facing summaries (daily/weekly)
+    // computed from worker endpoints.
     ctx.waitUntil(cronLite(env));
   },
 };
@@ -272,47 +303,10 @@ const kget = async (k, env) => { try { return await env.BOT_KV.get(k, 'json'); }
 const kput = async (k, v, env, opts = {}) => { try { await env.BOT_KV.put(k, JSON.stringify(v), opts); } catch (e) { console.error('kput', k, e.message); } };
 const kdel = async (k, env) => { try { await env.BOT_KV.delete(k); } catch {} };
 
-// ─── ANALYTICS KV HELPERS ─────────────────────────────────────────────────────
-
-async function getRegimeStats(cid, env) {
-  const d = await kget(`rs:${cid}`, env);
-  return d || { TRENDING:{w:0,l:0}, RANGING:{w:0,l:0}, BREAKOUT:{w:0,l:0}, VOLATILE:{w:0,l:0} };
-}
-async function updateRegimeStats(cid, regime, result, env) {
-  if (!regime || (result !== 'WIN' && result !== 'LOSS')) return;
-  const s = await getRegimeStats(cid, env);
-  if (!s[regime]) s[regime] = { w:0, l:0 };
-  result === 'WIN' ? s[regime].w++ : s[regime].l++;
-  await kput(`rs:${cid}`, s, env);
-}
-
-async function getSessionStats(cid, env) {
-  const d = await kget(`ss:${cid}`, env);
-  return d || {};
-}
-async function updateSessionStats(cid, sessionKey, result, env) {
-  if (!sessionKey || (result !== 'WIN' && result !== 'LOSS')) return;
-  const s = await getSessionStats(cid, env);
-  if (!s[sessionKey]) s[sessionKey] = { w:0, l:0 };
-  result === 'WIN' ? s[sessionKey].w++ : s[sessionKey].l++;
-  await kput(`ss:${cid}`, s, env);
-}
-
-async function getRisk(cid, env) { return (await kget(`risk:${cid}`, env)) || { streak: 0, type: null }; }
-async function updateRisk(cid, result, env) {
-  const r = await getRisk(cid, env);
-  if (result === 'LOSS') {
-    r.streak = r.type === 'LOSS' ? r.streak + 1 : 1; r.type = 'LOSS';
-  } else if (result === 'WIN') {
-    r.streak = r.type === 'WIN' ? r.streak + 1 : 1; r.type = 'WIN';
-  } else {
-    r.streak = 0; r.type = null;
-  }
-  await kput(`risk:${cid}`, r, env, { expirationTtl: 86400 });
-  return r;
-}
-
-// [Fix#2] Feature #15: Confidence Trend Tracking
+// [Fix#2] Feature #15: Confidence Trend Tracking — NON-TRADE per-user UX state.
+// v4.5.0: this is a small rolling alert-state (last 3 confidence values of the
+// signals the bot shows this user), NOT a trade ledger. The confidence values
+// themselves come from the worker; the bot only keeps the per-user alert window.
 async function getConfTrend(cid, env) { return (await kget(`ct:${cid}`, env)) || []; }
 async function updateConfTrend(cid, confStr, env) {
   const val = parseInt((confStr || '0%').replace('%', ''), 10);
@@ -381,12 +375,20 @@ function getCurrencyExposure(pair, direction) {
   } catch { return {}; }
 }
 
-// Returns array of warning strings for correlated open trades
+// Returns array of warning strings for correlated open trades.
+// v4.5.0: pending trades come from the WORKER's per-pair history stream
+// (result === null rows) for the user's pair + watchlist — never a bot ledger.
 async function checkCorrelated(cid, newPair, newDir, env) {
   try {
-    const h       = await getHist(cid, env);
-    // [Bug#2 FIX] filter out entries with null/undefined pair
-    const pending = h.filter(x => !x.result && x.direction && x.pair && norm(x.pair) !== norm(newPair));
+    const u     = await getUser(cid, env);
+    const pairs = [u.pair, ...u.watchlist.map(norm)]
+      .filter((p, i, a) => a.indexOf(p) === i && norm(p) !== norm(newPair));
+    const all = await Promise.all(pairs.map(p =>
+      fetchWorker(`/api/history?pair=${p}&limit=20`, env).catch(() => null)
+    ));
+    const pending = all
+      .flatMap(d => (Array.isArray(d?.signals) ? d.signals : []))
+      .filter(x => !x.result && x.direction && x.pair && norm(x.pair) !== norm(newPair));
     const newExp  = getCurrencyExposure(newPair, newDir);
     const warnings = [];
     for (const t of pending) {
@@ -400,20 +402,6 @@ async function checkCorrelated(cid, newPair, newDir, env) {
     }
     return warnings;
   } catch { return []; }
-}
-
-// ─── EXPIRY REMINDERS ─────────────────────────────────────────────────────────
-
-async function getPendingReminders(env) { return (await kget('remind_ids', env)) || []; }
-async function addReminder(rem, env) {
-  await kput(`rem:${rem.tradeId}`, rem, env, { expirationTtl: 3600 });
-  const ids = await getPendingReminders(env);
-  if (!ids.includes(rem.tradeId)) await kput('remind_ids', [...ids, rem.tradeId], env);
-}
-async function delReminder(tid, env) {
-  await kdel(`rem:${tid}`, env);
-  const ids = await getPendingReminders(env);
-  await kput('remind_ids', ids.filter(x => x !== tid), env);
 }
 
 // ─── USER ─────────────────────────────────────────────────────────────────────
@@ -454,95 +442,6 @@ async function addSummaryUser(cid, env) {
 async function removeSummaryUser(cid, env) {
   const list = await getSummaryUsers(env);
   await kput('summary_users', list.filter(x => x !== String(cid)), env);
-}
-
-// ─── HISTORY ──────────────────────────────────────────────────────────────────
-
-const getHist    = async (cid, env) => (await kget(`h:${cid}`, env)) || [];
-const getCounter = async (cid, env) => (await kget(`cnt:${cid}`, env)) || 0;
-
-async function addHist(cid, entry, env) {
-  const h   = await getHist(cid, env);
-  const cnt = (await getCounter(cid, env)) + 1;
-  await kput(`cnt:${cid}`, cnt, env);
-  entry.no = cnt;
-  h.unshift(entry);
-  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
-  await kput(`h:${cid}`, h.slice(0, MAX_HIST).filter(x => new Date(x.timestamp).getTime() > cutoff), env);
-  return cnt;
-}
-
-async function setResult(cid, tid, result, exitPrice, pips, env) {
-  const h = await getHist(cid, env);
-  const i = h.findIndex(x => x.id === tid);
-  if (i !== -1) {
-    h[i] = { ...h[i], result, exitPrice, pips, resolvedAt: new Date().toISOString() };
-    await kput(`h:${cid}`, h, env);
-    if (result === 'WIN' || result === 'LOSS') {
-      const trade = h[i];
-      if (trade.regime)     await updateRegimeStats(cid, trade.regime, result, env);
-      if (trade.sessionKey) await updateSessionStats(cid, trade.sessionKey, result, env);
-    }
-  }
-}
-
-// ─── PENDING TRADES ───────────────────────────────────────────────────────────
-
-const getPendingIds  = async env => (await kget('pending_ids', env)) || [];
-const savePendingIds = (ids, env) => kput('pending_ids', ids, env);
-async function addPending(trade, env) {
-  await kput(`pt:${trade.tradeId}`, trade, env, { expirationTtl: 7200 });
-  const ids = await getPendingIds(env);
-  if (!ids.includes(trade.tradeId)) await kput('pending_ids', [...ids, trade.tradeId], env);
-}
-
-// ─── LOCKS ────────────────────────────────────────────────────────────────────
-
-const getLock   = (cid, pair, env) => kget(`lock:${cid}:${pair}`, env);
-const clearLock = (cid, pair, env) => kdel(`lock:${cid}:${pair}`, env);
-async function setLock(cid, pair, dir, expiryAt, env) {
-  const ttl = Math.max(60, Math.ceil((expiryAt - Date.now()) / 1000) + 120);
-  await kput(`lock:${cid}:${pair}`, { direction: dir, expiryAt }, env, { expirationTtl: ttl });
-}
-
-// ─── LOG & SCHEDULE ───────────────────────────────────────────────────────────
-
-async function logAndSchedule(cid, pair, sig, env) {
-  const dir        = sig.finalSignal;
-  // [Bug#5 FIX] FX trades have no fixed expiry (hold until SL/TP) — use a
-  // 60min tracking horizon and resolve by SL/TP hit in resultCheck.
-  // FTT trades keep the candle-based expiry.
-  const isFx       = sig.mode === 'fx';
-  const expMins    = isFx ? 60 : (sig.bestTimeframe?.expiry?.totalMinutes || 5);
-  const expAt      = Date.now() + expMins * 60 * 1000;
-  const entry      = sig.recommendations?.['1min']?.entry?.price || sig.recommendations?.['5min']?.entry?.price || null;
-  const sl         = isFx ? (sig.fxLevels?.sl ?? null) : null;
-  const tp         = isFx ? (sig.fxLevels?.tp ?? null) : null;
-  const grade      = sig.grade ? `${sig.grade.grade} ${sig.grade.label}` : '';
-  const tid        = uid();
-  const regime     = sig.marketRegime || 'UNKNOWN';
-  const session    = sig.session || {};
-  const sessionKey = session.overlap && session.overlap !== 'NONE'
-    ? session.overlap : (session.sessions && session.sessions[0]) || 'UNKNOWN';
-
-  const no = await addHist(cid, {
-    id: tid, pair, direction: dir, confidence: sig.confidence || '0%', grade,
-    entryPrice: entry, expiryMinutes: expMins, expiryAt: expAt, sl, tp,
-    fillStatus: sig.fillStatus || 'INSTANT',
-    timestamp: new Date().toISOString(), result: null, regime, sessionKey,
-  }, env);
-
-  await addPending({ chatId: String(cid), tradeId: tid, pair, direction: dir, entryPrice: entry, expiryAt: expAt, signalNo: no, grade, regime, sessionKey, sl, tp, fillStatus: sig.fillStatus || 'INSTANT' }, env);
-
-  // FX: no "expires in ~30s" reminder — the trade stays open until SL/TP
-  if (!isFx) {
-    const remAt = expAt - 30000;
-    if (remAt > Date.now())
-      await addReminder({ tradeId: tid, chatId: String(cid), pair, direction: dir, signalNo: no, remAt }, env);
-  }
-
-  await setLock(cid, pair, dir, expAt, env);
-  return no;
 }
 
 // ─── FILTERS ──────────────────────────────────────────────────────────────────
@@ -593,9 +492,14 @@ function msToHuman(ms) {
 const kb  = rows => ({ inline_keyboard: rows });
 const btn = (text, cb) => ({ text, callback_data: cb });
 
-const signalKb = (no = null) => {
+// v4.5.0: buttons carry the WORKER signal id (sig_...) — the ✅/❌ payload is
+// forwarded to worker /api/report?id=<sigId>&result=WIN|LOSS. No bot ledger `no`.
+const signalKb = (sigId = null) => {
   const rows = [[{ text: '📈 Trade on Quotex', url: QUOTEX_URL }]];
-  if (no) rows.push([btn(`✅ WIN #${no}`, `res:win:${no}`), btn(`❌ LOSS #${no}`, `res:loss:${no}`)]);
+  if (sigId) {
+    const tag = `#${String(sigId).slice(-6)}`;
+    rows.push([btn(`✅ WIN ${tag}`, `res:win:${sigId}`), btn(`❌ LOSS ${tag}`, `res:loss:${sigId}`)]);
+  }
   rows.push([btn('🔁 New Signal', 'cmd:signal'), btn('📈 History', 'cmd:history:0'), btn('🔙 Menu', 'cmd:main')]);
   return kb(rows);
 };
@@ -722,7 +626,6 @@ const backQuick = () => [btn('🔙 Back', 'cmd:quick'), btn('🏠 Menu', 'cmd:ma
 // which crashed /history /stats /best /weekly /journal. Now null-safe.
 const disp  = p  => (p ? ((!p.includes('/') && p.length === 6) ? p.slice(0,3) + '/' + p.slice(3) : p) : '?');
 const norm  = p  => String(p ?? '').replace('/', '');
-const uid   = () => Math.random().toString(36).slice(2, 8).toUpperCase();
 const isCr  = p  => CRYPTO.some(b => String(p || '').startsWith(b));
 const chunk = (arr, n) => arr.reduce((r, x, i) => (i % n === 0 ? r.push([x]) : r[r.length-1].push(x), r), []);
 const fmtPrice = (price, pair) => {
@@ -732,15 +635,32 @@ const fmtPrice = (price, pair) => {
 };
 const modeLabel = m => m === 'fx' ? 'FX' : m === 'both' ? 'BOTH' : 'FTT';
 
-// Arena hub card (status + 6-button grid below)
-function fmtMainMenu(u, cnt, wr, resolvedN) {
-  return `FTT Signal Bot v4.4.2\n${SEP}\n` +
+// Worker signal id → short display tag (sig_<ts>_<abcde> → last 6 chars)
+const shortId = id => String(id ?? '?').slice(-6);
+
+// Worker history row → human session label (record.session is an array, e.g.
+// ['LONDON','NEWYORK']); sessionQuality is a fallback label.
+const rowSession = x => String(((x.session && x.session[0]) || x.sessionQuality || '')).replace(/_/g, '-');
+
+// v4.5.0: main menu card — the signals/win-rate line comes from the WORKER
+// (/api/history for the user's pair). Worker failure degrades to "—" gracefully.
+async function fmtMainMenu(u, env) {
+  let summary = `📊 Signals: —  📈 Win Rate: —`;
+  try {
+    const d = await fetchWorker(`/api/history?pair=${u.pair}&limit=20`, env);
+    if (d && typeof d.total === 'number') {
+      const decided = d.decided ?? 0;
+      const wr = d.winRate != null ? Math.round(d.winRate * 100) : 0;
+      summary = `📊 Signals: ${d.total}  📈 Win Rate: ${wr}% (${decided} decided)`;
+    }
+  } catch { /* worker down — show settings only */ }
+  return `FTT Signal Bot v4.5.0\n${SEP}\n` +
     `💱 ${esc(disp(u.pair))} · ${u.interval}min · ${modeLabel(u.fxMode)}\n` +
     `🔄 Auto: ${u.autoEnabled ? 'ON ✅' : 'OFF'}  👁 Watchlist: ${u.watchlist.length} pairs\n` +
     `🎯 Grade: ${esc(u.gradeFilter || 'ALL')}  🤖 AI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}\n` +
     `📰 News Block: ${u.blockNews !== false ? 'ON' : 'OFF'}\n` +
     `${SEP}\n` +
-    `📊 Signals: ${cnt}  📈 Win Rate: ${wr}% (${resolvedN} resolved)\n` +
+    `${summary}\n` +
     `${SEP}\n` +
     `💡 <i>Tap a button below</i>`;
 }
@@ -810,8 +730,9 @@ function fmtSignal(data, pair, interval, no, opts = {}) {
   const regimeE = { TRENDING:'🔵', RANGING:'🟡', BREAKOUT:'🟠', VOLATILE:'🔴' };
 
   let msg = '';
-  if (opts.replay) msg += `🔄 <i>REPLAY — not logged</i>\n`;
-  if (no)          msg += `📌 Signal No. <b>${no}</b>\n`;
+  if (opts.replay) msg += `🔄 <i>REPLAY — preview only</i>\n`;
+  // v4.5.0: `no` is the WORKER signal id (sig_...) — display its short tag
+  if (no)          msg += `📌 Signal <code>#${esc(shortId(no))}</code>\n`;
   msg += header + '\n' + SEP + '\n';
 
   if (dir === 'BUY' || dir === 'SELL') {
@@ -910,8 +831,8 @@ function fmtSignal(data, pair, interval, no, opts = {}) {
 
     // ── Footer ─────────────────────────────────────────────────────────────
     msg += opts.replay
-      ? `🔄 <i>Replay only — result not tracked</i>`
-      : `⏳ <i>Result tracked automatically</i>`;
+      ? `🔄 <i>Replay — the signal still lands in the pair's worker history</i>`
+      : `⏳ <i>Result tracked by the worker automatically</i>`;
   } else {
     // ── NO_TRADE empty state (clean, informative) ─────────────────────────
     const filters = sig.filtersApplied || [];
@@ -924,21 +845,29 @@ function fmtSignal(data, pair, interval, no, opts = {}) {
   return msg;
 }
 
-function fmtHist(hist, page = 0) {
+// v4.5.0: renders WORKER /api/history rows 1:1 (single source, no bot ledger).
+// Each row: result icon · short id (last 6 of sig_…) · direction · pair ·
+// confidence · grade (calibrated) · entry price · fill status · entry hit ·
+// live countdown (pending) or date (resolved).
+function fmtHistWorker(hist, page = 0, meta = {}) {
   const per = 10, slice = hist.slice(page * per, page * per + per);
-  if (!hist.length) return `📈 History\n${SEP}\nNo signals yet.\n\n💡 Tap 📊 Signal Now to get your first signal.`;
+  const total = typeof meta.total === 'number' ? meta.total : hist.length;
+  if (!hist.length) return `📈 History\n${SEP}\nNo signals yet for this pair.\n\n💡 Tap 📊 Signal Now to get your first signal.`;
   if (!slice.length) return `📈 History\n${SEP}\nNo more signals on this page.`;
-  let msg = `📈 History (${page * per + 1}-${page * per + slice.length} of ${hist.length})\n${SEP}\n`;
+  let msg = `📈 History (${page * per + 1}-${page * per + slice.length} of ${total})\n${SEP}\n`;
   for (const h of slice) {
-    const dE = h.direction === 'BUY' ? '🟢' : '🔴';
-    const rE = h.result === 'WIN' ? '✅' : h.result === 'LOSS' ? '❌' : h.result === 'SKIP' ? '⏭' : h.result === 'CANCEL' ? '🗑' : '⏳';
-    const g  = h.grade  ? ` [${esc(h.grade.split(' ')[0])}]` : '';
-    const p  = h.pips != null ? ` ${h.pips > 0 ? '+' : ''}${h.pips}` : '';
-    // [UX3] pending rows show live countdown instead of the timestamp
-    const timeStr = (!h.result && h.expiryAt)
-      ? `⏳ ${msToHuman(h.expiryAt - Date.now())} left`
-      : new Date(h.timestamp).toUTCString().slice(5, 17);
-    msg += `${rE} #${String(h.no || '?').padStart(3)} ${dE} ${disp(h.pair).padEnd(8)} ${esc(h.confidence || '').padStart(4)}${g}${p.padStart(6)}  ${timeStr}\n`;
+    const dE = h.direction === 'BUY' ? '🟢' : h.direction === 'SELL' ? '🔴' : '⚪';
+    const rE = h.result === 'WIN' ? '✅' : h.result === 'LOSS' ? '❌' : h.result === 'TIE' ? '🤝' : h.result === 'SKIP' ? '⏭' : h.result === 'CANCEL' ? '🗑' : '⏳';
+    const g  = h.grade && h.grade !== 'N/A' ? ` [${esc(h.grade)}]` : '';
+    const entry = h.entryPrice != null ? ` 💰<code>${esc(fmtPrice(h.entryPrice, h.pair))}</code>` : '';
+    const fill = (h.fillStatus === 'PENDING_ENTRY' || h.fillStatus === 'PENDING') ? ' ⏳' : h.fillStatus === 'INSTANT' ? ' ⚡' : '';
+    const hit  = h.entryHit === true ? ' ✓' : h.entryHit === false ? ' ✗' : '';
+    // [UX3] pending rows show live countdown (worker expiryTime), resolved rows show date
+    const expMs = h.expiryTime ? new Date(h.expiryTime).getTime() : NaN;
+    const timeStr = (!h.result && isFinite(expMs))
+      ? `⏳ ${msToHuman(expMs - Date.now())} left`
+      : h.timestamp ? new Date(h.timestamp).toUTCString().slice(5, 17) : '';
+    msg += `${rE} #${shortId(h.id)} ${dE} ${disp(h.pair).padEnd(8)} ${esc(String(h.confidence || '')).padStart(4)}${g}${entry}${fill}${hit}  ${timeStr}\n`;
   }
   return msg;
 }
@@ -957,12 +886,14 @@ function calcDrawdown(resolved) {
   return { maxDd, maxLoss };
 }
 
-function fmtStats(hist, regimeStats, sessionStats) {
+// v4.5.0: renders WORKER /api/stats (winRate windowed, sampleSize, bySession /
+// byTF / byRegime) + WORKER /api/history rows (pending, streak, drawdown, grade
+// breakdown). Nothing is computed from a bot ledger.
+function fmtStatsWorker(stats, hist, pair) {
   const trades   = hist.filter(h => h.direction === 'BUY' || h.direction === 'SELL');
   const resolved = trades.filter(h => h.result === 'WIN' || h.result === 'LOSS');
   const wins     = resolved.filter(h => h.result === 'WIN').length;
   const losses   = resolved.length - wins;
-  const wr       = resolved.length > 0 ? Math.round(wins / resolved.length * 100) : 0;
   const pending  = trades.filter(h => !h.result).length;
   let streak = 0, sT = '';
   for (const h of resolved) {
@@ -970,45 +901,61 @@ function fmtStats(hist, regimeStats, sessionStats) {
     else if (h.result === sT) streak++;
     else break;
   }
-
-  // [F07] Drawdown
+  // [F07] Drawdown (worker history sequence)
   const { maxDd, maxLoss } = calcDrawdown(resolved);
 
-  let msg = `🏆 Win/Loss Stats\n${SEP}\n`;
-  msg += `✅ Wins: ${wins}  ❌ Losses: ${losses}\n`;
-  msg += `📊 Win Rate: ${wr}% (${resolved.length} trades)\n`;
+  if (!stats && resolved.length === 0)
+    return `🏆 Win/Loss Stats — ${esc(disp(pair))}\n${SEP}\nNo resolved trades yet.`;
+
+  // worker winRate is a 0..1 fraction over the rolling lookback window
+  const wrWindowed = stats?.winRate != null ? Math.round(stats.winRate * 100) : null;
+  const wrLifetime = resolved.length > 0 ? Math.round(wins / resolved.length * 100) : null;
+
+  let msg = `🏆 Win/Loss Stats — ${esc(disp(pair))}\n${SEP}\n`;
+  if (stats) msg += `✅ Wins: ${stats.wins ?? wins}  ❌ Losses: ${stats.losses ?? losses}\n`;
+  msg += `📊 Win Rate: ${wrWindowed ?? wrLifetime ?? 0}% (last ${stats?.sampleSize ?? resolved.length})\n`;
+  if (wrLifetime != null) msg += `📈 All-time: ${wrLifetime}% (${resolved.length} decided)\n`;
   msg += `⏳ Pending: ${pending}`;
   if (streak >= 2) msg += `\n🔥 Streak: ${streak} ${sT}s`;
   if (maxLoss > 0) msg += `\n📉 Max Losing Streak: ${maxLoss}  Max Drawdown: ${maxDd} trades`;
 
-  if (regimeStats) {
-    const regimes = Object.entries(regimeStats).filter(([, s]) => s.w + s.l > 0);
+  if (stats?.byRegime) {
+    const regimes = Object.entries(stats.byRegime).filter(([, s]) => (s.wins || 0) + (s.losses || 0) > 0);
     if (regimes.length) {
       msg += `\n\n📊 By Regime:\n`;
       const rE = { TRENDING:'🔵', RANGING:'🟡', BREAKOUT:'🟠', VOLATILE:'🔴' };
       for (const [r, s] of regimes) {
-        const t = s.w + s.l;
-        const pct = Math.round(s.w / t * 100);
-        msg += `  ${rE[r]||'⚪'} ${r}: ${s.w}W/${s.l}L (${pct}%) ${pct>=55?'✅':pct>=45?'⚠️':'❌'}\n`;
+        const t = s.wins + s.losses;
+        const pct = Math.round(s.wins / t * 100);
+        msg += `  ${rE[r]||'⚪'} ${r}: ${s.wins}W/${s.losses}L (${pct}%) ${pct>=55?'✅':pct>=45?'⚠️':'❌'}\n`;
       }
     }
   }
-  if (sessionStats) {
-    const sessions = Object.entries(sessionStats).filter(([, s]) => s.w + s.l > 0);
+  if (stats?.bySession) {
+    const sessions = Object.entries(stats.bySession).filter(([, s]) => (s.wins || 0) + (s.losses || 0) > 0);
     if (sessions.length) {
       msg += `\n⏰ By Session:\n`;
       for (const [s, v] of sessions) {
-        const t = v.w + v.l;
-        const pct = Math.round(v.w / t * 100);
-        msg += `  ${s}: ${v.w}W/${v.l}L (${pct}%) ${pct>=55?'✅':pct>=45?'⚠️':'❌'}\n`;
+        const t = v.wins + v.losses;
+        const pct = Math.round(v.wins / t * 100);
+        msg += `  ${s}: ${v.wins}W/${v.losses}L (${pct}%) ${pct>=55?'✅':pct>=45?'⚠️':'❌'}\n`;
       }
     }
   }
-  const pm = {}, gm = {};
+  if (stats?.byTF) {
+    const tfs = Object.entries(stats.byTF).filter(([, s]) => (s.wins || 0) + (s.losses || 0) > 0);
+    if (tfs.length) {
+      msg += `\n⏱ By TF:\n`;
+      for (const [tf, v] of tfs) {
+        const t = v.wins + v.losses;
+        const pct = Math.round(v.wins / t * 100);
+        msg += `  ${tf}: ${v.wins}W/${v.losses}L (${pct}%) ${pct>=55?'✅':pct>=45?'⚠️':'❌'}\n`;
+      }
+    }
+  }
+  const gm = {};
   for (const h of resolved) {
-    if (!pm[h.pair]) pm[h.pair] = { w:0, l:0 };
-    h.result === 'WIN' ? pm[h.pair].w++ : pm[h.pair].l++;
-    const g = (h.grade || '?').split(' ')[0];
+    const g = (h.grade && h.grade !== 'N/A') ? h.grade : '?';
     if (!gm[g]) gm[g] = { w:0, l:0 };
     h.result === 'WIN' ? gm[g].w++ : gm[g].l++;
   }
@@ -1019,14 +966,11 @@ function fmtStats(hist, regimeStats, sessionStats) {
       msg += `  ${esc(g)}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)\n`;
     }
   }
-  if (Object.keys(pm).length) {
-    msg += `\nTop Pairs:\n`;
-    Object.entries(pm).sort((a,b)=>(b[1].w+b[1].l)-(a[1].w+a[1].l)).slice(0,5)
-      .forEach(([p,s]) => { const t=s.w+s.l; msg += `  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w/t*100)}%)\n`; });
-  }
   return msg;
 }
 
+// v4.5.0: journal is computed from WORKER history rows (timestamp, marketRegime,
+// session array, worker signal id). No bot ledger.
 function fmtJournal(hist, date) {
   const today = date || new Date().toISOString().slice(0, 10);
   const th = hist.filter(x => x.timestamp?.startsWith(today));
@@ -1039,16 +983,16 @@ function fmtJournal(hist, date) {
   for (const x of th.slice(0, 10)) {
     const dE = x.direction === 'BUY' ? '🟢' : '🔴';
     const rE = x.result === 'WIN' ? '✅' : x.result === 'LOSS' ? '❌' : x.result === 'CANCEL' ? '🗑' : '⏳';
-    const rg = x.regime ? ` [${esc(x.regime.slice(0,3))}]` : '';
-    const sk = x.sessionKey ? ` ${esc(x.sessionKey.replace('_','-'))}` : '';
-    msg += `${rE} #${x.no} ${dE} ${disp(x.pair)} ${esc(x.confidence || '')}${rg}${sk}\n`;
+    const rg = x.marketRegime ? ` [${esc(x.marketRegime.slice(0,3))}]` : '';
+    const sk = rowSession(x) ? ` ${esc(rowSession(x))}` : '';
+    msg += `${rE} #${shortId(x.id)} ${dE} ${disp(x.pair)} ${esc(x.confidence || '')}${rg}${sk}\n`;
   }
   if (th.length > 10) msg += `...+${th.length - 10} more\n`;
   const regToday = {};
   for (const x of res) {
-    if (!x.regime) continue;
-    if (!regToday[x.regime]) regToday[x.regime] = { w:0, l:0 };
-    x.result === 'WIN' ? regToday[x.regime].w++ : regToday[x.regime].l++;
+    if (!x.marketRegime) continue;
+    if (!regToday[x.marketRegime]) regToday[x.marketRegime] = { w:0, l:0 };
+    x.result === 'WIN' ? regToday[x.marketRegime].w++ : regToday[x.marketRegime].l++;
   }
   if (Object.keys(regToday).length) {
     msg += `\nToday's Regimes:\n`;
@@ -1076,9 +1020,10 @@ function fmtWeekly(hist, weekLabel) {
   msg += `📊 ${wh.length} signals  ✅ ${wins}W ❌ ${res.length-wins}L\n📈 Win Rate: ${wr}%\n`;
   const rm = {};
   for (const x of res) {
-    if (!x.regime) continue;
-    if (!rm[x.regime]) rm[x.regime] = { w:0, l:0 };
-    x.result === 'WIN' ? rm[x.regime].w++ : rm[x.regime].l++;
+    const r = x.marketRegime;
+    if (!r) continue;
+    if (!rm[r]) rm[r] = { w:0, l:0 };
+    x.result === 'WIN' ? rm[r].w++ : rm[r].l++;
   }
   if (Object.keys(rm).length) {
     const sorted = Object.entries(rm).map(([r,s])=>{ const t=s.w+s.l; return { r, w:s.w, l:s.l, pct:t>0?Math.round(s.w/t*100):0 }; }).sort((a,b)=>b.pct-a.pct);
@@ -1107,10 +1052,10 @@ function fmtWeekly(hist, weekLabel) {
   return msg;
 }
 
-// [F04] Risk Dashboard
-function fmtRisk(hist) {
-  // [Bug#2 FIX] filter out entries with null pair to avoid getCurrencyExposure crash
-  const pending = hist.filter(x => !x.result && (x.direction === 'BUY' || x.direction === 'SELL') && x.pair);
+// [F04] Risk Dashboard — v4.5.0: pending rows come from WORKER per-pair history
+// (result === null), so the dashboard reflects the pair's real open-signal stream.
+// "Cancel All" was removed: the worker owns the ledger and has no cancel endpoint.
+function fmtRiskWorker(pending) {
   if (!pending.length) return `📉 Open Risk Dashboard\n${SEP}\nNo open trades — nice and clean. ✅`;
   const now = Date.now();
   let msg = `📉 Open Risk Dashboard\n${SEP}\n${pending.length} open trade(s)\n`;
@@ -1124,10 +1069,11 @@ function fmtRisk(hist) {
   }
   for (const t of pending) {
     const dE      = t.direction === 'BUY' ? '🟢' : '🔴';
-    const g       = t.grade ? ` [${esc(t.grade.split(' ')[0])}]` : '';
-    const rem     = t.expiryAt ? msToHuman(t.expiryAt - now) : '?';
-    const expired = t.expiryAt && t.expiryAt < now;
-    msg += `${dE} #${t.no} ${t.direction} ${disp(t.pair)}${g} ${esc(t.confidence || '')}\n`;
+    const g       = t.grade && t.grade !== 'N/A' ? ` [${esc(t.grade)}]` : '';
+    const expMs   = t.expiryTime ? new Date(t.expiryTime).getTime() : NaN;
+    const rem     = isFinite(expMs) ? msToHuman(expMs - now) : '?';
+    const expired = isFinite(expMs) && expMs < now;
+    msg += `${dE} #${shortId(t.id)} ${t.direction} ${disp(t.pair)}${g} ${esc(t.confidence || '')}\n`;
     msg += `   Entry: ${t.entryPrice ? fmtPrice(t.entryPrice, t.pair) : '?'}  ${expired ? '⏳ Result pending' : `⏱ ${rem} left`}\n`;
   }
   const multi = Object.entries(exposure).filter(([, v]) => (v.long + v.short) > 1 && v.long > 0 && v.short === 0);
@@ -1135,9 +1081,10 @@ function fmtRisk(hist) {
   return msg;
 }
 
-// [F05] Hourly Heatmap
-function fmtHeatmap(hist) {
-  const resolved = hist.filter(x => x.result === 'WIN' || x.result === 'LOSS');
+// [F05] Hourly Heatmap — v4.5.0: computed from WORKER history rows (all pairs'
+// resolved signals aggregated from /api/history; timestamps are UTC ISO).
+function fmtHeatmapWorker(hist) {
+  const resolved = hist.filter(x => (x.result === 'WIN' || x.result === 'LOSS') && x.direction);
   if (!resolved.length) return `🕐 Hourly Heatmap\n${SEP}\nNo resolved trades yet.`;
   const hmap = {};
   for (const h of resolved) {
@@ -1167,29 +1114,28 @@ function fmtHeatmap(hist) {
   return msg;
 }
 
-// [F06] Best Pairs Leaderboard
-function fmtBest(hist) {
-  const resolved = hist.filter(x => x.result === 'WIN' || x.result === 'LOSS');
-  if (!resolved.length) return `🔥 Best Pairs\n${SEP}\nNo resolved trades yet.`;
-  const pm = {};
-  for (const h of resolved) {
-    if (!h.pair) continue;
-    if (!pm[h.pair]) pm[h.pair] = { w:0, l:0 };
-    h.result === 'WIN' ? pm[h.pair].w++ : pm[h.pair].l++;
-  }
-  const ranked = Object.entries(pm)
-    .map(([p,s]) => { const t=s.w+s.l; return { p, w:s.w, l:s.l, t, pct: Math.round(s.w/t*100) }; })
+// [F06] Best Pairs Leaderboard — v4.5.0: aggregates WORKER /api/stats (all pairs,
+// already ranked by windowed winRate) + /api/signals/latest (per-pair direction).
+function fmtBestWorker(statsAll, latest) {
+  const pairs = Array.isArray(statsAll?.pairs) ? statsAll.pairs : [];
+  const ranked = pairs
+    .map(p => {
+      const w = p.wins || 0, l = p.losses || 0;
+      return { p: p.pair, w, l, t: w + l, pct: Math.round((p.winRate || 0) * 100) };
+    })
     .filter(x => x.t >= 3)
-    .sort((a,b) => b.pct - a.pct || b.t - a.t);
+    .sort((a, b) => b.pct - a.pct || b.t - a.t);
 
-  if (!ranked.length) return `🔥 Best Pairs\n${SEP}\nNeed at least 3 trades per pair.`;
+  if (!ranked.length) return `🔥 Best Pairs\n${SEP}\nNo pairs with 3+ decided trades yet.`;
 
   const medals = ['🥇','🥈','🥉','4️⃣','5️⃣'];
   let msg = `🔥 Best Pairs Leaderboard\n${SEP}\n`;
   ranked.slice(0, 7).forEach((x, i) => {
     const bar  = '█'.repeat(Math.round(x.pct/10)) + '░'.repeat(10-Math.round(x.pct/10));
     const icon = x.pct >= 60 ? '✅' : x.pct >= 45 ? '⚠️' : '❌';
-    msg += `${medals[i]||'  '} ${disp(x.p).padEnd(8)} ${bar} ${x.pct}% (${x.w}W/${x.l}L) ${icon}\n`;
+    const lv = latest?.signals?.[x.p]?.signal?.finalSignal || latest?.signals?.[x.p]?.finalSignal || null;
+    const lE = lv === 'BUY' ? '🟢' : lv === 'SELL' ? '🔴' : '⚪';
+    msg += `${medals[i]||'  '} ${disp(x.p).padEnd(8)} ${bar} ${x.pct}% (${x.w}W/${x.l}L) ${icon} ${lE}\n`;
   });
   if (ranked.length > 7) msg += `...+${ranked.length - 7} more pairs\n`;
   msg += `\n💡 Tip: Add top pairs to your Watchlist for auto scanning`;
@@ -1223,7 +1169,6 @@ async function onMessage(msg, env) {
   if (text.startsWith('/watchlist')) return doWatchlist(cid, null, env);
   if (text.startsWith('/today'))     return doToday(cid, null, env);
   if (text.startsWith('/summary'))   return doSummary(cid, null, env);
-  if (text.startsWith('/cancelall')) return doCancelAll(cid, null, env);
   if (text.startsWith('/journal'))   return doJournal(cid, null, env);
   if (text.startsWith('/weekly'))    return doWeekly(cid, null, env);
   if (text.startsWith('/analyze'))   return doAnalyze(cid, null, text.slice(8).trim() || null, env);
@@ -1246,13 +1191,14 @@ async function onMessage(msg, env) {
     return R('✅ Channel removed.', mainKb(u));
   }
 
-  // Manual WIN/LOSS
+  // Manual WIN/LOSS — v4.5.0: uses the WORKER signal id (sig_... or its last-6
+  // short tag from 📈 History). The bot POSTs it to worker /api/report.
   if (text.startsWith('/win ') || text.startsWith('/loss ')) {
     const parts  = text.split(' ');
     const result = text.startsWith('/win') ? 'WIN' : 'LOSS';
-    const no     = parseInt(parts[1], 10);
-    if (isNaN(no)) return R(`❌ Usage: /win 5  or  /loss 5`, mainKb(u));
-    return doManualResult(cid, null, no, result, env);
+    const sigId  = parts.slice(1).join('').trim();
+    if (!sigId) return R(`❌ Usage: /win <signal id>  or  /loss <signal id>\n\nFind ids in 📈 History (or tap ✅/❌ on a signal card).`, mainKb(u));
+    return doManualResult(cid, null, sigId, result, env);
   }
   if (text.startsWith('/pair ')) {
     const raw = text.slice(6).trim().toUpperCase().replace(/[\s/]/g, '');
@@ -1265,7 +1211,7 @@ async function onMessage(msg, env) {
     return R('❌ Use: 1, 5, or 15', mainKb(u));
   }
   if (text.startsWith('/help'))
-    return R(`<b>FTT Signal Bot — Commands</b>\n\n📊 <b>Core:</b>\n/signal — get signal\n/scan — scan all pairs\n/auto — toggle auto scan\n\n📈 <b>Analytics:</b>\n/history — trade history\n/stats — win rate stats\n/today — today's performance\n/summary — daily summary\n/best — best pairs leaderboard\n/risk — risk dashboard\n/heatmap — win rate by hour\n\n⚙️ <b>Settings:</b>\n/pair EURUSD — set pair\n/interval 5 — set interval\n/watchlist — manage watchlist\n/replay EURUSD — analyze without logging\n/setchannel — mirror to channel\n/cancelall — cancel pending\n/win <no> /loss <no> — manual override\n\n💡 <i>Just type a pair name to scan instantly</i>`, mainKb(u));
+    return R(`<b>FTT Signal Bot — Commands</b>\n\n📊 <b>Core:</b>\n/signal — get signal\n/scan — scan all pairs\n/auto — toggle auto\n\n📈 <b>Analytics (worker data):</b>\n/history — trade history\n/stats — win rate stats\n/today — today's performance\n/summary — daily summary\n/best — best pairs leaderboard\n/risk — risk dashboard\n/heatmap — win rate by hour\n\n⚙️ <b>Settings:</b>\n/pair EURUSD — set pair\n/interval 5 — set interval\n/watchlist — manage watchlist\n/replay EURUSD — analyze without logging\n/setchannel — mirror to channel\n/win <id> /loss <id> — manual result → worker\n\n💡 <i>Just type a pair name to scan instantly</i>`, mainKb(u));
 
   // Auto pair detect
   const rawPair = text.toUpperCase().replace(/[\s\/\-_.]/g, '');
@@ -1307,11 +1253,7 @@ async function _handleCb(cid, mid, data, u, env) {
   const R = (text, kboard) => reply(cid, mid, text, env, kboard);
 
   if (data === 'cmd:main') {
-    const h   = await getHist(cid, env);
-    const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
-    const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
-    const cnt = await getCounter(cid, env);
-    return R(fmtMainMenu(u, cnt, wr, res.length), mainKb(u));
+    return R(await fmtMainMenu(u, env), mainKb(u));
   }
 
   if (data === 'cmd:signal')      return doSignal(cid, mid, env);
@@ -1417,12 +1359,11 @@ async function _handleCb(cid, mid, data, u, env) {
     return R(`👁 Add to Watchlist (${u.watchlist.length}/${MAX_WL}):`, wlAddKb(page, u.watchlist));
   }
 
-  // [Bug#2 FIX] cmd:cancelall was used in Risk Dashboard button but had no handler
-  if (data === 'cmd:cancelall')   return doCancelAll(cid, mid, env);
-
   if (data.startsWith('qs:')) return doQuickSignal(cid, mid, data.slice(3), env);
-  if (data.startsWith('res:win:'))  return doManualResult(cid, mid, parseInt(data.split(':')[2], 10), 'WIN', env);
-  if (data.startsWith('res:loss:')) return doManualResult(cid, mid, parseInt(data.split(':')[2], 10), 'LOSS', env);
+  // v4.5.0: res:win:<sigId> / res:loss:<sigId> carry the WORKER signal id and
+  // are forwarded to worker /api/report (idempotent — no double-count).
+  if (data.startsWith('res:win:'))  return doManualResult(cid, mid, data.slice('res:win:'.length), 'WIN', env);
+  if (data.startsWith('res:loss:')) return doManualResult(cid, mid, data.slice('res:loss:'.length), 'LOSS', env);
 }
 
 // ─── ACTION FUNCTIONS ─────────────────────────────────────────────────────────
@@ -1430,11 +1371,7 @@ async function _handleCb(cid, mid, data, u, env) {
 // Shared helper: restore original message with main menu after sending a signal card
 async function restoreMainMsg(cid, mid, u, env) {
   if (!mid) return;
-  const h   = await getHist(cid, env);
-  const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
-  const wr  = res.length > 0 ? Math.round(res.filter(x => x.result === 'WIN').length / res.length * 100) : 0;
-  const cnt = await getCounter(cid, env);
-  await editMsg(cid, mid, fmtMainMenu(u, cnt, wr, res.length), env, { reply_markup: mainKb(u) });
+  await editMsg(cid, mid, await fmtMainMenu(u, env), env, { reply_markup: mainKb(u) });
 }
 
 async function doSignal(cid, mid, env) {
@@ -1454,13 +1391,15 @@ async function doSignal(cid, mid, env) {
     ]);
     const sig = data.signal;
     const dir = sig?.finalSignal;
-    let no = null, corrWarnings = [];
+    // v4.5.0: no bot logging — the WORKER already saved this signal (its id is
+    // in data.id) and owns the result. Buttons carry the worker signal id.
+    const sigId = (dir === 'BUY' || dir === 'SELL') ? (data.id || null) : null;
+    let corrWarnings = [];
     if (dir === 'BUY' || dir === 'SELL') {
       corrWarnings = await checkCorrelated(cid, u.pair, dir, env);
-      no = await logAndSchedule(cid, u.pair, sig, env);
     }
-    const useKb  = (dir === 'BUY' || dir === 'SELL') ? signalKb(no) : afterKb();
-    await sendMsg(cid, fmtSignal(data, u.pair, u.interval, no, { newsAlert, correlated: corrWarnings, mode: normMode(u.fxMode) }), env, { reply_markup: useKb });
+    const useKb  = (dir === 'BUY' || dir === 'SELL') ? signalKb(sigId) : afterKb();
+    await sendMsg(cid, fmtSignal(data, u.pair, u.interval, sigId, { newsAlert, correlated: corrWarnings, mode: normMode(u.fxMode) }), env, { reply_markup: useKb });
     // Restore button message (button flow) or delete loading msg (text command flow)
     if (mid) {
       await restoreMainMsg(cid, mid, u, env);
@@ -1499,13 +1438,14 @@ async function doQuickSignal(cid, mid, pair, env) {
     ]);
     const sig = data.signal;
     const dir = sig?.finalSignal;
-    let no = null, corrWarnings = [];
+    // v4.5.0: no bot logging — the worker signal id rides on the ✅/❌ buttons.
+    const sigId = (dir === 'BUY' || dir === 'SELL') ? (data.id || null) : null;
+    let corrWarnings = [];
     if (dir === 'BUY' || dir === 'SELL') {
       corrWarnings = await checkCorrelated(cid, pair, dir, env);
-      no = await logAndSchedule(cid, pair, sig, env);
     }
-    const useKb  = (dir === 'BUY' || dir === 'SELL') ? signalKb(no) : afterKb();
-    await sendMsg(cid, fmtSignal(data, pair, u.interval, no, { newsAlert, correlated: corrWarnings, mode: normMode(u.fxMode) }), env, { reply_markup: useKb });
+    const useKb  = (dir === 'BUY' || dir === 'SELL') ? signalKb(sigId) : afterKb();
+    await sendMsg(cid, fmtSignal(data, pair, u.interval, sigId, { newsAlert, correlated: corrWarnings, mode: normMode(u.fxMode) }), env, { reply_markup: useKb });
     if (mid) {
       await restoreMainMsg(cid, mid, u, env);
     } else if (loadingMid) {
@@ -1544,9 +1484,10 @@ async function doScanAll(cid, mid, env) {
       const sig  = data.signal;
       const dir  = sig?.finalSignal;
       if ((dir === 'BUY' || dir === 'SELL') && passGrade(sig, u.gradeFilter) && passConf(sig, u.minConfidence) && passAI(sig, u.aiOnlyMode)) {
+        // v4.5.0: no bot logging — worker owns the record; buttons carry its id.
         const corrWarnings = await checkCorrelated(cid, pair, dir, env);
-        const no = await logAndSchedule(cid, pair, sig, env);
-        await sendMsg(cid, fmtSignal(data, pair, u.interval, no, { correlated: corrWarnings, mode: normMode(u.fxMode) }), env, { reply_markup: signalKb(no) });
+        const sigId = data.id || null;
+        await sendMsg(cid, fmtSignal(data, pair, u.interval, sigId, { correlated: corrWarnings, mode: normMode(u.fxMode) }), env, { reply_markup: signalKb(sigId) });
         found++;
       }
     } catch (e) { console.error(`scan ${pair}:`, e.message); }
@@ -1564,19 +1505,18 @@ async function doScanAll(cid, mid, env) {
 async function doToggle(cid, mid, env) {
   const u = await getUser(cid, env);
   u.autoEnabled = !u.autoEnabled;
-  u.noTradeStreak = 0;
   await saveUser(cid, u, env);
   if (u.autoEnabled) {
     await addAutoUser(cid, env);
   } else {
     await removeAutoUser(cid, env);
-    await kdel(`lc:${cid}`, env);
-    await kput(`errcnt:${cid}`, 0, env);
   }
   const wl = u.watchlist.map(disp).join(', ');
+  // v4.5.0: the bot has no scan cron — worker push is the single delivery
+  // channel. The toggle keeps the user setting + weekly-report targeting.
   const t  = u.autoEnabled
-    ? `🔄 Auto Scan ON\n${SEP}\n${esc(disp(u.pair))}${wl ? '\nWatchlist: ' + esc(wl) : ''}\nInterval: ${u.interval}min  Grade: ${esc(u.gradeFilter || 'ALL')}\nAI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}  News Block: ${u.blockNews !== false ? 'ON' : 'OFF'}\n⏰ Next scan: ${nextCandleIn(u.interval)}`
-    : `🔕 Auto Scan OFF\n${SEP}\nAuto scanning stopped.`;
+    ? `🔄 Auto ON\n${SEP}\nWorker push delivers signals for your pairs (single source).\n${esc(disp(u.pair))}${wl ? '\nWatchlist: ' + esc(wl) : ''}\nInterval: ${u.interval}min  Grade: ${esc(u.gradeFilter || 'ALL')}\nAI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}  News Block: ${u.blockNews !== false ? 'ON' : 'OFF'}`
+    : `🔕 Auto OFF\n${SEP}\nWorker push delivery for your pairs is not subscribed via the bot setting.\n\n📊 Use 📊 Signal Now or 👁 Watchlist any time — data always comes from the worker.`;
   // Stay on Quick actions hub so user can keep acting
   return reply(cid, mid, t, env, quickKb(u));
 }
@@ -1619,59 +1559,132 @@ async function doExportInfo(cid, mid, env) {
     `⬇ Export History\n${SEP}\n` +
     `CSV export is available via the admin endpoint:\n\n` +
     `<code>/export?secret=…&amp;chat=${cid}</code>\n\n` +
-    `Columns: No, Pair, Dir, Grade, Conf, Entry, Exit, Pips, Result, Expiry, Time, ResolvedAt\n\n` +
+    `Columns: Id, Pair, Dir, Grade, Conf, Entry, Exit, Result, Expiry, Time, ResolvedAt, FillStatus, EntryHit\n\n` +
     `💡 Ask your bot admin if you need a dump.`;
   return reply(cid, mid, t, env, settingsKb(await getUser(cid, env)));
 }
 
 async function doStatus(cid, mid, env) {
-  const u   = await getUser(cid, env);
-  const cnt = await getCounter(cid, env);
-  const h   = await getHist(cid, env);
-  const pen = h.filter(x => !x.result && x.direction).length;
-  const nextScan = u.autoEnabled ? `\n⏰ Next scan: ${nextCandleIn(u.interval)}` : '';
-  const t = `📋 Status\n${SEP}\nPair: ${esc(disp(u.pair))}\nWatchlist: ${u.watchlist.map(disp).join(', ') || 'None'}\nInterval: ${u.interval}min\nAuto: ${u.autoEnabled ? 'ON' : 'OFF'}${nextScan}\nGrade: ${esc(u.gradeFilter || 'ALL')}\nMin Conf: ${u.minConfidence || 0}%\nAI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}\nNews Block: ${u.blockNews !== false ? 'ON' : 'OFF'}\nSummary: ${u.dailySummary ? 'ON' : 'OFF'}\nChannel: ${u.channelId ? esc(String(u.channelId)) : 'None'}\nTotal Signals: ${cnt}  Pending: ${pen}`;
+  const u = await getUser(cid, env);
+  // v4.5.0: totals/pending/win-rate come from the WORKER (/api/history window).
+  let total = '—', pending = '—', wr = '—';
+  try {
+    const d = await fetchWorker(`/api/history?pair=${u.pair}&limit=20`, env);
+    if (d) {
+      total   = d.total ?? '—';
+      pending = d.pending ?? '—';
+      wr      = d.winRate != null ? Math.round(d.winRate * 100) + '%' : '—';
+    }
+  } catch { /* worker down — show settings + dashes */ }
+  const t = `📋 Status\n${SEP}\nPair: ${esc(disp(u.pair))}\nWatchlist: ${u.watchlist.map(disp).join(', ') || 'None'}\nInterval: ${u.interval}min\nAuto: ${u.autoEnabled ? 'ON' : 'OFF'} (worker push)\nGrade: ${esc(u.gradeFilter || 'ALL')}\nMin Conf: ${u.minConfidence || 0}%\nAI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}\nNews Block: ${u.blockNews !== false ? 'ON' : 'OFF'}\nSummary: ${u.dailySummary ? 'ON' : 'OFF'}\nChannel: ${u.channelId ? esc(String(u.channelId)) : 'None'}\n\n📊 Worker stream for ${esc(disp(u.pair))}:\nSignals: ${total}  Pending (last 20): ${pending}  Win Rate (last 20): ${wr}`;
   return reply(cid, mid, t, env, kb([[btn('⚙️ Settings', 'cmd:settings'), btn('📉 Risk', 'cmd:risk')], backQuick()]));
 }
 
+// v4.5.0: /history reads the WORKER's per-pair global stream — the single
+// source. cbShadow rows (circuit-breaker counterfactuals) are hidden from the
+// user display (they were never tradable); pagination uses worker `total`.
 async function doHist(cid, mid, page, env) {
-  const h = await getHist(cid, env);
-  return reply(cid, mid, fmtHist(h, page), env, histNavKb(page, h.length));
+  const u = await getUser(cid, env);
+  try {
+    const data = await fetchWorker(`/api/history?pair=${u.pair}&limit=${(page + 1) * 10}`, env);
+    const h    = Array.isArray(data?.signals)
+      ? data.signals.filter(s => !(s && s.cbShadow === true))
+      : [];
+    return reply(cid, mid, fmtHistWorker(h, page, data || {}), env, histNavKb(page, data?.total ?? h.length));
+  } catch (e) {
+    return reply(cid, mid, `📈 History\n${SEP}\n⚠️ Worker unreachable — try again in a few seconds.\n\n<code>${esc(e.message.slice(0, 120))}</code>`, env, kb([[btn('🏆 Stats', 'cmd:stats'), btn('🔙 Back', 'cmd:main')]]));
+  }
 }
 
+// v4.5.0: /stats reads WORKER /api/stats (+ /api/history window for pending /
+// streak / drawdown / grade breakdown). Nothing from a bot ledger.
 async function doStats(cid, mid, env) {
-  const h  = await getHist(cid, env);
-  const rs = await getRegimeStats(cid, env);
-  const ss = await getSessionStats(cid, env);
-  return reply(cid, mid, fmtStats(h, rs, ss), env, kb([[btn('📈 History', 'cmd:history:0'), btn('📒 Journal', 'cmd:journal'), btn('🔥 Best', 'cmd:best')], backQuick()]));
+  const u = await getUser(cid, env);
+  try {
+    const [statsData, histData] = await Promise.all([
+      fetchWorker(`/api/stats?pair=${u.pair}`, env).catch(() => null),
+      fetchWorker(`/api/history?pair=${u.pair}&limit=100`, env).catch(() => null),
+    ]);
+    const stats = statsData?.stats || null;
+    const hist  = Array.isArray(histData?.signals)
+      ? histData.signals.filter(s => !(s && s.cbShadow === true))
+      : [];
+    return reply(cid, mid, fmtStatsWorker(stats, hist, u.pair), env, kb([[btn('📈 History', 'cmd:history:0'), btn('📒 Journal', 'cmd:journal'), btn('🔥 Best', 'cmd:best')], backQuick()]));
+  } catch (e) {
+    return reply(cid, mid, `🏆 Stats\n${SEP}\n⚠️ Worker unreachable — try again in a few seconds.\n\n<code>${esc(e.message.slice(0, 120))}</code>`, env, kb([[btn('📈 History', 'cmd:history:0'), btn('🔙 Back', 'cmd:main')]]));
+  }
 }
 
+// v4.5.0: journal/weekly read the WORKER history stream for the user's pair.
 async function doJournal(cid, mid, env) {
-  const h = await getHist(cid, env);
-  return reply(cid, mid, fmtJournal(h), env, kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')], backQuick()]));
+  const u = await getUser(cid, env);
+  try {
+    const d = await fetchWorker(`/api/history?pair=${u.pair}&limit=100`, env);
+    const h = Array.isArray(d?.signals) ? d.signals.filter(s => !(s && s.cbShadow === true)) : [];
+    return reply(cid, mid, fmtJournal(h), env, kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')], backQuick()]));
+  } catch (e) {
+    return reply(cid, mid, `📒 Journal\n${SEP}\n⚠️ Worker unreachable — try again in a few seconds.`, env, kb([backQuick()]));
+  }
 }
 
 async function doWeekly(cid, mid, env) {
-  const h = await getHist(cid, env);
-  return reply(cid, mid, fmtWeekly(h), env, kb([[btn('🏆 Stats', 'cmd:stats'), btn('📒 Journal', 'cmd:journal')], backQuick()]));
+  const u = await getUser(cid, env);
+  try {
+    const d = await fetchWorker(`/api/history?pair=${u.pair}&limit=500`, env);
+    const h = Array.isArray(d?.signals) ? d.signals.filter(s => !(s && s.cbShadow === true)) : [];
+    return reply(cid, mid, fmtWeekly(h), env, kb([[btn('🏆 Stats', 'cmd:stats'), btn('📒 Journal', 'cmd:journal')], backQuick()]));
+  } catch (e) {
+    return reply(cid, mid, `📅 Weekly Report\n${SEP}\n⚠️ Worker unreachable — try again in a few seconds.`, env, kb([backQuick()]));
+  }
 }
 
-// [F04] Risk Dashboard
+// [F04] Risk Dashboard — v4.5.0: pending trades come from the WORKER's per-pair
+// history streams (user's pair + watchlist). Cancel All removed (worker owns the
+// ledger; there is no cancel endpoint — see PR body).
 async function doRisk(cid, mid, env) {
-  const h = await getHist(cid, env);
-  return reply(cid, mid, fmtRisk(h), env, kb([[btn('🗑 Cancel All', 'cmd:cancelall'), btn('📈 History', 'cmd:history:0')], backQuick()]));
+  const u = await getUser(cid, env);
+  const pairs = [u.pair, ...u.watchlist.map(norm)].filter((p, i, a) => a.indexOf(p) === i);
+  try {
+    const all = await Promise.all(pairs.map(p =>
+      fetchWorker(`/api/history?pair=${p}&limit=50`, env).catch(() => null)
+    ));
+    const pend = all
+      .flatMap(d => (Array.isArray(d?.signals) ? d.signals : []))
+      .filter(x => !x.result && (x.direction === 'BUY' || x.direction === 'SELL') && x.pair && !(x && x.cbShadow === true));
+    return reply(cid, mid, fmtRiskWorker(pend), env, kb([[btn('📈 History', 'cmd:history:0')], backQuick()]));
+  } catch (e) {
+    return reply(cid, mid, `📉 Risk Dashboard\n${SEP}\n⚠️ Worker unreachable — try again in a few seconds.`, env, kb([backQuick()]));
+  }
 }
 
-// [F05] Heatmap
+// [F05] Heatmap — v4.5.0: aggregates WORKER /api/history across all tracked
+// pairs (timestamps are UTC) — never a bot ledger.
 async function doHeatmap(cid, mid, env) {
-  const h = await getHist(cid, env);
-  return reply(cid, mid, fmtHeatmap(h), env, kb([[btn('🏆 Stats', 'cmd:stats'), btn('🔥 Best Pairs', 'cmd:best')], backQuick()]));
+  try {
+    const all = await Promise.all(PAIR_PAGES.flat().map(p =>
+      fetchWorker(`/api/history?pair=${norm(p)}&limit=100`, env).catch(() => null)
+    ));
+    const rows = all
+      .flatMap(d => (Array.isArray(d?.signals) ? d.signals : []))
+      .filter(s => !(s && s.cbShadow === true));
+    return reply(cid, mid, fmtHeatmapWorker(rows), env, kb([[btn('🏆 Stats', 'cmd:stats'), btn('🔥 Best Pairs', 'cmd:best')], backQuick()]));
+  } catch (e) {
+    return reply(cid, mid, `🕐 Hourly Heatmap\n${SEP}\n⚠️ Worker unreachable — try again in a few seconds.`, env, kb([backQuick()]));
+  }
 }
 
-// [F06] Best Pairs
+// [F06] Best Pairs — v4.5.0: aggregates WORKER /api/stats (all pairs, ranked by
+// windowed winRate) + /api/signals/latest (per-pair latest direction).
 async function doBest(cid, mid, env) {
-  const h = await getHist(cid, env);
-  return reply(cid, mid, fmtBest(h), env, kb([[btn('🕐 Heatmap', 'cmd:heatmap'), btn('🏆 Stats', 'cmd:stats')], backQuick()]));
+  try {
+    const [statsAll, latest] = await Promise.all([
+      fetchWorker('/api/stats', env).catch(() => null),
+      fetchWorker('/api/signals/latest', env).catch(() => null),
+    ]);
+    return reply(cid, mid, fmtBestWorker(statsAll, latest), env, kb([[btn('🕐 Heatmap', 'cmd:heatmap'), btn('🏆 Stats', 'cmd:stats')], backQuick()]));
+  } catch (e) {
+    return reply(cid, mid, `🔥 Best Pairs\n${SEP}\n⚠️ Worker unreachable — try again in a few seconds.`, env, kb([backQuick()]));
+  }
 }
 
 
@@ -1679,15 +1692,15 @@ async function doBest(cid, mid, env) {
 async function doReplay(cid, mid, pairRaw, env) {
   const u = await getUser(cid, env);
   const pair = pairRaw ? pairRaw.toUpperCase().replace(/[\s\/\-_.]/g, '') : norm(u.pair);
-  if (mid) await editMsg(cid, mid, `🔄 Replaying ${disp(pair)} (not logged)...`, env, {});
-  else     await sendMsg(cid, `🔄 Replaying ${disp(pair)} (not logged)...`, env, {});
+  if (mid) await editMsg(cid, mid, `🔄 Replaying ${disp(pair)}...`, env, {});
+  else     await sendMsg(cid, `🔄 Replaying ${disp(pair)}...`, env, {});
   try {
     const data = await fetchSig(pair, env, { mode: normMode(u.fxMode) });
     const sig  = data?.signal;
     if (!sig) return sendMsg(cid, `❌ No data for ${disp(pair)}`, env, { reply_markup: mainKb(u) });
     const msg = fmtSignal(data, pair, u.interval, null, { replay: true, mode: normMode(u.fxMode) });
     await sendMsg(cid, msg, env, { reply_markup: kb([
-      [btn('📊 Get Signal (log it)', `qs:${norm(pair)}`), btn('🔙 Menu', 'cmd:main')],
+      [btn('📊 Get Signal', `qs:${norm(pair)}`), btn('🔙 Menu', 'cmd:main')],
     ]) });
     await restoreMainMsg(cid, mid, u, env);
   } catch (e) {
@@ -1747,93 +1760,110 @@ async function doWatchlist(cid, mid, env) {
   return reply(cid, mid, t, env, wlKb(u.watchlist));
 }
 
+// v4.5.0: today's performance comes from the WORKER history stream.
 async function doToday(cid, mid, env) {
-  const h     = await getHist(cid, env);
-  const today = new Date().toISOString().slice(0, 10);
-  const th    = h.filter(x => x.timestamp?.startsWith(today));
-  if (!th.length) return reply(cid, mid, `📅 Today (${today})\n${SEP}\nNo signals yet.`, env, kb([backQuick()]));
-  const res  = th.filter(x => x.result === 'WIN' || x.result === 'LOSS');
-  const wins = res.filter(x => x.result === 'WIN').length;
-  const wr   = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
-  let t = `📅 Today — ${today}\n${SEP}\n📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n\n`;
-  for (const x of th.slice(0, 8)) {
-    const dE = x.direction === 'BUY' ? '🟢' : '🔴';
-    const rE = x.result === 'WIN' ? '✅' : x.result === 'LOSS' ? '❌' : x.result === 'CANCEL' ? '🗑' : '⏳';
-    t += `${rE} #${x.no} ${dE} ${disp(x.pair)}${x.grade ? ' [' + esc(x.grade.split(' ')[0]) + ']' : ''} ${esc(x.confidence || '')}\n`;
+  const u = await getUser(cid, env);
+  try {
+    const d     = await fetchWorker(`/api/history?pair=${u.pair}&limit=100`, env);
+    const h     = Array.isArray(d?.signals) ? d.signals.filter(s => !(s && s.cbShadow === true)) : [];
+    const today = new Date().toISOString().slice(0, 10);
+    const th    = h.filter(x => x.timestamp?.startsWith(today));
+    if (!th.length) return reply(cid, mid, `📅 Today (${today}) — ${esc(disp(u.pair))}\n${SEP}\nNo signals yet.`, env, kb([backQuick()]));
+    const res  = th.filter(x => x.result === 'WIN' || x.result === 'LOSS');
+    const wins = res.filter(x => x.result === 'WIN').length;
+    const wr   = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
+    let t = `📅 Today — ${today} · ${esc(disp(u.pair))}\n${SEP}\n📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n\n`;
+    for (const x of th.slice(0, 8)) {
+      const dE = x.direction === 'BUY' ? '🟢' : '🔴';
+      const rE = x.result === 'WIN' ? '✅' : x.result === 'LOSS' ? '❌' : x.result === 'CANCEL' ? '🗑' : '⏳';
+      const g  = x.grade && x.grade !== 'N/A' ? ` [${esc(x.grade)}]` : '';
+      t += `${rE} #${shortId(x.id)} ${dE} ${disp(x.pair)}${g} ${esc(x.confidence || '')}\n`;
+    }
+    return reply(cid, mid, t, env, kb([[btn('📈 History', 'cmd:history:0'), btn('📉 Risk', 'cmd:risk')], backQuick()]));
+  } catch (e) {
+    return reply(cid, mid, `📅 Today\n${SEP}\n⚠️ Worker unreachable — try again in a few seconds.`, env, kb([backQuick()]));
   }
-  return reply(cid, mid, t, env, kb([[btn('📈 History', 'cmd:history:0'), btn('📉 Risk', 'cmd:risk')], backQuick()]));
 }
 
+// v4.5.0: daily summary reads the WORKER history stream (user's pair).
 async function doSummary(cid, mid, env) {
-  const h     = await getHist(cid, env);
-  const today = new Date().toISOString().slice(0, 10);
-  const th    = h.filter(x => x.timestamp?.startsWith(today));
-  if (!th.length) return reply(cid, mid, `No signals today yet.`, env, kb([backQuick()]));
-  const res   = th.filter(x => x.result === 'WIN' || x.result === 'LOSS');
-  const wins  = res.filter(x => x.result === 'WIN').length;
-  const wr    = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
-  const allR  = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
-  const allWR = allR.length > 0 ? Math.round(allR.filter(x => x.result === 'WIN').length / allR.length * 100) : 0;
-  const trend = wr > allWR ? '📈 Above avg' : wr < allWR ? '📉 Below avg' : '➡️ On avg';
-  const gm = {};
-  for (const x of res) {
-    const g = (x.grade || '?').split(' ')[0];
-    if (!gm[g]) gm[g] = { w:0, l:0 };
-    x.result === 'WIN' ? gm[g].w++ : gm[g].l++;
+  const u = await getUser(cid, env);
+  try {
+    const d     = await fetchWorker(`/api/history?pair=${u.pair}&limit=100`, env);
+    const h     = Array.isArray(d?.signals) ? d.signals.filter(s => !(s && s.cbShadow === true)) : [];
+    const today = new Date().toISOString().slice(0, 10);
+    const th    = h.filter(x => x.timestamp?.startsWith(today));
+    if (!th.length) return reply(cid, mid, `No signals today yet.`, env, kb([backQuick()]));
+    const res   = th.filter(x => x.result === 'WIN' || x.result === 'LOSS');
+    const wins  = res.filter(x => x.result === 'WIN').length;
+    const wr    = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
+    const allR  = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
+    const allWR = allR.length > 0 ? Math.round(allR.filter(x => x.result === 'WIN').length / allR.length * 100) : 0;
+    const trend = wr > allWR ? '📈 Above avg' : wr < allWR ? '📉 Below avg' : '➡️ On avg';
+    const gm = {};
+    for (const x of res) {
+      const g = (x.grade && x.grade !== 'N/A') ? x.grade : '?';
+      if (!gm[g]) gm[g] = { w:0, l:0 };
+      x.result === 'WIN' ? gm[g].w++ : gm[g].l++;
+    }
+    let t = `📅 Daily Summary — ${today} · ${esc(disp(u.pair))}\n${SEP}\n📊 ${th.length} signals  Resolved: ${res.length}\n✅ ${wins}W  ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n`;
+    if (Object.keys(gm).length) {
+      t += `\nGrades:\n`;
+      for (const [g, s] of Object.entries(gm)) {
+        const tt = s.w + s.l;
+        t += `  ${esc(g)}: ${s.w}W/${s.l}L (${Math.round(s.w / tt * 100)}%)\n`;
+      }
+    }
+    t += `\n${trend} (all-time: ${allWR}%)`;
+    return reply(cid, mid, t, env, kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')], backQuick()]));
+  } catch (e) {
+    return reply(cid, mid, `📅 Daily Summary\n${SEP}\n⚠️ Worker unreachable — try again in a few seconds.`, env, kb([backQuick()]));
   }
-  let t = `📅 Daily Summary — ${today}\n${SEP}\n📊 ${th.length} signals  Resolved: ${res.length}\n✅ ${wins}W  ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n`;
-  if (Object.keys(gm).length) {
-    t += `\nGrades:\n`;
-    for (const [g, s] of Object.entries(gm)) {
-      const tt = s.w + s.l;
-      t += `  ${esc(g)}: ${s.w}W/${s.l}L (${Math.round(s.w / tt * 100)}%)\n`;
+}
+
+// v4.5.0: manual override forwards the WORKER signal id to the worker's
+// idempotent /api/report (FIX-4 guard — a second report never double-counts).
+// `sigIdRaw` may be the full sig_... id or its last-6 short tag (resolved
+// against the worker's history stream — the only lookup table, no bot ledger).
+async function doManualResult(cid, mid, sigIdRaw, result, env) {
+  const u   = await getUser(cid, env);
+  const raw = String(sigIdRaw || '').trim();
+  if (!raw) return reply(cid, mid, `❌ Usage: /win <signal id>  or  /loss <signal id>`, env, mainKb(u));
+
+  let sigId = raw;
+  if (!raw.startsWith('sig_')) {
+    // short tag → find the full id in worker history (single source)
+    try {
+      const d = await fetchWorker(`/api/history?pair=${u.pair}&limit=200`, env);
+      const rows = Array.isArray(d?.signals) ? d.signals : [];
+      const matches = rows.filter(s => s.id && String(s.id).slice(-6) === raw);
+      if (matches.length === 0)
+        return reply(cid, mid, `❌ No signal matching "<code>${esc(raw)}</code>" in worker history for ${esc(disp(u.pair))}.\n\nTap ✅/❌ on a signal card, or use the full id from 📈 History.`, env, mainKb(u));
+      if (matches.length > 1)
+        return reply(cid, mid, `⚠️ ${matches.length} signals end with "<code>${esc(raw)}</code>". Use the full id:\n\n${matches.slice(0, 3).map(s => `<code>${esc(s.id)}</code>`).join('\n')}`, env, mainKb(u));
+      sigId = matches[0].id;
+    } catch (e) {
+      return reply(cid, mid, `❌ Worker lookup failed: ${esc(e.message.slice(0, 120))}`, env, mainKb(u));
     }
   }
-  t += `\n${trend} (all-time: ${allWR}%)`;
-  return reply(cid, mid, t, env, kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats')], backQuick()]));
-}
 
-async function doCancelAll(cid, mid, env) {
-  const u    = await getUser(cid, env);
-  const h    = await getHist(cid, env);
-  const pend = h.filter(x => !x.result && x.direction);
-  if (!pend.length) return reply(cid, mid, `ℹ️ No pending trades to cancel.`, env, mainKb(u));
-  const allIds = await getPendingIds(env);
-  const myTids = pend.map(x => x.id);
-  for (const trade of pend) {
-    await setResult(cid, trade.id, 'CANCEL', null, null, env);
-    await clearLock(cid, trade.pair, env);
-    await kdel(`pt:${trade.id}`, env);
-    // [Bug#4 FIX] drop the stale "expires in ~30s" reminder for cancelled trades
-    await delReminder(trade.id, env);
+  try {
+    const data = await fetchWorker(`/api/report?id=${encodeURIComponent(sigId)}&result=${result}`, env, { method: 'POST' });
+    if (data?.error)
+      return reply(cid, mid, `❌ ${esc(String(data.message || 'Report failed').slice(0, 150))}`, env, mainKb(u));
+    const rE   = result === 'WIN' ? '✅ WIN' : '❌ LOSS';
+    const note = data?.alreadyRecorded
+      ? 'ℹ️ Already recorded — stats not double-counted (idempotent).'
+      : '✅ Recorded — worker stats updated.';
+    return reply(cid, mid,
+      `${rE} — ${esc(data?.pair || disp(u.pair))}\n${SEP}\nSignal: <code>#${esc(shortId(data?.signalId || sigId))}</code>\n${note}`,
+      env, afterKb());
+  } catch (e) {
+    return reply(cid, mid, `❌ Report failed: ${esc(e.message.slice(0, 150))}`, env, mainKb(u));
   }
-  await savePendingIds(allIds.filter(id => !myTids.includes(id)), env);
-  return reply(cid, mid, `🗑 Cancelled ${pend.length} pending trade(s).`, env, mainKb(u));
 }
 
-async function doManualResult(cid, mid, no, result, env) {
-  const u     = await getUser(cid, env);
-  const h     = await getHist(cid, env);
-  const trade = h.find(x => x.no === no);
-  if (!trade)
-    return reply(cid, mid, `❌ Signal #${no} not found.`, env, mainKb(u));
-  if (trade.result === 'WIN' || trade.result === 'LOSS')
-    return reply(cid, mid, `ℹ️ Signal #${no} already resolved as ${trade.result}.`, env, mainKb(u));
-  await setResult(cid, trade.id, result, null, null, env);
-  await clearLock(cid, trade.pair, env);
-  await kdel(`pt:${trade.id}`, env);
-  // [Bug#4 FIX] drop the stale "expires in ~30s" reminder for resolved trades
-  await delReminder(trade.id, env);
-  const ids = await getPendingIds(env);
-  await savePendingIds(ids.filter(id => id !== trade.id), env);
-  const dE = trade.direction === 'BUY' ? '🟢' : '🔴';
-  const rE = result === 'WIN' ? '✅ WIN' : '❌ LOSS';
-  return reply(cid, mid,
-    `${rE} — manually set\n${SEP}\n${dE} #${no} ${trade.direction} ${disp(trade.pair)}${trade.grade ? ` [${esc(trade.grade)}]` : ''}`,
-    env, afterKb());
-}
-
-// ─── SIGNAL FETCH ─────────────────────────────────────────────────────────────
+// ─── WORKER FETCH (single source) ────────────────────────────────────────────
 
 // [Fix#4] Service Binding now has timeout via Promise.race
 // map user fxMode ('ftt'|'fx'|'both') to worker ?mode= param
@@ -1842,11 +1872,13 @@ async function doManualResult(cid, mid, no, result, env) {
 const workerModeParam = (m) => (m === 'fx' || m === 'both' || m === true) ? '&mode=fx' : '';
 const normMode = (m) => { if (m === 'fx' || m === 'both') return m; return 'ftt'; };   // legacy bool/undefined → ftt
 
-async function fetchSig(pair, env, opts = {}) {
+// v4.5.0: THE single worker client — every trading-data read AND write goes
+// through this helper (signal, history, stats, latest, report). The bot never
+// stores trading data; it only forwards what the worker owns.
+async function fetchWorker(path, env, opts = {}) {
   const WORKER_URL = 'https://fttotcv6.umuhammadiswa.workers.dev';
-  const mode = workerModeParam(opts.mode);
-  const url  = `${WORKER_URL}/api/signal?pair=${pair}${mode}`;
-  // [Bug#6 FIX] the 20s race now covers fetch AND res.json(), so a slow or
+  const url  = `${WORKER_URL}${path}`;
+  // [Bug#6 FIX] the 20s race covers fetch AND res.json(), so a slow or
   // hanging response body can never leave the user's message stuck on
   // "⏳ Fetching…" — the caller always gets a rejection to render.
   const withTimeout = async (p, label) => {
@@ -1858,299 +1890,49 @@ async function fetchSig(pair, env, opts = {}) {
       p.catch(() => {}); // swallow late rejection of the losing promise
     }
   };
+  const init = { headers: { Accept: 'application/json' }, ...(opts.method ? { method: opts.method } : {}) };
   const res = env.SIGNAL_WORKER
-    ? await withTimeout(env.SIGNAL_WORKER.fetch(new Request(url, { headers: { Accept: 'application/json' } })), 'Service binding timeout 20s')
-    : await fetch(url, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
+    ? await withTimeout(env.SIGNAL_WORKER.fetch(new Request(url, init)), 'Service binding timeout 20s')
+    : await fetch(url, { ...init, signal: AbortSignal.timeout(20000) });
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text().catch(() => '')).slice(0, 150)}`);
-  return withTimeout(res.json(), 'Signal worker response timeout 20s');
+  return withTimeout(res.json(), 'Worker response timeout 20s');
 }
 
-async function fetchPrice(pair, env) {
-  try {
-    const d = await fetchSig(pair, env);
-    return d?.signal?.recommendations?.['1min']?.entry?.price
-        || d?.signal?.recommendations?.['5min']?.entry?.price
-        || d?.signal?.recommendations?.['15min']?.entry?.price || null;
-  } catch { return null; }
+async function fetchSig(pair, env, opts = {}) {
+  return fetchWorker(`/api/signal?pair=${pair}${workerModeParam(opts.mode)}`, env);
 }
 
 // ─── CRON ─────────────────────────────────────────────────────────────────────
 
-// Lite cron: signal generation disabled (Worker Push / Phase 10 handles auto signals).
-// Bot cron only tracks: result resolution (bot analytics), reminders, summaries.
+// v4.5.0: the bot cron has NO trading tasks left. Worker */2 cron resolves
+// results and Phase 10 push delivers signals + results (single source).
+// Bot cron only sends user-facing daily/weekly summaries computed from the
+// worker's endpoints.
 async function cronLite(env) {
   const logs = [];
   const log = m => { console.log(m); logs.push(String(m)); };
   log(`CronLite ${new Date().toISOString()}`);
   if (!env?.BOT_TOKEN) { log('ERROR: BOT_TOKEN missing'); return; }
   if (!env?.BOT_KV)    { log('ERROR: BOT_KV missing');    return; }
-  // BUG-B3 (Option A): worker push is the single source of signal delivery.
-  // autoScan now only maintains bot-side analytics (logAndSchedule, dedup keys,
-  // errcnt/noTradeStreak, confidence trend) — it no longer sends fmtSignal
-  // messages, so no duplicate Telegram signal from the bot.
-  await autoScan(env, log).catch(e => log('ScanErr: ' + e.message));
-  await resultCheck(env, log).catch(e => log('ResultErr: ' + e.message));
-  await expiryReminder(env, log).catch(e => log('ReminderErr: ' + e.message));
   await dailySummary(env, log).catch(e => log('SummaryErr: ' + e.message));
   await weeklyReport(env, log).catch(e => log('WeeklyErr: ' + e.message));
   log('Done');
 }
 
-// Full cron (kept for /runcron debug — includes autoScan if ever needed)
+// Full cron (kept for /runcron debug — same tasks as cronLite)
 async function cron(env, logs = [], force = false) {
   const log = m => { console.log(m); logs.push(String(m)); };
   log(`Cron ${new Date().toISOString()}`);
   if (!env?.BOT_TOKEN) { log('ERROR: BOT_TOKEN missing'); return; }
   if (!env?.BOT_KV)    { log('ERROR: BOT_KV missing');    return; }
-  await autoScan(env, log).catch(e => log('ScanErr: ' + e.message));
-  await resultCheck(env, log).catch(e => log('ResultErr: ' + e.message));
-  await expiryReminder(env, log).catch(e => log('ReminderErr: ' + e.message));
   await dailySummary(env, log).catch(e => log('SummaryErr: ' + e.message));
   await weeklyReport(env, log).catch(e => log('WeeklyErr: ' + e.message));
   log('Done');
 }
 
-async function autoScan(env, log) {
-  const users = await getAutoUsers(env);
-  log(`Scan: ${users.length} users`);
-  const now = Date.now();
-
-  // [F03] Fetch news once per cron run (shared across all users)
-  let newsAlert = null;
-  try { newsAlert = await hasHighImpactNews(env); } catch {}
-  if (newsAlert) log(`News alert: ${newsAlert.title} (${newsAlert.currency}) in ${newsAlert.minsAway}min`);
-
-  for (const cid of users) {
-    try {
-      const u = await getUser(cid, env);
-      if (!u.autoEnabled) continue;
-
-      // Candle-close gate
-      const intervalMin   = u.interval || 5;
-      const intervalMs    = intervalMin * 60 * 1000;
-      const currentCandle = Math.floor(now / intervalMs) * intervalMs;
-      const lastCandle    = (await kget(`lc:${cid}`, env)) || 0;
-      if (currentCandle <= lastCandle) { log(`Skip ${cid} — same candle`); continue; }
-      await kput(`lc:${cid}`, currentCandle, env, { expirationTtl: intervalMin * 60 * 2 });
-
-      // [F03] Skip auto scan during high-impact news window
-      if (u.blockNews !== false && newsAlert) {
-        log(`News skip for ${cid}: ${newsAlert.title}`);
-        // Only notify once (when the event starts, minsAway close to 0)
-        if (Math.abs(newsAlert.minsAway) <= intervalMin) {
-          const sign = newsAlert.minsAway >= 0 ? 'in' : 'ago';
-          await sendMsg(cid, `🚫 Auto scan paused\n${SEP}\n⚠️ ${esc(newsAlert.title)} (${esc(newsAlert.currency)}) ${sign} ${Math.abs(newsAlert.minsAway)}min\n${SEP}\n\nSignals resume after the news window.`, env);
-        }
-        continue;
-      }
-
-      const list = [u.pair, ...u.watchlist].filter((p,i,a) => a.indexOf(p) === i);
-      let anySignalSent = false, pairErrors = 0;
-
-      for (const pair of list) {
-        try {
-          // Same-candle dedup
-          const scKey = `sc:${cid}:${norm(pair)}`;
-          const lastPairCandle = (await kget(scKey, env)) || 0;
-          if (lastPairCandle >= currentCandle) { log(`Dedup ${pair}`); continue; }
-
-          const data = await fetchSig(pair, env, { mode: normMode(u.fxMode) });
-          const sig  = data.signal;
-          const dir  = sig?.finalSignal;
-
-          if (dir === 'BUY' || dir === 'SELL') {
-            // BUG-B3 (Option A): worker push (Phase 10, BUG-001 fixed) is the
-            // SINGLE source of auto signal delivery. autoScan must NOT send
-            // fmtSignal messages (nor custom alerts / channel mirror) or users
-            // would get the same signal twice. We keep the same gates + bot-side
-            // bookkeeping (logAndSchedule, sc:/lc:/lock:, errcnt/noTradeStreak,
-            // confidence trend) so resultCheck/dailySummary/weeklyReport/stats
-            // still have data to work from.
-            const passesMain = passGrade(sig, u.gradeFilter) && passConf(sig, u.minConfidence) && passAI(sig, u.aiOnlyMode);
-            if (!passesMain) { log(`Filtered ${pair}`); continue; }
-
-            const lock = await getLock(cid, pair, env);
-            if (lock?.direction === dir && lock?.expiryAt > now) { log(`Locked ${pair}`); continue; }
-
-            // Log the signal for bot analytics (history, pending, lock, reminder).
-            // Delivery to the user is handled by worker push — no sendMsg here.
-            const no = await logAndSchedule(cid, pair, sig, env);
-            await kput(scKey, currentCandle, env, { expirationTtl: intervalMin * 60 + 60 });
-            log(`Logged #${no} ${pair} ${dir}`);
-            anySignalSent = true;
-
-            // [Fix#2] Confidence trend (bot analytics — kept)
-            if (sig.confidence) {
-              const ct = await updateConfTrend(cid, sig.confidence, env);
-              if (ct.alert)
-                await sendMsg(cid, `📉 Confidence Dropping — last 3: ${ct.vals[2]}% → ${ct.vals[1]}% → ${ct.vals[0]}%\n\nConsider waiting for a stronger setup.`, env, { reply_markup: kb([[btn('🏆 Stats', 'cmd:stats'), btn('🔙 Menu', 'cmd:main')]]) });
-            }
-          }
-        } catch (e) {
-          log(`Pair ${pair}: ${e.message}`);
-          pairErrors++;
-        }
-      }
-
-      // Worker error auto-pause
-      if (list.length > 0 && pairErrors === list.length) {
-        const errKey = `errcnt:${cid}`;
-        const errs   = ((await kget(errKey, env)) || 0) + 1;
-        await kput(errKey, errs, env, { expirationTtl: 3600 });
-        log(`Worker errors for ${cid}: ${errs}/${MAX_ERRORS}`);
-        if (errs >= MAX_ERRORS) {
-          u.autoEnabled = false;
-          await saveUser(cid, u, env);
-          await removeAutoUser(cid, env);
-          await kdel(`lc:${cid}`, env);
-          await kput(errKey, 0, env);
-          await sendMsg(cid, `⚠️ Auto Scan paused\n\nSignal worker unreachable — ${MAX_ERRORS} consecutive failures.\nFix the worker then tap 🔄 Start Auto to resume.`, env, { reply_markup: mainKb(u) });
-          log(`Auto paused for ${cid}`);
-        }
-      } else if (pairErrors === 0 && list.length > 0) {
-        await kput(`errcnt:${cid}`, 0, env);
-      }
-
-      if (!anySignalSent) {
-        u.noTradeStreak = (u.noTradeStreak || 0) + 1;
-        if (u.noTradeStreak >= 12) {
-          // [Fix#5] Added 🔙 Menu button
-          await sendMsg(cid, `⚪ No setup for ${u.noTradeStreak} scans across ${list.length} pair(s).`, env,
-            { reply_markup: kb([[btn('🔕 Stop Auto', 'cmd:toggle_auto'), btn('🔙 Menu', 'cmd:main')]]) });
-          u.noTradeStreak = 0;
-        }
-      } else {
-        u.noTradeStreak = 0;
-      }
-
-      await saveUser(cid, u, env);
-    } catch (e) { log(`User ${cid}: ${e.message}`); }
-  }
-}
-
-async function resultCheck(env, log) {
-  const ids = await getPendingIds(env);
-  if (!ids.length) return;
-  log(`Results: ${ids.length} pending`);
-  const now = Date.now(), keep = [];
-
-  // Is this a fill-pending trade? (entry hit/miss only matters for these)
-  const isPendingFill = t => ['PENDING_ENTRY', 'PENDING'].includes(t.fillStatus);
-  // Has price touched the entry level since logging?
-  const touchedEntry = (t, current) => {
-    const entry = parseFloat(t.entryPrice);
-    if (isNaN(entry) || isNaN(current)) return false;
-    return t.direction === 'BUY' ? current <= entry : current >= entry;
-  };
-  // Record the observation on the pending trade (survives until resolution)
-  const noteEntryTouch = async (t, tid, current) => {
-    if (!isPendingFill(t) || t.entryHit === true || !touchedEntry(t, current)) return false;
-    t.entryHit = true;
-    await kput(`pt:${tid}`, t, env, { expirationTtl: 7200 });
-    return true;
-  };
-
-  // Premium result card + risk/milestone bookkeeping
-  const finish = async (t, tid, current, result, hitNote, lateMin) => {
-    const entry = parseFloat(t.entryPrice);
-    const diff  = current - entry;
-    const pips  = isCr(t.pair) ? Math.round(Math.abs(diff) * 100) / 100 : Math.round(Math.abs(diff) * 10000 * 10) / 10;
-    const moveS = isCr(t.pair)
-      ? `${diff > 0 ? '+' : ''}$${pips}`
-      : `${diff > 0 ? '+' : ''}${pips} pips`;
-    const pct   = !isNaN(entry) && entry !== 0 ? ((diff / entry) * 100) : 0;
-    await setResult(t.chatId, tid, result, current, pips, env);
-    await clearLock(t.chatId, t.pair, env);
-    await kdel(`pt:${tid}`, env);
-    await delReminder(tid, env);
-    const dE       = t.direction === 'BUY' ? '🟢' : '🔴';
-    const rE       = result === 'WIN' ? '✅ <b>WIN</b>' : '❌ <b>LOSS</b>';
-    const gS       = t.grade ? ` [${esc(t.grade)}]` : '';
-    const notes    = [`#${t.signalNo || tid}`];
-    if (hitNote) notes.push(hitNote);
-    if (lateMin > 1) notes.push(`+${lateMin}min`);
-    // [v4.3] entry hit/miss — INSTANT fills always hit; PENDING_ENTRY judged
-    // by whether price touched entry during the tracking window
-    const entryHit = t.entryHit === true || !isPendingFill(t);
-    const hitLine  = entryHit
-      ? `⚡ Entry hit ✓ — price reached entry`
-      : `⚠️ Entry miss — price never reached entry (result may be misleading)`;
-    await sendMsg(t.chatId,
-      `📌 Signal ${notes.join(' · ')}\n` +
-      `${rE} — ${dE} ${esc(disp(t.pair))}${gS}\n` +
-      `${SEP}\n` +
-      `💰 Entry: <code>${esc(fmtPrice(entry, t.pair))}</code> → Exit: <code>${esc(fmtPrice(current, t.pair))}</code>\n` +
-      `🎯 Result: <b>${result}</b> ${moveS} (${diff > 0 ? '+' : ''}${pct.toFixed(2)}%)\n` +
-      `${SEP}\n` +
-      `${hitLine}`,
-      env, { reply_markup: afterKb() });
-    // Risk alert
-    const risk = await updateRisk(t.chatId, result, env);
-    if (risk.type === 'LOSS' && risk.streak >= 3) {
-      await sendMsg(t.chatId,
-        `⚠️ Risk Alert — ${risk.streak} Consecutive Losses\n\nConsider taking a break or reducing trade size.`,
-        env, { reply_markup: kb([[btn('🏆 Check Stats', 'cmd:stats'), btn('🔕 Stop Auto', 'cmd:toggle_auto')],[btn('🔙 Continue', 'cmd:main')]]) });
-    }
-    await checkMilestone(t.chatId, env);
-  };
-
-  const skipTrade = async (t, tid, reason) => {
-    await setResult(t.chatId, tid, 'SKIP', null, null, env);
-    await clearLock(t.chatId, t.pair, env);
-    await kdel(`pt:${tid}`, env);
-    await delReminder(tid, env);
-    await sendMsg(t.chatId, `⏭ Tracking #${t.signalNo || tid} — ${reason}`, env, { reply_markup: afterKb() });
-  };
-
-  for (const tid of ids) {
-    try {
-      const t = await kget(`pt:${tid}`, env);
-      if (!t) continue;
-      const isFx = !!(t.sl && t.tp);
-
-      // [Bug#5 FIX] FX trade inside its 60min horizon: resolve only on SL/TP hit
-      if (t.expiryAt > now) {
-        if (isFx) {
-          const cur = await fetchPrice(t.pair, env);
-          if (!cur) { keep.push(tid); continue; }
-          const current = parseFloat(cur);
-          // [v4.3] observe whether price ever reached the (pending) entry
-          await noteEntryTouch(t, tid, current);
-          const sl = parseFloat(t.sl), tp = parseFloat(t.tp);
-          if (isNaN(current) || isNaN(sl) || isNaN(tp)) { keep.push(tid); continue; }
-          const hitTp = t.direction === 'BUY' ? current >= tp : current <= tp;
-          const hitSl = t.direction === 'BUY' ? current <= sl : current >= sl;
-          if (hitTp)      await finish(t, tid, current, 'WIN',  '🎯 TP hit', 0);
-          else if (hitSl) await finish(t, tid, current, 'LOSS', '🛑 SL hit', 0);
-          else            keep.push(tid);
-        } else if (isPendingFill(t)) {
-          // [v4.3] FTT pending-entry: watch for the entry level during the window
-          const cur = await fetchPrice(t.pair, env);
-          if (cur) await noteEntryTouch(t, tid, parseFloat(cur));
-          keep.push(tid);
-        } else {
-          keep.push(tid);
-        }
-        continue;
-      }
-
-      // Horizon expired → resolve by price direction (FTT) / fallback (FX)
-      const cur = await fetchPrice(t.pair, env);
-      if (!cur || !t.entryPrice) { await skipTrade(t, tid, 'price unavailable'); continue; }
-      const entry   = parseFloat(t.entryPrice);
-      const current = parseFloat(cur);
-      if (isNaN(entry) || isNaN(current)) { await skipTrade(t, tid, 'invalid price data'); continue; }
-      // [v4.3] last chance to observe the entry level before judging hit/miss
-      await noteEntryTouch(t, tid, current);
-      const diff   = current - entry;
-      const result = t.direction === 'BUY' ? (diff > 0 ? 'WIN' : 'LOSS') : (diff < 0 ? 'WIN' : 'LOSS');
-      const late   = Math.round((now - t.expiryAt) / 60000);
-      await finish(t, tid, current, result, isFx ? '⏰ 60min horizon' : null, late);
-    } catch (e) { log(`Result ${tid}: ${e.message}`); keep.push(tid); }
-  }
-  await savePendingIds(keep, env);
-}
-
+// v4.5.0: daily summary is computed from the WORKER history stream for the
+// user's pair (per-pair global — same stream shown in /history). ds: is the
+// last-sent timestamp (UX state, not trade data).
 async function dailySummary(env, log) {
   const hour  = new Date().getUTCHours();
   const users = await getSummaryUsers(env);
@@ -2161,7 +1943,8 @@ async function dailySummary(env, log) {
       if (!u.dailySummary || hour !== (u.summaryHour ?? 20)) continue;
       const last = (await kget(`ds:${cid}`, env)) || 0;
       if (Date.now() - last < 55 * 60 * 1000) continue;
-      const h     = await getHist(cid, env);
+      const d     = await fetchWorker(`/api/history?pair=${u.pair}&limit=100`, env).catch(() => null);
+      const h     = Array.isArray(d?.signals) ? d.signals.filter(s => !(s && s.cbShadow === true)) : [];
       const today = new Date().toISOString().slice(0, 10);
       const th    = h.filter(x => x.timestamp?.startsWith(today));
       if (!th.length) continue;
@@ -2170,11 +1953,11 @@ async function dailySummary(env, log) {
       const wr   = res.length > 0 ? Math.round(wins / res.length * 100) : 0;
       const gm = {};
       for (const x of res) {
-        const g = (x.grade || '?').split(' ')[0];
+        const g = (x.grade && x.grade !== 'N/A') ? x.grade : '?';
         if (!gm[g]) gm[g] = { w:0, l:0 };
         x.result === 'WIN' ? gm[g].w++ : gm[g].l++;
       }
-      let sumT = `📅 Daily Summary — ${today}\n${SEP}\n📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n⏳ Pending: ${th.filter(x => !x.result).length}`;
+      let sumT = `📅 Daily Summary — ${today} · ${esc(disp(u.pair))}\n${SEP}\n📊 ${th.length} signals  ✅ ${wins}W ❌ ${res.length - wins}L\n📈 Win Rate: ${wr}%\n⏳ Pending: ${th.filter(x => !x.result).length}`;
       if (Object.keys(gm).length) {
         sumT += `\n${SEP}\nGrades:\n`;
         for (const [g, s] of Object.entries(gm)) {
@@ -2189,24 +1972,8 @@ async function dailySummary(env, log) {
   }
 }
 
-async function expiryReminder(env, log) {
-  const ids = await getPendingReminders(env);
-  if (!ids.length) return;
-  const now = Date.now(), remaining = [];
-  for (const tid of ids) {
-    try {
-      const r = await kget(`rem:${tid}`, env);
-      if (!r) continue;
-      if (r.remAt > now) { remaining.push(tid); continue; }
-      const dE = r.direction === 'BUY' ? '🟢' : '🔴';
-      await sendMsg(r.chatId, `⏰ Signal #${r.signalNo} expires in ~30s\n${SEP}\n${dE} <b>${esc(r.direction)}</b> ${esc(disp(r.pair))}`, env);
-      await kdel(`rem:${tid}`, env);
-      log(`Reminder sent #${r.signalNo}`);
-    } catch (e) { log(`Reminder ${tid}: ${e.message}`); remaining.push(tid); }
-  }
-  await kput('remind_ids', remaining, env);
-}
-
+// v4.5.0: weekly report is computed from the WORKER history stream (user's
+// pair, last 500 rows). wr: is the last-sent timestamp (UX state).
 async function weeklyReport(env, log) {
   const now  = new Date();
   const day  = now.getUTCDay(), hour = now.getUTCHours();
@@ -2218,40 +1985,12 @@ async function weeklyReport(env, log) {
       const lastKey = `wr:${cid}`;
       const last    = (await kget(lastKey, env)) || 0;
       if (Date.now() - last < 6 * 24 * 60 * 60 * 1000) continue;
-      const h   = await getHist(cid, env);
+      const u = await getUser(cid, env);
+      const d = await fetchWorker(`/api/history?pair=${u.pair}&limit=500`, env).catch(() => null);
+      const h = Array.isArray(d?.signals) ? d.signals.filter(s => !(s && s.cbShadow === true)) : [];
       await sendMsg(cid, fmtWeekly(h), env, { reply_markup: kb([[btn('🏆 Stats', 'cmd:stats'), btn('📒 Journal', 'cmd:journal')],[btn('🔥 Best Pairs', 'cmd:best'), btn('🔙 Menu', 'cmd:main')]]) });
       await kput(lastKey, Date.now(), env);
       log(`Weekly sent to ${cid}`);
     } catch (e) { log(`Weekly ${cid}: ${e.message}`); }
   }
-}
-
-async function checkMilestone(cid, env) {
-  try {
-    const mk  = `ms:${cid}`;
-    const ms  = (await kget(mk, env)) || { lastCount: 0 };
-    const h   = await getHist(cid, env);
-    const res = h.filter(x => x.result === 'WIN' || x.result === 'LOSS');
-    const since = Math.max(0, res.length - ms.lastCount);
-    if (since < MILESTONE) return;
-    const batch = res.slice(0, since);
-    const wins  = batch.filter(x => x.result === 'WIN').length;
-    const wr    = Math.round(wins / batch.length * 100);
-    const gm = {}, pm = {};
-    for (const x of batch) {
-      const g = (x.grade || '?').split(' ')[0];
-      if (!gm[g]) gm[g] = { w:0, l:0 };
-      x.result === 'WIN' ? gm[g].w++ : gm[g].l++;
-      if (!pm[x.pair]) pm[x.pair] = { w:0, l:0 };
-      x.result === 'WIN' ? pm[x.pair].w++ : pm[x.pair].l++;
-    }
-    let t = `🏁 ${MILESTONE}-Signal Report (#${batch[batch.length-1]?.no||'?'} to #${batch[0]?.no||'?'})\n${SEP}\n✅ ${wins}W  ❌ ${batch.length - wins}L\n📊 Win Rate: ${wr}%\n\nGrades:\n`;
-    for (const [g,s] of Object.entries(gm)) { const tt=s.w+s.l; t += `  ${esc(g)}: ${s.w}W/${s.l}L (${Math.round(s.w/tt*100)}%)\n`; }
-    t += `\nTop Pairs:\n`;
-    Object.entries(pm).sort((a,b)=>(b[1].w+b[1].l)-(a[1].w+a[1].l)).slice(0,4)
-      .forEach(([p,s]) => { const tt=s.w+s.l; t += `  ${disp(p)}: ${s.w}W/${s.l}L (${Math.round(s.w/tt*100)}%)\n`; });
-    t += `\n🔄 Next ${MILESTONE} signals tracking starts now.`;
-    await sendMsg(cid, t, env, { reply_markup: kb([[btn('📈 History', 'cmd:history:0'), btn('🏆 Stats', 'cmd:stats'), btn('🔥 Best Pairs', 'cmd:best')]]) });
-    await kput(mk, { lastCount: res.length }, env);
-  } catch (e) { console.error('milestone:', e.message); }
 }

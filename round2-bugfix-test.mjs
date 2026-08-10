@@ -1,5 +1,7 @@
 /**
  * Round 2 Bugfix Tests — BUG-B1 (passGrade A+) + BUG-B2 (passAI dual-combiner)
+ * v4.5.0: BUG-B3 section updated — bot ledger + autoScan + resultCheck removed
+ * (worker = single source of truth). Total stays 60 assertions.
  * Run: node round2-bugfix-test.mjs
  */
 import { readFileSync } from 'fs';
@@ -74,7 +76,9 @@ ok('dual shape OK + agrees true (both present, agrees wins) → true',
 console.log('\n═══ Integration re-verify (worker round-3 shapes) ═══\n');
 
 // 1. fillStatus on OTC: bot's signal message line ~ fillStatus || 'INSTANT' and fill badge in fmtSignal
-ok('logAndSchedule stores fillStatus || INSTANT', src.includes("fillStatus: sig.fillStatus || 'INSTANT'"));
+// v4.5.0: logAndSchedule is REMOVED — the bot no longer stores any trade record
+// (worker is the single source of truth). fill rendering still lives in fmtSignal.
+ok('no logAndSchedule (bot ledger removed)', !src.includes('async function logAndSchedule') && !src.includes('await logAndSchedule('));
 ok('fmtSignal fill badge uses sig.fillStatus || INSTANT', src.includes("const fill = sig.fillStatus || 'INSTANT'"));
 ok('fmtSignal handles PENDING_ENTRY', src.includes("PENDING_ENTRY") && src.includes("entryDistancePct"));
 ok('fmtSignal fill badge shows distance', src.includes("entryDistancePct"));
@@ -84,7 +88,7 @@ ok('fmtSignal fill badge shows distance', src.includes("entryDistancePct"));
 ok('logAndSchedule called only for BUY/SELL in doSignal', /if \(dir === 'BUY' \|\| dir === 'SELL'\)/.test(src));
 ok('fmtSignal grade N/A cannot appear in pushed BUY/SELL path (NO_TRADE branch separate)',
    src.includes("if (dir === 'BUY' || dir === 'SELL')") && src.includes("⚪ <b>NO TRADE</b>"));
-ok('history only contains BUY/SELL (logAndSchedule only for BUY/SELL)', src.includes("direction: dir"));
+ok('fmtHistWorker renders worker rows (short id / grade / entry / result)', src.includes('function fmtHistWorker') && src.includes('shortId(h.id)') && src.includes('h.grade') && src.includes('h.entryPrice') && src.includes('h.result'));
 
 // 3. mode=fx: worker mode=fx now forces fresh (never cached) — bot fx fetch still works and SL/TP chips show
 ok('workerModeParam maps fx/both to &mode=fx', src.includes("workerModeParam") && src.includes("&mode=fx"));
@@ -99,33 +103,32 @@ ok('fmtSignal uses worker provided countdown label (not local calc)', src.includ
 ok('fmtSignal AI block handles dual-combiner (aiRaw + combined fallback)', src.includes("aiRaw") && src.includes("combined") && src.includes("aiStatus"));
 ok('doAnalyze AI block handles dual-combiner', src.includes("aiA") && src.includes("combined"));
 
-console.log('\n═══ BUG-B3: duplicate signal pushes eliminated (Option A) ═══\n');
+console.log('\n═══ v4.5.0: bot ledger + autoScan REMOVED (single source of truth) ═══\n');
 
-// Extract just the autoScan body so the assertions target only the cron-driven
-// scan (doSignal/doQuickSignal/doScanAll are manual triggers and MUST keep sends).
-const a0 = src.indexOf('async function autoScan');
-const a1 = src.indexOf('async function resultCheck');
-const autoScanSrc = src.slice(a0, a1);
+// v4.5.0: autoScan and resultCheck are DELETED — worker push (Phase 10) is the
+// single delivery channel and the worker */2 cron is the single result resolver.
+// (doSignal/doQuickSignal/doScanAll are manual triggers and MUST keep sends.)
 
-// autoScan keeps bot-side analytics + bookkeeping
-ok('autoScan keeps logAndSchedule (bot history/pending/lock)', autoScanSrc.includes('await logAndSchedule(cid, pair, sig, env)'));
-ok('autoScan keeps candle-dedup bookkeeping (kput scKey)', autoScanSrc.includes('await kput(scKey, currentCandle, env'));
-ok('autoScan keeps anySignalSent / noTradeStreak bookkeeping', autoScanSrc.includes('anySignalSent = true'));
-ok('autoScan keeps confidence-trend tracker', autoScanSrc.includes('updateConfTrend'));
-ok('autoScan keeps same-candle gate (lc:)', autoScanSrc.includes('`lc:${cid}`'));
-ok('autoScan keeps lock check (lock:)', autoScanSrc.includes('getLock(cid, pair, env)'));
+// The bot-side parallel ledger is gone — no cron task may exist that scans/logs
+ok('autoScan removed entirely (no bot cron scan)', !src.includes('async function autoScan') && !src.includes('autoScan(env, log)'));
+ok('no sc: same-candle dedup writes', !src.includes('sc:${cid}'));
+ok('no anySignalSent bookkeeping', !src.includes('anySignalSent'));
+ok('no lc: candle gate key', !src.includes('lc:${cid}'));
+ok('no lock helpers (getLock/clearLock/setLock)', !src.includes('getLock') && !src.includes('setLock') && !src.includes('clearLock'));
+ok('no bot-side expiry lock keys', !src.includes('lock:${cid}'));
 
-// autoScan must NOT send signal cards — worker push is the single source
-ok('autoScan has NO sendMsg(cid, fmtSignal( — bot signal push removed', !autoScanSrc.includes('sendMsg(cid, fmtSignal('));
-ok('autoScan has NO custom-alert delivery (getAlerts/passesAlert gone)', !autoScanSrc.includes('getAlerts') && !autoScanSrc.includes('passesAlert') && !autoScanSrc.includes('Custom Alert'));
-ok('autoScan has NO channel mirror send (fmtSignal via channel)', !autoScanSrc.includes('sendMsg(u.channelId'));
-ok('autoScan has no OTHER fmtSignal(message) send', !autoScanSrc.includes('fmtSignal(data, pair, intervalMin'));
+// No bot-side cron push of signal cards — worker push is the single source
+ok('cronLite has NO scan/result tasks (no autoScan/resultCheck calls)', !src.includes('await autoScan(') && !src.includes('await resultCheck('));
+ok('no custom-alert delivery (getAlerts/passesAlert gone)', !src.includes('getAlerts') && !src.includes('passesAlert'));
+ok('no channel mirror send (sendMsg(u.channelId)', !src.includes('sendMsg(u.channelId'));
+ok('no OTHER fmtSignal(message) send in cron paths', !src.includes('fmtSignal(data, pair, intervalMin'));
 
-// Bot-only analytics crons are all preserved
-ok('resultCheck kept (bot-only analytics)', src.includes('async function resultCheck'));
-ok('expiryReminder kept (bot-only analytics)', src.includes('async function expiryReminder'));
-ok('dailySummary kept (bot-only analytics)', src.includes('async function dailySummary'));
-ok('weeklyReport kept (bot-only analytics)', src.includes('async function weeklyReport'));
+// Result resolution + expiry reminders now live on the WORKER side only
+ok('resultCheck removed (worker */2 resolves + Phase 10 pushes)', !src.includes('async function resultCheck') && !src.includes("'pending_ids'"));
+ok('expiryReminder removed (worker push covers delivery)', !src.includes('async function expiryReminder') && !src.includes("'remind_ids'") && !src.includes('addReminder'));
+// User-facing summaries stay, computed from WORKER endpoints (not bot KV)
+ok('dailySummary kept (worker-backed summaries)', src.includes('async function dailySummary') && src.includes('fetchWorker(`/api/history?pair=${u.pair}&limit=100`'));
+ok('weeklyReport kept (worker-backed summaries)', src.includes('async function weeklyReport') && src.includes('fetchWorker(`/api/history?pair=${u.pair}&limit=500`'));
 
 // Custom Alerts (F09) dead UI removed — no half-working feature left behind
 ok('dead /alerts menu handler removed (no doAlerts)', !src.includes('async function doAlerts'));
