@@ -1,0 +1,885 @@
+From 951324e6bb2cd58d3e9696533b04fac66ec0082c Mon Sep 17 00:00:00 2001
+From: ferdausfs <178710601+ferdausfs@users.noreply.github.com>
+Date: Wed, 12 Aug 2026 07:06:23 +0000
+Subject: [PATCH] fix(push): stop silent Telegram auto-push death (v6.10.1)
+
+Live /health (2026-08-12): pushEnabled=true, subscriberCount=1,
+pushesLast24h=0 while the scanner keeps saving tradeable rows
+(ADA/USD pending SELL sig_1786517126427 with no pushLog).
+
+Root causes with evidence:
+- claimPushLock ran BEFORE sendMessage. A 401/403 held the 30-min
+  lock and wrote no pushLog, so every later tick returned 'locked'.
+- pushesLast24h counted pushLog:* keys that result-push deletes,
+  so a full day of resolve looked like zero deliveries.
+- scheduled() wrap-and-return + nested waitUntil(saveAndPush)
+  could freeze the isolate after the scan, killing the Telegram send.
+- /health only checked !!BOT_TOKEN, so a wrong/whitespace token
+  looked "enabled".
+
+Fix: release the lock on send failure; persist lastAttempt + a
+durable 24h counter; /health.push exposes enabled, noTokenReason,
+tokenValid (getMe), lastAttempt, subscriber snapshot; await the
+*/5 scan and awaitPersist from the scanner; harden auto_users
+shape and trim BOT_TOKEN.
+
+Tests: fix_tests 302/0 (T43 pins the lock-release + health path),
+phase10 19/19 + 71/0, r71 117P/0F, d2/probe/eh/fx/p7 all green.
+---
+ AGENT_LOG.md                      |  51 +++++
+ scripts/fix_tests.mjs             |  80 ++++++-
+ scripts/phase10_smoke.mjs         |  38 +++-
+ src/handlers/health.js            |  20 +-
+ src/handlers/pushToSubscribers.js | 345 ++++++++++++++++++++++++++----
+ src/handlers/scheduledScan.js     |   8 +-
+ src/handlers/signal.js            |  17 +-
+ src/index.js                      |  10 +-
+ 8 files changed, 513 insertions(+), 56 deletions(-)
+
+diff --git a/AGENT_LOG.md b/AGENT_LOG.md
+index f2e59c5..1822fbb 100644
+--- a/AGENT_LOG.md
++++ b/AGENT_LOG.md
+@@ -1,5 +1,56 @@
+ # Ftt-Otc-v6 — Agent Log
+ 
++## 2026-08-12 — AUTO PUSH STILL SILENT AFTER v6.10 (v6.10.1)
++
++**Base:** `3df5f1a` (main, v6.10.0). Live `/health` at 06:47Z: `pushEnabled:true`,
++`botKvBound:true`, `subscriberCount:1`, `pushesLast24h:0`. Scanner is saving
++(ADA/USD `sig_1786517126427_n1xn9` SELL 85% B pending at 06:45:26, 26s after
++the `*/5` cron) but no `pushLog:*` exists for that pending row.
++
++### Evidence (not guesses)
++1. **BOT_TOKEN is SET** on fttotcv6 (`pushEnabled:true`). Candidate 1 from the
++   prompt (secret missing) is ruled out. The secret may still be the *wrong*
++   bot (getMe was never probed — `/health` only checked `!!BOT_TOKEN`).
++2. **`pushesLast24h` was a lie for resolved signals.** `pushResultToSubscribers`
++   deletes `pushLog:<id>` after the result DM, so a day of successful
++   push+resolve shows `0`. The ADA pending row is the exception that proves
++   the real failure: if that SELL had been delivered, its pushLog would still
++   be open and the counter would be ≥1.
++3. **Lock-on-failed-send (code bug).** `claimPushLock` ran BEFORE
++   `sendTelegramMessage`. A 401/403 (wrong worker token, or a chat that token
++   cannot write) left the 30-min lock held and wrote no pushLog. The next
++   scanner tick returned `skipped:'locked'`. Forever 0 DMs, forever 0 logs.
++4. **Nested waitUntil on the `*/5` scheduled handler.**
++   `scheduled(){ ctx.waitUntil(scheduledScan); return; }` +
++   `handleSignalRaw` → `ctx.waitUntil(saveAndPush)`. Save (fast KV) completed;
++   Telegram send (slower, + optional 8s FX self-fetch) could be frozen when
++   the scan promise resolved. Matches "history grows, pushLog=0".
++
++### Fix (v6.10.1)
++- Release the pushLock if Telegram send fails, so the next tick retries.
++- Persist `push:lastAttempt` on EVERY outcome (no-token / no-match /
++  telegram-fail / locked) with per-subscriber skip reasons.
++- Durable `push:delivered24h` counter that result-push does not delete.
++- `/health.push = {enabled, noTokenReason, tokenValid (getMe), lastAttempt,
++  subscribers[]}` so this class of failure is never silent again.
++- `await scheduledScan` + scanner `awaitPersist:true` so the scheduled
++  isolate cannot drop the push.
++- Harden `auto_users` (numbers / `u:` prefix / `{chatId}` objects) and
++  trim BOT_TOKEN (dashboard paste with a trailing newline → silent 401).
++
++### Tests
++fix_tests **302/0** (was 281; T43 pins lock-release + health + no-token +
++shape hardening) · phase10_integration 19/19 · phase10_smoke 71/0 ·
++phase7 68+36 · d2 39 · probe 34 · eh 7 · fx 20 · r71 **117P/0F**.
++
++### Deploy note
++Rebuild bundle + `bash redeploy.sh`. Then hit `/health` and read
++`push.lastAttempt` + `push.subscribers` + `push.tokenValid`. If
++`tokenValid:false`, set the **worker's** BOT_TOKEN to the same secret the
++bot worker uses (`wrangler secret put BOT_TOKEN --name fttotcv6`).
++
++---
++
+ ## 2026-08-10 — RESTORE AUTO SIGNAL PUSH (worker = single source; v6.10.0)
+ 
+ **Base:** `bad7140c` (main, incl. PR #15 edge features). 5 files: 4 modified +
+diff --git a/scripts/fix_tests.mjs b/scripts/fix_tests.mjs
+index 8ccc8ea..8e32a0c 100644
+--- a/scripts/fix_tests.mjs
++++ b/scripts/fix_tests.mjs
+@@ -980,7 +980,9 @@ console.log('\n── T27: scanner pushes fresh tradeable signals, deduped (F3-1
+   // ── 5) call-site contract: noPush is no longer forced by the scanner ──
+   const ss = fs.readFileSync(fileURLToPath(new URL('../src/handlers/scheduledScan.js', import.meta.url)), 'utf8');
+   ok('T27e: scanner no longer forces noPush:true at the call site',
+-    !ss.includes('noPush: true') && ss.includes('handleSignalRaw(pair, env, ctx, opts)'));
++    !ss.includes('noPush: true') && ss.includes('handleSignalRaw(pair, env, ctx'));
++  ok('T27e: scanner awaits persist so scheduled isolate cannot drop the push',
++    ss.includes('awaitPersist: true'));
+ }
+ 
+ console.log('\n── T28: no AI calls on D2-blocked signals (F3-15) ─────');
+@@ -1740,6 +1742,82 @@ console.log('\n── T42: signalIndicators extended, additive (R5) ────
+   }
+ }
+ 
++
++console.log('\n── T43: push lock released on Telegram fail + health status ─');
++{
++  // Live bug 2026-08-12: claimPushLock ran BEFORE sendMessage. A 401/403
++  // left the lock held for 30 min, wrote no pushLog, and the next tick
++  // returned skipped:'locked'. User saw pushesLast24h=0 forever.
++  const { getPushStats, normalizeAutoUsers, isAutoEnabled } = await import('../src/handlers/pushToSubscribers.js');
++  const seed = {
++    'u:111': { pair: 'BTCUSD', watchlist: [], autoEnabled: true, gradeFilter: 'ALL', minConfidence: 0, aiOnlyMode: false, channelId: null },
++    'auto_users': ['111'],
++  };
++  const env = { SIGNAL_CACHE: makeKV(), BOT_KV: makeKV(seed), BOT_TOKEN: 'tok' };
++  const signal = {
++    id: 'sig_t43a', pair: 'BTC/USD',
++    signal: {
++      finalSignal: 'BUY', confidence: '85%', grade: { grade: 'A', label: 'STRONG' },
++      bestTimeframe: { timeframe: '5min' },
++      recommendations: { '5min': { entry: { price: 1 }, expiry: { totalMinutes: 10, countdown: { label: '1m' } } } },
++    },
++  };
++  globalThis.fetch = async () => ({ ok: false, status: 401, text: async () => 'Unauthorized', json: async () => ({ ok: false }) });
++  const q = quiet();
++  const r1 = await pushSignalToSubscribers(signal, env);
++  q();
++  eq('T43a: failed send reports telegram-fail (not silent 0)', r1.skipped, 'telegram-fail');
++  eq('T43a: nothing delivered', r1.pushed, 0);
++  eq('T43a: lock NOT held after a failed send',
++    [...env.SIGNAL_CACHE._m.keys()].filter(k => k.startsWith('pushLock:')).length, 0);
++  ok('T43a: lastAttempt recorded', !!env.SIGNAL_CACHE._m.get('push:lastAttempt'));
++
++  let tg = [];
++  globalThis.fetch = async (url, init) => {
++    if (String(url).includes('api.telegram.org')) {
++      const b = JSON.parse(init.body);
++      tg.push(b.chat_id);
++      return { ok: true, status: 200, json: async () => ({ ok: true }), text: async () => '{}' };
++    }
++    return { ok: true, status: 200, json: async () => ({}), text: async () => '' };
++  };
++  const r2 = await pushSignalToSubscribers({ ...signal, id: 'sig_t43b' }, env);
++  eq('T43b: retry after a failed send is delivered', r2.pushed, 1);
++  eq('T43b: Telegram got the retry', tg.length, 1);
++  ok('T43b: pushLog written on the successful retry', !!env.SIGNAL_CACHE._m.get('pushLog:sig_t43b'));
++
++  const r3 = await pushSignalToSubscribers(signal, { SIGNAL_CACHE: makeKV(), BOT_KV: makeKV(seed) });
++  eq('T43c: missing BOT_TOKEN -> skipped no-token', r3.skipped, 'no-token');
++
++  const r4 = await pushSignalToSubscribers(signal, { SIGNAL_CACHE: makeKV(), BOT_KV: makeKV(seed), BOT_TOKEN: '   ' });
++  eq('T43d: whitespace BOT_TOKEN -> skipped no-token', r4.skipped, 'no-token');
++
++  const stats = await getPushStats(env);
++  ok('T43e: pushEnabled true when token present', stats.pushEnabled === true);
++  eq('T43e: noTokenReason null when token present', stats.noTokenReason, null);
++  ok('T43e: lastAttempt exposed', !!(stats.lastAttempt && stats.lastAttempt.signalId));
++  ok('T43e: durable deliveries counted (not just open pushLog keys)', stats.pushesLast24h >= 1);
++  ok('T43e: subscriber snapshot includes pair/autoEnabled',
++    Array.isArray(stats.subscribers) && stats.subscribers[0] && stats.subscribers[0].autoEnabled === true
++    && stats.subscribers[0].pair === 'BTCUSD');
++
++  const off = await getPushStats({ SIGNAL_CACHE: makeKV() });
++  eq('T43f: noTokenReason missing when secret absent', off.noTokenReason, 'missing');
++  eq('T43f: pushEnabled false without token', off.pushEnabled, false);
++
++  eq('T43g: normalize numbers + u: prefix + objects',
++    normalizeAutoUsers([111, 'u:222', { chatId: '333' }, ' 444 ']),
++    ['111', '222', '333', '444']);
++  ok('T43g: isAutoEnabled accepts true/1/"true"',
++    isAutoEnabled({ autoEnabled: true }) && isAutoEnabled({ autoEnabled: 1 }) && isAutoEnabled({ autoEnabled: 'true' }));
++  ok('T43g: isAutoEnabled rejects false/missing',
++    !isAutoEnabled({ autoEnabled: false }) && !isAutoEnabled({}) && !isAutoEnabled(null));
++
++  const idx = fs.readFileSync(fileURLToPath(new URL('../src/index.js', import.meta.url)), 'utf8');
++  ok('T43h: scheduled */5 awaits scheduledScan (does not wrap-and-return)',
++    idx.includes('await scheduledScan(env, ctx)') && !idx.includes('ctx.waitUntil(scheduledScan'));
++}
++
+ console.log('\n───────────────────────────────────────────────────────────');
+ console.log(fail === 0 ? 'PASS: ' + pass + '   FAIL: 0' : 'PASS: ' + pass + '   FAIL: ' + fail);
+ console.log(fail === 0 ? 'ALL FIX TESTS PASSED' : 'FAILURES: ' + failures.join(', '));
+diff --git a/scripts/phase10_smoke.mjs b/scripts/phase10_smoke.mjs
+index 97ceabf..a9c19c6 100644
+--- a/scripts/phase10_smoke.mjs
++++ b/scripts/phase10_smoke.mjs
+@@ -293,8 +293,41 @@ console.log('\n── §5.6: /health block ────────────
+   eq('botKvBound', stats.botKvBound, true);
+   eq('pushesLast24h counted', stats.pushesLast24h, 2);
+   eq('subscriberCount from auto_users', stats.subscriberCount, 2);
++  eq('noTokenReason null when token set', stats.noTokenReason, null);
++  ok('subscriber snapshot present', Array.isArray(stats.subscribers) && stats.subscribers.length === 2);
+   const off = await push.getPushStats({ SIGNAL_CACHE: makeKV() });
+   eq('pushEnabled false without token', off.pushEnabled, false);
++  eq('noTokenReason missing when secret absent', off.noTokenReason, 'missing');
++}
++
++console.log('\n── lock released on telegram fail (live 2026-08-12) ────');
++{
++  installTelegram();
++  tgFailFor = new Set(['111']);
++  const env = envOf({ 111: userOf() });
++  const r = quiet();
++  const out = await push.pushSignalToSubscribers(sigOf({ id: 'sig_fail1' }), env);
++  r();
++  tgFailFor = new Set();
++  eq('failed send reports telegram-fail', out.skipped, 'telegram-fail');
++  eq('lock not held after failed send',
++    [...env.SIGNAL_CACHE._m.keys()].filter(k => k.startsWith('pushLock:')).length, 0);
++  const retry = await push.pushSignalToSubscribers(sigOf({ id: 'sig_fail2' }), env);
++  eq('retry after fail is delivered', retry.pushed, 1);
++  ok('lastAttempt recorded', !!env.SIGNAL_CACHE._m.get('push:lastAttempt'));
++}
++
++console.log('\n── auto_users shape hardening ──────────────────────────');
++{
++  eq('normalize numbers/objects/u: prefix',
++    push.normalizeAutoUsers([111, 'u:222', { chatId: '333' }]),
++    ['111', '222', '333']);
++  installTelegram();
++  const env = { BOT_TOKEN: 'tok', BOT_KV: makeKV({ 'u:111': userOf(), auto_users: [111] }), SIGNAL_CACHE: makeKV() };
++  const r = quiet();
++  const out = await push.pushSignalToSubscribers(sigOf(), env);
++  r();
++  eq('numeric auto_users entry still matches', out.pushed, 1);
+ }
+ 
+ console.log('\n── wiring + bans ──────────────────────────────────────────');
+@@ -306,7 +339,10 @@ console.log('\n── wiring + bans ──────────────
+   ok('signal.js imports the push module', sig.includes("from './pushToSubscribers.js'"));
+   ok('both emit paths go through saveAndPush', (sig.match(/saveAndPush\(/g) || []).length === 3);
+   ok('push is chained behind the dedup result', sig.includes('saveResult.deduped'));
+-  ok('push runs inside waitUntil (non-blocking)', sig.includes('ctx.waitUntil(saveAndPush('));
++  ok('push runs inside waitUntil (non-blocking)',
++    sig.includes('ctx.waitUntil(persist)') || sig.includes('ctx.waitUntil(saveAndPush('));
++  ok('scanner/fetch can await persist so scheduled isolate cannot drop the push',
++    sig.includes('opts.awaitPersist'));
+ 
+   const stats = rd('src/history/stats.js');
+   ok('result checker pushes results', stats.includes('pushResultToSubscribers(record, winLoss, exitPrice, env)'));
+diff --git a/src/handlers/health.js b/src/handlers/health.js
+index 2cd3b67..93a0561 100644
+--- a/src/handlers/health.js
++++ b/src/handlers/health.js
+@@ -24,10 +24,10 @@ export async function handleHealth(env) {
+   const quotaUsedToday = await readQuota(env);
+   const rotationIdx    = await readRotationIndex(env);
+   const scanCache      = await getScanCacheStats(env);   // Phase 7
+-  const phase10        = await getPushStats(env);        // Phase 10 push
++  const phase10        = await getPushStats(env, { validateToken: true });        // Phase 10 push
+ 
+   return jsonResponse({
+-    status: 'healthy', version: '6.10.0', timestamp: new Date().toISOString(),
++    status: 'healthy', version: '6.10.1', timestamp: new Date().toISOString(),
+     apiKeys: { configured: keyCount, source: keySource, status: keyCount > 0 ? 'ready' : 'NO KEYS' },
+     apiKeysLoaded: keyCount,
+     quotaUsedToday,
+@@ -47,9 +47,21 @@ export async function handleHealth(env) {
+     // Phase 7 — cron scanner cache. oldestCachedAge well above scanIntervalSec
+     // means the */5 scan is failing or being skipped.
+     scanCache,
+-    // Phase 10 — cross-surface Telegram push. pushEnabled false means the
+-    // BOT_TOKEN secret is not set on this worker, so pushes are inert.
++    // Phase 10 — cross-surface Telegram push.
++    // pushEnabled false  → BOT_TOKEN missing/blank on THIS worker (fttotcv6).
++    // noTokenReason      → 'missing' | 'empty' | 'invalid' | 'error' | null.
++    // lastAttempt        → last pushSignalToSubscribers outcome (even no-match
++    //                      / telegram-fail). Survives result-push deleting
++    //                      pushLog:* so pushesLast24h=0 is no longer silent.
+     phase10,
++    push: {
++      enabled: !!(phase10 && phase10.pushEnabled),
++      noTokenReason: phase10 ? phase10.noTokenReason : 'missing',
++      tokenValid: phase10 ? phase10.tokenValid : null,
++      tokenUsername: phase10 ? phase10.tokenUsername : null,
++      lastAttempt: phase10 ? phase10.lastAttempt : null,
++      subscribers: phase10 ? phase10.subscribers : [],
++    },
+     history: {
+       enabled: !!env.SIGNAL_CACHE, maxPerPair: HISTORY_CONFIG.MAX_SIGNALS_PER_PAIR,
+       winRateLookback: HISTORY_CONFIG.WIN_RATE_LOOKBACK, resultCheckDelay: HISTORY_CONFIG.RESULT_CHECK_DELAY + 's after expiry',
+diff --git a/src/handlers/pushToSubscribers.js b/src/handlers/pushToSubscribers.js
+index 54af914..91d2e0d 100644
+--- a/src/handlers/pushToSubscribers.js
++++ b/src/handlers/pushToSubscribers.js
+@@ -44,9 +44,20 @@ const PUSH_LOG_TTL_S   = 24 * 3600;
+  */
+ const PUSH_LOCK_TTL_S  = 30 * 60;
+ 
++// Durable diagnostics — survive result-push deleting pushLog:<id>.
++const LAST_ATTEMPT_KEY   = 'push:lastAttempt';
++const DELIVERED_24H_KEY  = 'push:delivered24h';
++const TOKEN_CHECK_KEY    = 'push:tokenCheck';
++const TOKEN_CHECK_TTL_S  = 300;
++
+ const TELEGRAM_API = 'https://api.telegram.org';
+ const SELF_URL = 'https://fttotcv6.umuhammadiswa.workers.dev';
+ 
++/** Trim so a dashboard paste with trailing newline is not a silent 401. */
++export function botToken(env) {
++  return env && env.BOT_TOKEN ? String(env.BOT_TOKEN).trim() : '';
++}
++
+ /** Bot stores pairs slash-less ("EURUSD"); normalise both sides before compare. */
+ function normPair(p) {
+   return String(p || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+@@ -56,6 +67,82 @@ function confPct(sig) {
+   return parseInt(String((sig && sig.confidence) || '0%').replace('%', ''), 10) || 0;
+ }
+ 
++/**
++ * Coerce the Bot's `auto_users` index into chat-id strings.
++ * Live shape is `["123456"]`, but a dashboard edit or an older writer can
++ * leave numbers, `u:<id>` keys, or `{chatId}` objects — all of which made
++ * `u:` + cid look up the wrong KV key and silently match nobody.
++ */
++export function normalizeAutoUsers(raw) {
++  if (!Array.isArray(raw)) return [];
++  const ids = [];
++  for (const entry of raw) {
++    if (entry == null) continue;
++    if (typeof entry === 'number' && isFinite(entry)) {
++      ids.push(String(Math.trunc(entry)));
++      continue;
++    }
++    if (typeof entry === 'string') {
++      const s = entry.trim();
++      if (!s) continue;
++      ids.push(s.startsWith('u:') ? s.slice(2) : s);
++      continue;
++    }
++    if (typeof entry === 'object') {
++      const v = entry.chatId ?? entry.id ?? entry.cid ?? entry.chat_id;
++      if (v == null) continue;
++      const s = String(v).trim();
++      if (s) ids.push(s.startsWith('u:') ? s.slice(2) : s);
++    }
++  }
++  return ids;
++}
++
++/** Accept boolean true plus the string/number forms a KV edit can leave. */
++export function isAutoEnabled(user) {
++  if (!user) return false;
++  return user.autoEnabled === true || user.autoEnabled === 1 || user.autoEnabled === 'true';
++}
++
++function lockKey(chatId, signal) {
++  return PUSH_LOCK_PREFIX + chatId + ':' + normPair(signal.pair)
++    + ':' + signal.signal.finalSignal;
++}
++
++async function releasePushLock(chatId, signal, env) {
++  if (!env || !env.SIGNAL_CACHE) return;
++  try { await env.SIGNAL_CACHE.delete(lockKey(chatId, signal)); }
++  catch (e) { console.warn('push: lock release failed: ' + e.message); }
++}
++
++async function recordPushAttempt(env, rec) {
++  if (!env || !env.SIGNAL_CACHE) return;
++  try {
++    await env.SIGNAL_CACHE.put(
++      LAST_ATTEMPT_KEY,
++      JSON.stringify({ ...rec, at: new Date().toISOString() }),
++      { expirationTtl: 7 * 24 * 3600 },
++    );
++  } catch (e) {
++    console.warn('push: lastAttempt write failed: ' + e.message);
++  }
++}
++
++async function recordDelivery(env, signalId, pair, n) {
++  if (!env || !env.SIGNAL_CACHE || !n) return;
++  try {
++    let arr = await env.SIGNAL_CACHE.get(DELIVERED_24H_KEY, 'json');
++    if (!Array.isArray(arr)) arr = [];
++    const now = Date.now();
++    arr = arr.filter(x => x && x.at && (now - new Date(x.at).getTime()) < 24 * 3600 * 1000);
++    arr.push({ id: signalId, pair, n, at: new Date().toISOString() });
++    if (arr.length > 500) arr = arr.slice(-500);
++    await env.SIGNAL_CACHE.put(DELIVERED_24H_KEY, JSON.stringify(arr), { expirationTtl: 48 * 3600 });
++  } catch (e) {
++    console.warn('push: delivered24h write failed: ' + e.message);
++  }
++}
++
+ // ── filter helpers — mirrored from the Bot's own implementation ─────────
+ export function passGrade(sig, f) {
+   if (!f || f === 'ALL') return true;
+@@ -90,42 +177,84 @@ export function passAI(sig, aiOnly) {
+ /**
+  * Everyone who should receive this signal.
+  * Returns [{ chatId, channelId }] — channelId mirrors the Bot's [F10] behaviour.
++ * Optional `diag.skips` is filled with per-subscriber skip reasons so /health
++ * can show WHY a live signal matched nobody (the previous silent `no-match`).
+  */
+-export async function getMatchingSubscribers(signal, env) {
+-  if (!env || !env.BOT_KV) return [];
++export async function getMatchingSubscribers(signal, env, diag = null) {
++  if (diag && !Array.isArray(diag.skips)) diag.skips = [];
++  if (!env || !env.BOT_KV) {
++    if (diag) diag.skips.push({ reason: 'no-bot-kv' });
++    return [];
++  }
+   const sig = signal && signal.signal;
+-  if (!sig) return [];
++  if (!sig) {
++    if (diag) diag.skips.push({ reason: 'no-signal' });
++    return [];
++  }
+ 
+   let autoUsers;
+   try {
+     autoUsers = await env.BOT_KV.get('auto_users', 'json');
+   } catch (e) {
+     console.warn('push: auto_users read failed: ' + e.message);
++    if (diag) diag.skips.push({ reason: 'auto-users-read-failed', error: e.message });
++    return [];
++  }
++  const ids = normalizeAutoUsers(autoUsers);
++  if (diag) {
++    diag.autoUsersRawType = Array.isArray(autoUsers) ? 'array' : typeof autoUsers;
++    diag.autoUsersCount = ids.length;
++  }
++  if (ids.length === 0) {
++    if (diag) diag.skips.push({ reason: 'auto-users-empty' });
+     return [];
+   }
+-  if (!Array.isArray(autoUsers) || autoUsers.length === 0) return [];
+ 
+   const want = normPair(signal.pair);
+   const matches = [];
+ 
+-  for (const cid of autoUsers) {
++  for (const cid of ids) {
+     try {
+       const user = await env.BOT_KV.get('u:' + cid, 'json');
+-      if (!user || user.autoEnabled !== true) continue;
++      if (!user) {
++        if (diag) diag.skips.push({ chatId: String(cid), reason: 'no-user-record' });
++        continue;
++      }
++      if (!isAutoEnabled(user)) {
++        if (diag) diag.skips.push({ chatId: String(cid), reason: 'auto-disabled' });
++        continue;
++      }
+ 
+       const watched = [user.pair, ...(Array.isArray(user.watchlist) ? user.watchlist : [])]
+         .filter(Boolean)
+         .map(normPair);
+-      if (!watched.includes(want)) continue;
++      if (!watched.includes(want)) {
++        if (diag) diag.skips.push({
++          chatId: String(cid), reason: 'pair-not-watched',
++          want, pair: user.pair || null,
++          watchlist: Array.isArray(user.watchlist) ? user.watchlist : [],
++        });
++        continue;
++      }
+ 
+       // Same three gates the Bot applies in autoScan.
+-      if (!passConf(sig, user.minConfidence)) continue;
+-      if (!passGrade(sig, user.gradeFilter)) continue;
+-      if (!passAI(sig, user.aiOnlyMode)) continue;
++      if (!passConf(sig, user.minConfidence)) {
++        if (diag) diag.skips.push({ chatId: String(cid), reason: 'min-confidence', min: user.minConfidence });
++        continue;
++      }
++      if (!passGrade(sig, user.gradeFilter)) {
++        if (diag) diag.skips.push({ chatId: String(cid), reason: 'grade-filter', filter: user.gradeFilter });
++        continue;
++      }
++      if (!passAI(sig, user.aiOnlyMode)) {
++        if (diag) diag.skips.push({ chatId: String(cid), reason: 'ai-only' });
++        continue;
++      }
+ 
+       matches.push({ chatId: String(cid), channelId: user.channelId || null, fxMode: user.fxMode || 'ftt' });
+     } catch (e) {
+       console.warn('push: user read failed for ' + cid + ': ' + e.message);
++      if (diag) diag.skips.push({ chatId: String(cid), reason: 'user-read-failed', error: e.message });
+     }
+   }
+   return matches;
+@@ -141,8 +270,7 @@ export async function getMatchingSubscribers(signal, env) {
+  */
+ async function claimPushLock(chatId, signal, env) {
+   if (!env.SIGNAL_CACHE) return true;
+-  const key = PUSH_LOCK_PREFIX + chatId + ':' + normPair(signal.pair)
+-    + ':' + signal.signal.finalSignal;
++  const key = lockKey(chatId, signal);
+   try {
+     const held = await env.SIGNAL_CACHE.get(key);
+     if (held) return false;
+@@ -160,31 +288,43 @@ async function claimPushLock(chatId, signal, env) {
+  * Call inside ctx.waitUntil() — never block the caller's response.
+  */
+ export async function pushSignalToSubscribers(signal, env) {
++  const diag = { skips: [] };
++  const out = await pushSignalToSubscribersInner(signal, env, diag);
++  await recordPushAttempt(env, {
++    signalId: signal && signal.id || null,
++    pair: signal && signal.pair || null,
++    dir: signal && signal.signal && signal.signal.finalSignal || null,
++    skipped: out.skipped || null,
++    pushed: out.pushed || 0,
++    matched: out.matched || 0,
++    error: out.error || null,
++    telegramError: out.telegramError || null,
++    skips: diag.skips,
++  });
++  return out;
++}
++
++async function pushSignalToSubscribersInner(signal, env, diag) {
+   if (!signal || !signal.id) return { pushed: 0, skipped: 'no-id' };
+   const sig = signal.signal;
+   if (!sig || !['BUY', 'SELL'].includes(sig.finalSignal)) {
+     return { pushed: 0, skipped: 'not-actionable' };
+   }
+-  if (!env || !env.BOT_TOKEN) {
+-    // Not an error: push is opt-in via secret. Stay silent to avoid log spam
+-    // on every single signal when the feature simply is not configured.
++  if (!env || !botToken(env)) {
+     return { pushed: 0, skipped: 'no-token' };
+   }
+ 
+   try {
+-    const subscribers = await getMatchingSubscribers(signal, env);
+-    if (subscribers.length === 0) return { pushed: 0, skipped: 'no-match' };
++    const subscribers = await getMatchingSubscribers(signal, env, diag);
++    if (subscribers.length === 0) return { pushed: 0, skipped: 'no-match', matched: 0 };
+ 
+-    // Idempotency: only push to subscribers not already notified about this
+-    // pair+direction inside the lock window.
+     const eligible = [];
+     for (const sub of subscribers) {
+       if (await claimPushLock(sub.chatId, signal, env)) eligible.push(sub);
++      else if (diag) diag.skips.push({ chatId: sub.chatId, reason: 'locked' });
+     }
+-    if (eligible.length === 0) return { pushed: 0, skipped: 'locked' };
++    if (eligible.length === 0) return { pushed: 0, skipped: 'locked', matched: subscribers.length };
+ 
+-    // Per-subscriber message: FX-mode users get SL/TP levels (fetched with
+-    // mode=fx&nopush=1 to avoid a push loop), others get FTT.
+     const results = await Promise.allSettled(
+       eligible.map(async (sub) => {
+         let msgSignal = signal;
+@@ -200,23 +340,28 @@ export async function pushSignalToSubscribers(signal, env) {
+         }
+         const fxOnly = sub.fxMode === 'fx';
+         const message = formatSignalMessage(msgSignal, { fx: sub.fxMode === 'fx' || sub.fxMode === 'both', fxOnly });
+-        await sendTelegramMessage(sub.chatId, message, env);
+-        // F3-01 (BUG-011): carry the per-subscriber formatted message with the
+-        // delivery record so the channel-mirror block below uses THIS
+-        // subscriber's message instead of a block-scoped variable that no
+-        // longer exists outside the map callback (ReferenceError before).
++        try {
++          await sendTelegramMessage(sub.chatId, message, env);
++        } catch (e) {
++          // Live 2026-08-12: lock was claimed BEFORE send. A 401/403 left the
++          // lock held for 30 min and wrote no pushLog — next tick was 'locked',
++          // /health.pushesLast24h stayed 0, user never got a retry.
++          await releasePushLock(sub.chatId, signal, env);
++          throw e;
++        }
+         return { sub, message };
+       }),
+     );
+ 
+     const delivered = [];
++    const telegramErrors = [];
+     results.forEach((r) => {
+       if (r.status === 'fulfilled' && r.value) delivered.push(r.value);
++      else if (r.status === 'rejected') {
++        telegramErrors.push(String((r.reason && r.reason.message) || r.reason || 'send-failed'));
++      }
+     });
+ 
+-    // Channel mirroring ([F10] parity) — best effort, never gates the DM.
+-    // Each delivery record carries its own message, so a mirror failure can
+-    // never throw out of this block and lose the pushLog write.
+     await Promise.allSettled(
+       delivered.filter(d => d.sub.channelId)
+         .map(d => sendTelegramMessage(d.sub.channelId, d.message, env)),
+@@ -229,12 +374,22 @@ export async function pushSignalToSubscribers(signal, env) {
+         JSON.stringify(delivered.map(d => ({ chatId: d.sub.chatId, sentAt: now }))),
+         { expirationTtl: PUSH_LOG_TTL_S },
+       );
++      await recordDelivery(env, signal.id, signal.pair, delivered.length);
+     }
+ 
+     console.log('Phase 10 push: ' + signal.id + ' ' + signal.pair + ' '
+       + sig.finalSignal + ' -> ' + delivered.length + '/' + eligible.length
+-      + ' delivered (' + subscribers.length + ' matched)');
+-    return { pushed: delivered.length, matched: subscribers.length };
++      + ' delivered (' + subscribers.length + ' matched)'
++      + (telegramErrors.length ? ' telegramErrors=' + telegramErrors[0] : ''));
++    const skipped = delivered.length === 0
++      ? (telegramErrors.length ? 'telegram-fail' : 'no-delivery')
++      : undefined;
++    return {
++      pushed: delivered.length,
++      matched: subscribers.length,
++      skipped,
++      telegramError: telegramErrors[0] || null,
++    };
+   } catch (e) {
+     console.warn('pushSignalToSubscribers error: ' + e.message);
+     return { pushed: 0, error: e.message };
+@@ -248,7 +403,7 @@ export async function pushSignalToSubscribers(signal, env) {
+ export async function pushResultToSubscribers(record, winLoss, exitPrice, env) {
+   if (!record || !record.id) return { pushed: 0 };
+   if (!['WIN', 'LOSS'].includes(winLoss)) return { pushed: 0, skipped: 'undecided' };
+-  if (!env || !env.BOT_TOKEN || !env.SIGNAL_CACHE) return { pushed: 0, skipped: 'not-configured' };
++  if (!env || !botToken(env) || !env.SIGNAL_CACHE) return { pushed: 0, skipped: 'not-configured' };
+ 
+   try {
+     const logKey = PUSH_LOG_PREFIX + record.id;
+@@ -358,7 +513,8 @@ export function formatResultMessage(record, winLoss, exitPrice) {
+  * the Bot's own Bug#1 comment.
+  */
+ export async function sendTelegramMessage(chatId, text, env) {
+-  const url = TELEGRAM_API + '/bot' + env.BOT_TOKEN + '/sendMessage';
++  const token = botToken(env);
++  const url = TELEGRAM_API + '/bot' + token + '/sendMessage';
+   const res = await fetch(url, {
+     method: 'POST',
+     headers: { 'Content-Type': 'application/json' },
+@@ -372,37 +528,142 @@ export async function sendTelegramMessage(chatId, text, env) {
+     const body = await res.text().catch(() => '');
+     console.warn('Telegram sendMessage failed: chatId=' + chatId
+       + ' status=' + res.status + ' body=' + body.slice(0, 200));
+-    throw new Error('Telegram ' + res.status);
++    throw new Error('Telegram ' + res.status + (body ? ' ' + body.slice(0, 120) : ''));
+   }
+   return res.json().catch(() => ({}));
+ }
+ 
+-/** /health support (spec §2.5). */
+-export async function getPushStats(env) {
+-  const enabled = !!(env && env.BOT_TOKEN);
++export async function validateBotToken(env) {
++  if (!botToken(env)) return { ok: false, reason: 'missing', checkedAt: new Date().toISOString() };
++  if (env.SIGNAL_CACHE) {
++    try {
++      const cached = await env.SIGNAL_CACHE.get(TOKEN_CHECK_KEY, 'json');
++      if (cached && cached.checkedAt
++          && (Date.now() - new Date(cached.checkedAt).getTime()) < TOKEN_CHECK_TTL_S * 1000) {
++        return cached;
++      }
++    } catch (e) { /* fall through */ }
++  }
++  try {
++    const res = await fetch(TELEGRAM_API + '/bot' + botToken(env) + '/getMe', {
++      signal: AbortSignal.timeout(5000),
++    });
++    const body = await res.json().catch(() => ({}));
++    const result = (res.ok && body.ok)
++      ? { ok: true, reason: null, username: body.result && body.result.username, checkedAt: new Date().toISOString() }
++      : {
++          ok: false, reason: 'invalid', status: res.status,
++          description: body.description || null, checkedAt: new Date().toISOString(),
++        };
++    if (env.SIGNAL_CACHE) {
++      await env.SIGNAL_CACHE.put(TOKEN_CHECK_KEY, JSON.stringify(result), {
++        expirationTtl: TOKEN_CHECK_TTL_S,
++      }).catch(() => {});
++    }
++    return result;
++  } catch (e) {
++    return { ok: false, reason: 'error', error: e.message, checkedAt: new Date().toISOString() };
++  }
++}
++
++export async function getSubscriberSnapshot(env) {
++  const out = [];
++  if (!env || !env.BOT_KV) return out;
++  let autoUsers;
++  try { autoUsers = await env.BOT_KV.get('auto_users', 'json'); }
++  catch (e) { return [{ error: e.message }]; }
++  for (const cid of normalizeAutoUsers(autoUsers)) {
++    try {
++      const user = await env.BOT_KV.get('u:' + cid, 'json');
++      out.push({
++        chatId: String(cid),
++        found: !!user,
++        autoEnabled: isAutoEnabled(user),
++        pair: user && user.pair || null,
++        watchlist: user && Array.isArray(user.watchlist) ? user.watchlist : [],
++        gradeFilter: (user && user.gradeFilter) || 'ALL',
++        minConfidence: (user && user.minConfidence) || 0,
++        aiOnlyMode: !!(user && user.aiOnlyMode),
++        fxMode: (user && user.fxMode) || 'ftt',
++      });
++    } catch (e) {
++      out.push({ chatId: String(cid), found: false, error: e.message });
++    }
++  }
++  return out;
++}
++
++export async function getPushStats(env, opts = {}) {
++  const token = botToken(env);
++  const enabled = !!token;
+   const stats = {
+     pushEnabled: enabled,
+     botKvBound: !!(env && env.BOT_KV),
++    noTokenReason: enabled ? null : (env && env.BOT_TOKEN ? 'empty' : 'missing'),
++    tokenValid: null,
++    tokenUsername: null,
+     pushesLast24h: null,
++    pushLogsOpen: null,
+     subscriberCount: null,
++    subscribers: [],
++    lastAttempt: null,
+   };
+-  if (!env || !env.SIGNAL_CACHE) return stats;
++  if (!env || !env.SIGNAL_CACHE) {
++    if (env && env.BOT_KV) {
++      try {
++        const autoUsers = await env.BOT_KV.get('auto_users', 'json');
++        const ids = normalizeAutoUsers(autoUsers);
++        stats.subscriberCount = ids.length;
++        stats.subscribers = await getSubscriberSnapshot(env);
++      } catch (e) { /* leave null */ }
++    }
++    return stats;
++  }
+ 
+   try {
+     const list = await env.SIGNAL_CACHE.list({ prefix: PUSH_LOG_PREFIX });
+-    stats.pushesLast24h = ((list && list.keys) || []).length;
++    stats.pushLogsOpen = ((list && list.keys) || []).length;
++  } catch (e) { /* leave null */ }
++
++  try {
++    const arr = await env.SIGNAL_CACHE.get(DELIVERED_24H_KEY, 'json');
++    if (Array.isArray(arr)) {
++      const now = Date.now();
++      stats.pushesLast24h = arr.filter(x => x && x.at && (now - new Date(x.at).getTime()) < 24 * 3600 * 1000)
++        .reduce((n, x) => n + (x.n || 1), 0);
++    } else {
++      stats.pushesLast24h = stats.pushLogsOpen;
++    }
++  } catch (e) {
++    stats.pushesLast24h = stats.pushLogsOpen;
++  }
++
++  try {
++    stats.lastAttempt = await env.SIGNAL_CACHE.get(LAST_ATTEMPT_KEY, 'json');
+   } catch (e) { /* leave null */ }
+ 
+   if (env.BOT_KV) {
+     try {
+       const autoUsers = await env.BOT_KV.get('auto_users', 'json');
+-      stats.subscriberCount = Array.isArray(autoUsers) ? autoUsers.length : 0;
++      const ids = normalizeAutoUsers(autoUsers);
++      stats.subscriberCount = ids.length;
++      stats.subscribers = await getSubscriberSnapshot(env);
+     } catch (e) { /* leave null */ }
+   }
++
++  if (opts.validateToken && enabled) {
++    const probe = await validateBotToken(env);
++    stats.tokenValid = !!probe.ok;
++    stats.tokenUsername = probe.username || null;
++    if (!probe.ok) stats.noTokenReason = probe.reason || 'invalid';
++  }
++
+   return stats;
+ }
+ 
+ export const __pushTest = {
+-  normPair, confPct, claimPushLock,
++  normPair, confPct, claimPushLock, releasePushLock, lockKey,
++  recordPushAttempt, recordDelivery, botToken,
+   PUSH_LOG_PREFIX, PUSH_LOCK_PREFIX, PUSH_LOCK_TTL_S, PUSH_LOG_TTL_S,
++  LAST_ATTEMPT_KEY, DELIVERED_24H_KEY, TOKEN_CHECK_KEY,
+ };
+diff --git a/src/handlers/scheduledScan.js b/src/handlers/scheduledScan.js
+index ff54e0e..3bfb49b 100644
+--- a/src/handlers/scheduledScan.js
++++ b/src/handlers/scheduledScan.js
+@@ -136,7 +136,13 @@ async function scanOnePair(pair, generationId, env, ctx, opts = {}) {
+     // writes the latest: cache.
+     // opts.edgeFeatures / opts.now are test-determinism hooks (production cron
+     // omits them → edge features ON, live clock).
+-    const result = await handleSignalRaw(pair, env, ctx, opts);
++    // awaitPersist: the */5 scheduled handler used to wrap this scan in
++    // ctx.waitUntil and return immediately; handleSignalRaw then nested
++    // another waitUntil(saveAndPush). When the scan promise resolved, the
++    // isolate could freeze before Telegram sendMessage finished — history
++    // rows landed (fast KV) but pushLog never did. Awaiting the persist
++    // here keeps the scan tick alive until the push attempt completes.
++    const result = await handleSignalRaw(pair, env, ctx, { ...opts, awaitPersist: true });
+ 
+     if (!result || result.error) {
+       console.warn('scanOnePair ' + pair + ' error: '
+diff --git a/src/handlers/signal.js b/src/handlers/signal.js
+index 90c75ae..0ea0d01 100644
+--- a/src/handlers/signal.js
++++ b/src/handlers/signal.js
+@@ -263,8 +263,14 @@ export async function handleSignalRaw(pair, env, ctx, opts = {}) {
+     cacheHits, entrySource, dataStatus,
+   };
+ 
+-  if (signalId)
+-    ctx.waitUntil(saveAndPush(signal, pair, false, env, signalId, entrySource, result, noPush));
++  if (signalId) {
++    // Fetch path: waitUntil so the HTTP response is not blocked.
++    // Scanner path: also await (opts.awaitPersist) so a scheduled isolate
++    // cannot freeze after scanOnePair returns and kill the Telegram send.
++    const persist = saveAndPush(signal, pair, false, env, signalId, entrySource, result, noPush);
++    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(persist);
++    if (opts.awaitPersist) await persist;
++  }
+ 
+   return result;
+ }
+@@ -349,8 +355,11 @@ async function handleSignalRawOTC(pair, env, ctx, opts = {}) {
+     cacheHits, entrySource, dataStatus,
+   };
+ 
+-  if (signalId)
+-    ctx.waitUntil(saveAndPush(signal, pair, true, env, signalId, entrySource, otcResult, noPush));
++  if (signalId) {
++    const persist = saveAndPush(signal, pair, true, env, signalId, entrySource, otcResult, noPush);
++    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(persist);
++    if (opts.awaitPersist) await persist;
++  }
+ 
+   return otcResult;
+ }
+diff --git a/src/index.js b/src/index.js
+index e9c6b43..9152370 100644
+--- a/src/index.js
++++ b/src/index.js
+@@ -1,5 +1,5 @@
+ /**
+- * FTT Signal Worker v6.10.0
++ * FTT Signal Worker v6.10.1
+  * Cloudflare Worker Entry Point
+  */
+ 
+@@ -36,7 +36,11 @@ export default {
+   async scheduled(event, env, ctx) {
+     const cron = event && event.cron;
+     if (cron === '*/5 * * * *') {
+-      ctx.waitUntil(scheduledScan(env, ctx));
++      // Await the scan (do NOT wrap-and-return). Nested waitUntil(scan) →
++      // waitUntil(saveAndPush) can drop the inner push when the scan
++      // promise resolves. Awaiting keeps the scheduled handler live until
++      // every pair's save+push attempt has finished.
++      await scheduledScan(env, ctx);
+       return;
+     }
+     // Self-calibration (C7): weekly refresh of the calibration tables
+@@ -120,7 +124,7 @@ export default {
+       } else {
+         response = jsonResponse({
+           status: 'ok',
+-          message: 'FTT Signal Worker v6.10.0 — Forex + Crypto + OTC + History Tracking',
++          message: 'FTT Signal Worker v6.10.1 — Forex + Crypto + OTC + History Tracking',
+           endpoints: {
+             health:    '/',
+             signal:    '/api/signal?pair=EUR/USD',
+-- 
+2.39.5
+
