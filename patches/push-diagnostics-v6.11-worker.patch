@@ -1,0 +1,531 @@
+diff --git a/AGENT_LOG.md b/AGENT_LOG.md
+index f2e59c5..d39f485 100644
+--- a/AGENT_LOG.md
++++ b/AGENT_LOG.md
+@@ -1,5 +1,58 @@
+ # Ftt-Otc-v6 — Agent Log
+ 
++## 2026-08-12 — PUSH DIAGNOSTICS (auto push still not firing live; v6.11.0)
++
++**Base:** `3df5f1a` (main, v6.10.0). 3 files modified + 2 test suites extended.
++Companion investigation report: `ftt-telegram-bot` PR (arena/019ff4ba…, PUSH_DEBUG_REPORT.md).
++
++### Live evidence chain (2026-08-12 ~06:50 UTC, all verified against the LIVE worker)
++1. `/health` → `version: 6.10.0`, `phase10.pushEnabled: true` → the v6.10.0 scanner-push
++   fix IS deployed and `BOT_TOKEN` **is** set on `fttotcv6` (candidate "secret missing" ruled out).
++2. `phase10.botKvBound: true`, `subscriberCount: 1` → the worker's BOT_KV binding resolves
++   and `auto_users` parses as a 1-element array (namespace/shape mismatch ruled out for the index).
++3. `scanCache` ages ~296s / 14 pairs → the `*/5` scanner is alive and writing `latest:`.
++4. `/api/history` shows FRESH tradeable rows saved today (each = a new non-deduped row, so
++   `saveAndPush` → `pushSignalToSubscribers` RAN for each): XRP/USD SELL 73% B 06:15Z,
++   EUR/USD SELL 85% A+ 02:20Z, BNB BUY 77% 00:25Z, DOGE BUY 77% 01:20Z, AUD/USD BUY 77% 00:40Z.
++5. `phase10.pushesLast24h: 0` → no `pushLog:` key exists → **every push attempt in ≥24h
++   ended with `pushed: 0`** and left NO trace: 'no-token'/'no-match' return silently and send
++   failures only console.warn. The break is inside `pushSignalToSubscribers`, after the token
++   check, before the pushLog write — and it is completely unqueryable.
++6. Deploy pipeline: GitHub Actions deploys have failed since 2026-08-07 06:06Z (wrangler step,
++   npx exit 1) — the leaked Cloudflare token `cfut_pTef5…` was rotated; the repo secret is
++   stale. Live bundles are deployed manually (redeploy.sh / bot_deploy2.sh), which is how the
++   live worker is 6.10.0 and the live bot is v4.5.0.
++
++### Why "200+/day → ~3/day"
++Until bot v4.4.1 the BOT's own autoScan pushed via the BOT token (200+/day). v4.4.2 silenced
++autoScan and v4.5.0 (live) removed it — delivery now depends 100% on worker push, which has
++been failing silently. The ~3/day are the user's own manual bot commands (bot replies work).
++
++### Fix — never silent again
++- `pushSignalToSubscribers` now records EVERY actionable attempt to KV:
++  `pushDiag:last` (overwritten) + `pushDiag:<signalId>` (48h TTL), with the exact outcome:
++  skip reason, per-subscriber gate breakdown (pair/conf/grade/AI), or the Telegram
++  status+body preview on a failed send.
++- `getMatchingSubscribers(signal, env, diagOut)` optionally returns the per-cid gate breakdown.
++- `sendTelegramMessage` errors now carry `.status` and `.body` (200-char preview).
++- `getPushStats` exposes `lastPushDiag` and `pushDisabledReason`; `/health` shows them.
++- The silent `no-token` / `no-match` / send-failure paths now console.warn (rate-limited to
++  once per 15 min per reason).
++- Next fresh tradeable signal on the live worker → `/health` `phase10.lastPushDiag` names the
++  exact gate or HTTP status. If it says `no-token` → set the secret; if a gate → fix settings;
++  if `Telegram 401` → the worker's BOT_TOKEN value is stale.
++
++### Verification
++- `phase10_integration.mjs` 19 → **41/41** (new §"push diagnostics" pins: success writes
++  pushDiag:last + pushDiag:<id>; no-token records the reason + pushDisabledReason; unwatched
++  pair records the gate breakdown; aiOnlyMode + BOTH_UNAVAILABLE records ai:false; Telegram
++  401 records status+body; the REAL handleSignalRaw chain leaves a diag trail end-to-end).
++- `phase10_smoke.mjs` 61 → **64/64** (health block: lastPushDiag + pushDisabledReason).
++- `fix_tests` **281/281** · `r71_tests` **117/117** · `d2_tests` 39 · `probe_tests` 34 ·
++  `fx_mode_tests` 20 · `entry_hit_tests` 7 · `phase7_integration` 36 · `phase7_smoke` 68 · r71 smoke.
++
++---
++
+ ## 2026-08-10 — RESTORE AUTO SIGNAL PUSH (worker = single source; v6.10.0)
+ 
+ **Base:** `bad7140c` (main, incl. PR #15 edge features). 5 files: 4 modified +
+diff --git a/scripts/phase10_integration.mjs b/scripts/phase10_integration.mjs
+index fb62189..bca14bb 100644
+--- a/scripts/phase10_integration.mjs
++++ b/scripts/phase10_integration.mjs
+@@ -246,6 +246,119 @@ console.log('\n── NO_TRADE emits nothing ───────────
+ }
+ 
+ console.log('\n───────────────────────────────────────────────────────────');
++console.log('\n── push diagnostics: every attempt is recorded (v6.11) ──────');
++{
++  const { pushSignalToSubscribers, getPushStats } = await import('../src/handlers/pushToSubscribers.js');
++  const sigOf = (over = {}, sigOver = {}) => ({
++    id: 'sig_diag_0001', pair: 'BTC/USD',
++    signal: {
++      finalSignal: 'BUY', confidence: '87%',
++      grade: { grade: 'A', label: 'EXCELLENT' },
++      bestTimeframe: { timeframe: '5min' },
++      recommendations: { '5min': { entry: { price: 63750 }, expiry: { totalMinutes: 10, countdown: { label: '2m 30s' } } } },
++      aiValidation: { status: 'OK', agrees: true },
++      ...sigOver,
++    },
++    ...over,
++  });
++
++  // success path -> pushDiag:last + pushDiag:<id> with delivered count
++  {
++    installNet();
++    const env = envOf({ 111: userOf() });
++    const r = quiet();
++    const out = await pushSignalToSubscribers(sigOf(), env);
++    r();
++    eq('diag: success reports pushed', out.pushed, 1);
++    const last = await env.SIGNAL_CACHE.get('pushDiag:last', 'json');
++    ok('diag:last written on success', !!last && last.pair === 'BTC/USD' && last.delivered === 1, JSON.stringify(last));
++    const per = await env.SIGNAL_CACHE.get('pushDiag:sig_diag_0001', 'json');
++    ok('diag:<signalId> written', !!per && per.skipped === null, JSON.stringify(per));
++    const stats = await getPushStats(env);
++    ok('health exposes lastPushDiag after success', !!stats.lastPushDiag && stats.lastPushDiag.delivered === 1, JSON.stringify(stats.lastPushDiag));
++    eq('pushDisabledReason null when enabled', stats.pushDisabledReason, null);
++  }
++
++  // no-token -> diag records the exact reason
++  {
++    const env = envOf({ 111: userOf() });
++    delete env.BOT_TOKEN;
++    const r = quiet();
++    const out = await pushSignalToSubscribers(sigOf(), env);
++    r();
++    eq('diag: no-token skip value', out.skipped, 'no-token');
++    const last = await env.SIGNAL_CACHE.get('pushDiag:last', 'json');
++    eq('diag:last records skipped no-token', last.skipped, 'no-token');
++    const off = await getPushStats(env);
++    eq('health pushDisabledReason explains why', off.pushDisabledReason, 'BOT_TOKEN secret not set on this worker');
++  }
++
++  // no-match (unwatched pair) -> diag carries the per-subscriber gate breakdown
++  {
++    const env = envOf({ 111: userOf({ pair: 'EURUSD' }) });
++    const r = quiet();
++    const out = await pushSignalToSubscribers(sigOf(), env);   // BTC/USD
++    r();
++    eq('diag: unwatched pair skip value', out.skipped, 'no-match');
++    const last = await env.SIGNAL_CACHE.get('pushDiag:last', 'json');
++    ok('diag: gate breakdown present', Array.isArray(last.gates) && last.gates.length === 1, JSON.stringify(last.gates));
++    eq('diag: pair gate shows the miss', last.gates[0].reason, 'pair-not-watched');
++    eq('diag: noSubscriberReason', last.noSubscriberReason, 'gate-rejected');
++  }
++
++  // gate rejection (aiOnlyMode + AI unavailable) -> diag names the failing gate
++  {
++    const env = envOf({ 111: userOf({ aiOnlyMode: true }) });
++    const r = quiet();
++    const out = await pushSignalToSubscribers(sigOf({}, {
++      aiValidation: { combined: { status: 'BOTH_UNAVAILABLE' }, combinedAgreed: null },
++    }), env);
++    r();
++    eq('diag: AI gate blocks the push', out.skipped, 'no-match');
++    const last = await env.SIGNAL_CACHE.get('pushDiag:last', 'json');
++    ok('diag: gate breakdown shows ai:false', last.gates[0].ai === false, JSON.stringify(last.gates));
++    eq('diag: gate reason', last.gates[0].reason, 'gate-rejected');
++  }
++
++  // send failure -> diag captures Telegram status + body (never a bare 400)
++  {
++    installNet();
++    const env = envOf({ 111: userOf() });
++    const realFetch = globalThis.fetch;
++    globalThis.fetch = async (url, init) => {
++      if (String(url).includes('api.telegram.org')) {
++        return { ok: false, status: 401, json: async () => ({}), text: async () => '{"ok":false,"error_code":401,"description":"Unauthorized"}' };
++      }
++      return realFetch(url, init);
++    };
++    const r = quiet();
++    const out = await pushSignalToSubscribers(sigOf(), env);
++    r();
++    eq('diag: send failure yields pushed 0', out.pushed, 0);
++    const last = await env.SIGNAL_CACHE.get('pushDiag:last', 'json');
++    eq('diag: skipped partial-send-failure', last.skipped, 'partial-send-failure');
++    ok('diag: failure carries status', last.failures[0].status === 401, JSON.stringify(last.failures));
++    ok('diag: failure carries body preview', String(last.failures[0].body).includes('Unauthorized'), JSON.stringify(last.failures));
++  }
++
++  // success path via the REAL request chain (scanner/manual /api/signal) also
++  // leaves a diag trail end-to-end
++  {
++    installNet();
++    const env = envOf();
++    const sink = [];
++    const r = quiet();
++    const res = await handleSignalRaw('BTC/USD', env, ctxOf(sink), { edgeFeatures: false, now: '2026-08-10T14:00:00Z' });
++    await drain(sink);
++    r();
++    ok('diag: real chain produced an id', !!res.id);
++    const last = await env.SIGNAL_CACHE.get('pushDiag:last', 'json');
++    ok('diag: real chain recorded the attempt', !!last && last.pair === 'BTC/USD' && last.delivered === 1, JSON.stringify(last));
++    const per = await env.SIGNAL_CACHE.get('pushDiag:' + res.id, 'json');
++    ok('diag: real chain recorded per-signal record', !!per, JSON.stringify(per));
++  }
++}
++
+ console.log('PASS: ' + pass + '   FAIL: ' + fail);
+ if (fail > 0) { console.log('\nFailures:'); failures.forEach(f => console.log('  - ' + f)); process.exit(1); }
+ console.log('ALL PHASE 10 INTEGRATION TESTS PASSED');
+diff --git a/scripts/phase10_smoke.mjs b/scripts/phase10_smoke.mjs
+index 97ceabf..358bdf5 100644
+--- a/scripts/phase10_smoke.mjs
++++ b/scripts/phase10_smoke.mjs
+@@ -293,8 +293,11 @@ console.log('\n── §5.6: /health block ────────────
+   eq('botKvBound', stats.botKvBound, true);
+   eq('pushesLast24h counted', stats.pushesLast24h, 2);
+   eq('subscriberCount from auto_users', stats.subscriberCount, 2);
++  ok('lastPushDiag exposed (null before any attempt)', stats.lastPushDiag === null, JSON.stringify(stats.lastPushDiag));
++  eq('pushDisabledReason null while enabled', stats.pushDisabledReason, null);
+   const off = await push.getPushStats({ SIGNAL_CACHE: makeKV() });
+   eq('pushEnabled false without token', off.pushEnabled, false);
++  eq('pushDisabledReason names the missing secret', off.pushDisabledReason, 'BOT_TOKEN secret not set on this worker');
+ }
+ 
+ console.log('\n── wiring + bans ──────────────────────────────────────────');
+diff --git a/src/handlers/health.js b/src/handlers/health.js
+index 2cd3b67..19ff30c 100644
+--- a/src/handlers/health.js
++++ b/src/handlers/health.js
+@@ -27,7 +27,7 @@ export async function handleHealth(env) {
+   const phase10        = await getPushStats(env);        // Phase 10 push
+ 
+   return jsonResponse({
+-    status: 'healthy', version: '6.10.0', timestamp: new Date().toISOString(),
++    status: 'healthy', version: '6.11.0', timestamp: new Date().toISOString(),
+     apiKeys: { configured: keyCount, source: keySource, status: keyCount > 0 ? 'ready' : 'NO KEYS' },
+     apiKeysLoaded: keyCount,
+     quotaUsedToday,
+diff --git a/src/handlers/pushToSubscribers.js b/src/handlers/pushToSubscribers.js
+index 54af914..779fe24 100644
+--- a/src/handlers/pushToSubscribers.js
++++ b/src/handlers/pushToSubscribers.js
+@@ -30,6 +30,15 @@
+  *    every manual view), and each call mints a NEW signalId even when the
+  *    worker's own 30-minute dedup guard treats it as a re-poll. Without a lock
+  *    one setup would be pushed dozens of times. See §1.4.
++ *
++ * 5. v6.11 (push diagnostics): every actionable push attempt writes
++ *    `pushDiag:last` + `pushDiag:<signalId>` with the exact outcome — skip
++ *    reason, per-subscriber gate breakdown, or Telegram status/body on a failed
++ *    send — and /health exposes the latest record. Live investigation (Aug 12)
++ *    showed a worker with fresh tradeable rows, one subscriber and
++ *    pushesLast24h:0 for days, with NOTHING queryable about why: 'no-token' and
++ *    'no-match' returned silently and send failures only console.warned. The
++ *    diag trail ends that class of blind debugging.
+  */
+ 
+ 
+@@ -37,6 +46,19 @@
+ const PUSH_LOG_PREFIX  = 'pushLog:';    // pushLog:<signalId> -> [{chatId, sentAt}]
+ const PUSH_LOCK_PREFIX = 'pushLock:';   // pushLock:<chatId>:<PAIR>:<DIR> -> signalId
+ const PUSH_LOG_TTL_S   = 24 * 3600;
++// v6.11 (push diagnostics): EVERY actionable push attempt records WHY it
++// skipped/failed into KV so the failure can never be silent again.
++//   pushDiag:last          -> the most recent attempt (overwritten each time)
++//   pushDiag:<signalId>    -> per-signal attempt record (48h TTL)
++// /health exposes phase10.lastPushDiag, so after the next fresh tradeable
++// signal the exact gate or Telegram status is queryable in one request.
++const PUSH_DIAG_PREFIX = 'pushDiag:';
++const PUSH_DIAG_LAST   = 'pushDiag:last';
++const PUSH_DIAG_TTL_S  = 48 * 3600;
++// Rate-limit the new console warnings (no-token / no-match / send-failure):
++// log once per 15 minutes per reason instead of on every signal.
++const WARN_EVERY_MS    = 15 * 60 * 1000;
++const lastWarnAt       = {};
+ /**
+  * How long one (subscriber, pair, direction) stays muted after a push.
+  * Mirrors the worker's own DEDUP_WINDOW_MS (30 min) so a push happens exactly
+@@ -87,11 +109,50 @@ export function passAI(sig, aiOnly) {
+   return status === 'OK' && agreed === true;
+ }
+ 
++/** Warn at most once per WARN_EVERY_MS per reason — diagnostics without spam. */
++function warnOnce(reason, msg) {
++  const now = Date.now();
++  if (now - (lastWarnAt[reason] || 0) < WARN_EVERY_MS) return;
++  lastWarnAt[reason] = now;
++  console.warn('push: ' + msg);
++}
++
++/**
++ * v6.11 — persist the outcome of a push attempt. Fail-open: a diag write
++ * must never be able to break the push itself. `pushDiag:last` is overwritten
++ * on every actionable attempt so /health can always show the most recent one.
++ */
++async function recordPushDiag(env, signal, diag) {
++  if (!env || !env.SIGNAL_CACHE) return;
++  const record = {
++    ts: new Date().toISOString(),
++    pair: signal && signal.pair,
++    direction: signal && signal.signal && signal.signal.finalSignal,
++    ...diag,
++  };
++  try {
++    await env.SIGNAL_CACHE.put(PUSH_DIAG_LAST, JSON.stringify(record));
++    if (signal && signal.id) {
++      await env.SIGNAL_CACHE.put(
++        PUSH_DIAG_PREFIX + signal.id,
++        JSON.stringify(record),
++        { expirationTtl: PUSH_DIAG_TTL_S },
++      );
++    }
++  } catch (e) {
++    console.warn('push: diag write failed: ' + e.message);
++  }
++}
++
+ /**
+  * Everyone who should receive this signal.
+  * Returns [{ chatId, channelId }] — channelId mirrors the Bot's [F10] behaviour.
++ *
++ * When `diagOut` is provided (v6.11) it receives a per-subscriber gate
++ * breakdown so a no-match can be explained instead of guessed:
++ *   diagOut.gates = [{ cid, pairMatched, conf, grade, ai, reason }]
+  */
+-export async function getMatchingSubscribers(signal, env) {
++export async function getMatchingSubscribers(signal, env, diagOut) {
+   if (!env || !env.BOT_KV) return [];
+   const sig = signal && signal.signal;
+   if (!sig) return [];
+@@ -107,27 +168,40 @@ export async function getMatchingSubscribers(signal, env) {
+ 
+   const want = normPair(signal.pair);
+   const matches = [];
++  const gates = [];
+ 
+   for (const cid of autoUsers) {
+     try {
+       const user = await env.BOT_KV.get('u:' + cid, 'json');
+-      if (!user || user.autoEnabled !== true) continue;
++      if (!user) { gates.push({ cid: String(cid), reason: 'no-u-record' }); continue; }
++      if (user.autoEnabled !== true) { gates.push({ cid: String(cid), autoEnabled: user.autoEnabled, reason: 'auto-off' }); continue; }
+ 
+       const watched = [user.pair, ...(Array.isArray(user.watchlist) ? user.watchlist : [])]
+         .filter(Boolean)
+         .map(normPair);
+-      if (!watched.includes(want)) continue;
++      const pairMatched = watched.includes(want);
++      if (!pairMatched) { gates.push({ cid: String(cid), pair: user.pair, watchlist: user.watchlist, pairMatched: false, reason: 'pair-not-watched' }); continue; }
+ 
+       // Same three gates the Bot applies in autoScan.
+-      if (!passConf(sig, user.minConfidence)) continue;
+-      if (!passGrade(sig, user.gradeFilter)) continue;
+-      if (!passAI(sig, user.aiOnlyMode)) continue;
++      const conf = passConf(sig, user.minConfidence);
++      const grade = passGrade(sig, user.gradeFilter);
++      const ai = passAI(sig, user.aiOnlyMode);
++      if (!conf || !grade || !ai) {
++        gates.push({
++          cid: String(cid), pair: user.pair, pairMatched: true,
++          minConfidence: user.minConfidence, gradeFilter: user.gradeFilter, aiOnlyMode: user.aiOnlyMode,
++          conf, grade, ai, reason: 'gate-rejected',
++        });
++        continue;
++      }
+ 
+       matches.push({ chatId: String(cid), channelId: user.channelId || null, fxMode: user.fxMode || 'ftt' });
+     } catch (e) {
+       console.warn('push: user read failed for ' + cid + ': ' + e.message);
++      gates.push({ cid: String(cid), reason: 'read-error: ' + e.message });
+     }
+   }
++  if (diagOut) diagOut.gates = gates;
+   return matches;
+ }
+ 
+@@ -158,6 +232,14 @@ async function claimPushLock(chatId, signal, env) {
+ /**
+  * Push a fresh signal to every matching subscriber.
+  * Call inside ctx.waitUntil() — never block the caller's response.
++ *
++ * v6.11: every actionable attempt writes a pushDiag record (pushDiag:last +
++ * pushDiag:<signalId>) describing the outcome — skipped reason, per-subscriber
++ * gate breakdown, or the exact Telegram status on a failed send — and the
++ * no-token / no-match / send-failure paths now emit a rate-limited console
++ * warning. Before this, all three returned {pushed:0} with no trace anywhere
++ * queryable, which is how a live worker ended up with fresh signals, one
++ * subscriber and pushesLast24h:0 for days.
+  */
+ export async function pushSignalToSubscribers(signal, env) {
+   if (!signal || !signal.id) return { pushed: 0, skipped: 'no-id' };
+@@ -166,14 +248,27 @@ export async function pushSignalToSubscribers(signal, env) {
+     return { pushed: 0, skipped: 'not-actionable' };
+   }
+   if (!env || !env.BOT_TOKEN) {
+-    // Not an error: push is opt-in via secret. Stay silent to avoid log spam
+-    // on every single signal when the feature simply is not configured.
++    // Not an error: push is opt-in via secret. v6.11 still records the attempt
++    // and warns once per 15 min so a missing secret is visible in /health
++    // (phase10.pushDisabledReason) and in the logs instead of vanishing.
++    await recordPushDiag(env, signal, { skipped: 'no-token' });
++    warnOnce('no-token', 'no-token: BOT_TOKEN secret is not set on this worker — signal ' + signal.id + ' not pushed');
+     return { pushed: 0, skipped: 'no-token' };
+   }
+ 
+   try {
+-    const subscribers = await getMatchingSubscribers(signal, env);
+-    if (subscribers.length === 0) return { pushed: 0, skipped: 'no-match' };
++    const diag = {};
++    const subscribers = await getMatchingSubscribers(signal, env, diag);
++    diag.subscriberCount = subscribers.length;
++    if (subscribers.length === 0) {
++      // API-compatible skip value ('no-match'); the finer distinction (empty
++      // auto_users vs every subscriber gate-rejected) lives in the diag record.
++      diag.noSubscriberReason = !diag.gates || diag.gates.length === 0 ? 'no-auto_users' : 'gate-rejected';
++      await recordPushDiag(env, signal, { skipped: 'no-match', ...diag });
++      warnOnce('no-match', 'no-match: signal ' + signal.id + ' ' + signal.pair + ' matched 0 of '
++        + ((diag.gates && diag.gates.length) || 0) + ' subscriber gate(s) — see pushDiag:' + signal.id);
++      return { pushed: 0, skipped: 'no-match' };
++    }
+ 
+     // Idempotency: only push to subscribers not already notified about this
+     // pair+direction inside the lock window.
+@@ -181,7 +276,10 @@ export async function pushSignalToSubscribers(signal, env) {
+     for (const sub of subscribers) {
+       if (await claimPushLock(sub.chatId, signal, env)) eligible.push(sub);
+     }
+-    if (eligible.length === 0) return { pushed: 0, skipped: 'locked' };
++    if (eligible.length === 0) {
++      await recordPushDiag(env, signal, { skipped: 'locked', matched: subscribers.length });
++      return { pushed: 0, skipped: 'locked' };
++    }
+ 
+     // Per-subscriber message: FX-mode users get SL/TP levels (fetched with
+     // mode=fx&nopush=1 to avoid a push loop), others get FTT.
+@@ -210,9 +308,24 @@ export async function pushSignalToSubscribers(signal, env) {
+     );
+ 
+     const delivered = [];
+-    results.forEach((r) => {
++    const failures = [];
++    results.forEach((r, i) => {
+       if (r.status === 'fulfilled' && r.value) delivered.push(r.value);
++      else if (r.status === 'rejected') {
++        const err = r.reason || {};
++        failures.push({
++          chatId: eligible[i] && eligible[i].chatId,
++          error: err.message || String(err),
++          status: err.status || null,
++          body: err.body || null,
++        });
++      }
+     });
++    if (failures.length > 0) {
++      // v6.11: surface failed sends in the diag instead of a lone console line.
++      warnOnce('send-failure', 'send failure for ' + signal.id + ' ' + signal.pair + ': '
++        + failures.map(f => 'chatId=' + f.chatId + ' ' + f.error + (f.body ? ' ' + f.body : '')).join(' | '));
++    }
+ 
+     // Channel mirroring ([F10] parity) — best effort, never gates the DM.
+     // Each delivery record carries its own message, so a mirror failure can
+@@ -234,9 +347,15 @@ export async function pushSignalToSubscribers(signal, env) {
+     console.log('Phase 10 push: ' + signal.id + ' ' + signal.pair + ' '
+       + sig.finalSignal + ' -> ' + delivered.length + '/' + eligible.length
+       + ' delivered (' + subscribers.length + ' matched)');
++    await recordPushDiag(env, signal, {
++      skipped: failures.length > 0 ? 'partial-send-failure' : null,
++      matched: subscribers.length, eligible: eligible.length, delivered: delivered.length,
++      failures: failures.length > 0 ? failures : undefined,
++    });
+     return { pushed: delivered.length, matched: subscribers.length };
+   } catch (e) {
+     console.warn('pushSignalToSubscribers error: ' + e.message);
++    await recordPushDiag(env, signal, { skipped: 'exception', error: e.message });
+     return { pushed: 0, error: e.message };
+   }
+ }
+@@ -356,6 +475,10 @@ export function formatResultMessage(record, winLoss, exitPrice) {
+ /**
+  * Plain-text sendMessage. No parse_mode on purpose — see the header note and
+  * the Bot's own Bug#1 comment.
++ *
++ * v6.11: the thrown error now carries `.status` and `.body` (200-char preview)
++ * so pushSignalToSubscribers can record WHY a send failed in pushDiag — a
++ * bare "Telegram 400" was indistinguishable from a missing match.
+  */
+ export async function sendTelegramMessage(chatId, text, env) {
+   const url = TELEGRAM_API + '/bot' + env.BOT_TOKEN + '/sendMessage';
+@@ -372,7 +495,10 @@ export async function sendTelegramMessage(chatId, text, env) {
+     const body = await res.text().catch(() => '');
+     console.warn('Telegram sendMessage failed: chatId=' + chatId
+       + ' status=' + res.status + ' body=' + body.slice(0, 200));
+-    throw new Error('Telegram ' + res.status);
++    const err = new Error('Telegram ' + res.status);
++    err.status = res.status;
++    err.body = body.slice(0, 200);
++    throw err;
+   }
+   return res.json().catch(() => ({}));
+ }
+@@ -382,9 +508,15 @@ export async function getPushStats(env) {
+   const enabled = !!(env && env.BOT_TOKEN);
+   const stats = {
+     pushEnabled: enabled,
++    // v6.11: when push is disabled, say exactly why (only reason today: the
++    // BOT_TOKEN secret is absent on this worker).
++    pushDisabledReason: enabled ? null : 'BOT_TOKEN secret not set on this worker',
+     botKvBound: !!(env && env.BOT_KV),
+     pushesLast24h: null,
+     subscriberCount: null,
++    // v6.11: the most recent push attempt outcome (see recordPushDiag) —
++    // never silent again.
++    lastPushDiag: null,
+   };
+   if (!env || !env.SIGNAL_CACHE) return stats;
+ 
+@@ -393,6 +525,10 @@ export async function getPushStats(env) {
+     stats.pushesLast24h = ((list && list.keys) || []).length;
+   } catch (e) { /* leave null */ }
+ 
++  try {
++    stats.lastPushDiag = await env.SIGNAL_CACHE.get(PUSH_DIAG_LAST, 'json');
++  } catch (e) { /* leave null */ }
++
+   if (env.BOT_KV) {
+     try {
+       const autoUsers = await env.BOT_KV.get('auto_users', 'json');
+@@ -405,4 +541,5 @@ export async function getPushStats(env) {
+ export const __pushTest = {
+   normPair, confPct, claimPushLock,
+   PUSH_LOG_PREFIX, PUSH_LOCK_PREFIX, PUSH_LOCK_TTL_S, PUSH_LOG_TTL_S,
++  PUSH_DIAG_PREFIX, PUSH_DIAG_LAST, PUSH_DIAG_TTL_S,
+ };
+diff --git a/src/index.js b/src/index.js
+index e9c6b43..fa9d3d0 100644
+--- a/src/index.js
++++ b/src/index.js
+@@ -1,5 +1,5 @@
+ /**
+- * FTT Signal Worker v6.10.0
++ * FTT Signal Worker v6.11.0
+  * Cloudflare Worker Entry Point
+  */
+ 
+@@ -120,7 +120,7 @@ export default {
+       } else {
+         response = jsonResponse({
+           status: 'ok',
+-          message: 'FTT Signal Worker v6.10.0 — Forex + Crypto + OTC + History Tracking',
++          message: 'FTT Signal Worker v6.11.0 — Forex + Crypto + OTC + History Tracking',
+           endpoints: {
+             health:    '/',
+             signal:    '/api/signal?pair=EUR/USD',
