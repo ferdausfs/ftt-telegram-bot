@@ -1,0 +1,37 @@
+diff --git a/scripts/phase10_smoke.mjs b/scripts/phase10_smoke.mjs
+index 97ceabf..9d81148 100644
+--- a/scripts/phase10_smoke.mjs
++++ b/scripts/phase10_smoke.mjs
+@@ -293,8 +293,17 @@ console.log('\n── §5.6: /health block ────────────
+   eq('botKvBound', stats.botKvBound, true);
+   eq('pushesLast24h counted', stats.pushesLast24h, 2);
+   eq('subscriberCount from auto_users', stats.subscriberCount, 2);
++  eq('push.enabled is true when BOT_TOKEN present', stats.push.enabled, true);
++  eq('push.noTokenReason is null when BOT_TOKEN present', stats.push.noTokenReason, null);
++
+   const off = await push.getPushStats({ SIGNAL_CACHE: makeKV() });
+   eq('pushEnabled false without token', off.pushEnabled, false);
++  eq('push.enabled is false without token', off.push.enabled, false);
++  eq('push.noTokenReason is BOT_TOKEN-missing when BOT_TOKEN absent', off.push.noTokenReason, 'BOT_TOKEN-missing');
++
++  const noEnvStats = await push.getPushStats(undefined);
++  eq('push.enabled is false on undefined env', noEnvStats.push.enabled, false);
++  eq('push.noTokenReason is env-undefined on undefined env', noEnvStats.push.noTokenReason, 'env-undefined');
+ }
+ 
+ console.log('\n── wiring + bans ──────────────────────────────────────────');
+diff --git a/src/handlers/pushToSubscribers.js b/src/handlers/pushToSubscribers.js
+index 54af914..d722c82 100644
+--- a/src/handlers/pushToSubscribers.js
++++ b/src/handlers/pushToSubscribers.js
+@@ -385,6 +385,10 @@ export async function getPushStats(env) {
+     botKvBound: !!(env && env.BOT_KV),
+     pushesLast24h: null,
+     subscriberCount: null,
++    push: {
++      enabled,
++      noTokenReason: enabled ? null : (!env ? 'env-undefined' : 'BOT_TOKEN-missing'),
++    },
+   };
+   if (!env || !env.SIGNAL_CACHE) return stats;
+ 
