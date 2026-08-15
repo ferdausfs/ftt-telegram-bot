@@ -1,5 +1,5 @@
 /**
- * FTT Signal Telegram Bot — v4.5.0 (WORKER = SINGLE SOURCE OF TRUTH)
+ * FTT Signal Telegram Bot — v4.5.1 (WORKER = SINGLE SOURCE OF TRUTH)
  * KV Binding     : BOT_KV
  * Service Binding: SIGNAL_WORKER → asignal.umuhammadiswa.workers.dev
  * Secrets        : BOT_TOKEN, SETUP_SECRET
@@ -168,6 +168,7 @@ const PAIR_PAGES = [
   ['USD/CHF','EUR/JPY','EUR/AUD','AUD/JPY'],
   ['BTC/USD','ETH/USD','SOL/USD','BNB/USD'],
   ['XRP/USD','ADA/USD','DOGE/USD','AVAX/USD'],
+  ['DOT/USD','LINK/USD'],
 ];
 const MAX_WL       = 6;
 const NEWS_WINDOW  = 15; // ±minutes around high-impact news
@@ -238,7 +239,7 @@ export default {
         },
       });
     }
-    return new Response('FTT Signal Bot v4.5.0');
+    return new Response('FTT Signal Bot v4.5.1');
   },
 
   async scheduled(e, env, ctx) {
@@ -417,6 +418,8 @@ const DEF_USER = () => ({
   blockNews: true,     // [F03] skip auto signals during news window
   channelId: null,     // [F10] channel to mirror signals to
   fxMode: 'ftt',        // [FX] 'ftt' | 'fx' | 'both' — signal output mode
+  // [v4.5.1] watch ALL worker pairs (worker push matches every pair when true)
+  watchAll: false,
 });
 
 async function getUser(cid, env) {
@@ -566,9 +569,10 @@ const pairsKb = (page, backTo = 'cmd:settings') => {
   return kb(rows);
 };
 
-const wlKb = wl => {
+const wlKb = (wl, watchAll) => {
   const rows = wl.map(p => [btn(`📊 ${disp(p)}`, `qs:${p}`), btn('❌', `wl:rm:${p}`)]);
   rows.push([btn('➕ Add Pairs', 'wlpage:0')]);
+  rows.push([btn(watchAll ? '⚡ Watch ALL: ON ✅' : '⚡ Watch ALL: OFF', 'wl:all')]);
   rows.push([btn('🔙 Back', 'cmd:main')]);
   return kb(rows);
 };
@@ -660,9 +664,9 @@ async function fmtMainMenu(u, env) {
       summary = `📊 Signals: ${d.total}  📈 Win Rate: ${wr}% (${decided} decided)`;
     }
   } catch { /* worker down — show settings only */ }
-  return `FTT Signal Bot v4.5.0\n${SEP}\n` +
+  return `FTT Signal Bot v4.5.1\n${SEP}\n` +
     `💱 ${esc(disp(u.pair))} · ${u.interval}min · ${modeLabel(u.fxMode)}\n` +
-    `🔄 Auto: ${u.autoEnabled ? 'ON ✅' : 'OFF'}  👁 Watchlist: ${u.watchlist.length} pairs\n` +
+    `🔄 Auto: ${u.autoEnabled ? 'ON ✅' : 'OFF'}  👁 Watchlist: ${u.watchAll ? 'ALL ⚡' : (u.watchlist.length + ' pairs')}\n` +
     `🎯 Grade: ${esc(u.gradeFilter || 'ALL')}  🤖 AI Only: ${u.aiOnlyMode ? 'ON' : 'OFF'}\n` +
     `📰 News Block: ${u.blockNews !== false ? 'ON' : 'OFF'}\n` +
     `${SEP}\n` +
@@ -1173,6 +1177,14 @@ async function onMessage(msg, env) {
   if (text.startsWith('/history'))   return doHist(cid, null, 0, env);
   if (text.startsWith('/stats'))     return doStats(cid, null, env);
   if (text.startsWith('/watchlist')) return doWatchlist(cid, null, env);
+  if (text.startsWith('/watchall')) {
+    const u = await getUser(cid, env);
+    u.watchAll = !u.watchAll;
+    await saveUser(cid, u, env);
+    return R(u.watchAll
+      ? '⚡ Watch ALL is now ON — worker will push every emitted signal.'
+      : 'Watch ALL is now OFF — back to your pair + watchlist only.', mainKb(u));
+  }
   if (text.startsWith('/today'))     return doToday(cid, null, env);
   if (text.startsWith('/summary'))   return doSummary(cid, null, env);
   if (text.startsWith('/journal'))   return doJournal(cid, null, env);
@@ -1350,6 +1362,12 @@ async function _handleCb(cid, mid, data, u, env) {
     u.pair = norm(data.slice(5));
     await saveUser(cid, u, env);
     return R(fmtSettings(u), settingsKb(u));
+  }
+
+  if (data === 'wl:all') {
+    u.watchAll = !u.watchAll;
+    await saveUser(cid, u, env);
+    return doWatchlist(cid, mid, env);
   }
 
   if (data.startsWith('wlpage:'))   return R(`👁 Add to Watchlist (${u.watchlist.length}/${MAX_WL}):`, wlAddKb(parseInt(data.split(':')[1], 10), u.watchlist));
@@ -1762,8 +1780,12 @@ async function doAnalyze(cid, mid, pairRaw, env) {
 
 async function doWatchlist(cid, mid, env) {
   const u = await getUser(cid, env);
-  const t = `👁 Watchlist (${u.watchlist.length}/${MAX_WL})\n\n${u.watchlist.length ? u.watchlist.map(disp).join(', ') : 'Empty'}\n\n📊 = Quick signal  ❌ = Remove`;
-  return reply(cid, mid, t, env, wlKb(u.watchlist));
+  const allLabel = u.watchAll ? 'ALL PAIRS ⚡' : `${u.watchlist.length}/${MAX_WL}`;
+  const body = u.watchAll
+    ? '⚡ Watching ALL worker pairs — every emitted signal will be pushed.'
+    : (u.watchlist.length ? u.watchlist.map(disp).join(', ') : 'Empty');
+  const t = `👁 Watchlist (${allLabel})\n\n${body}\n\n📊 = Quick signal  ❌ = Remove`;
+  return reply(cid, mid, t, env, wlKb(u.watchlist, u.watchAll));
 }
 
 // v4.5.0: today's performance comes from the WORKER history stream.
